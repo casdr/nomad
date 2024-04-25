@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package client
 
 import (
@@ -10,10 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/client/lib/proclib"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper/pluginutils/catalog"
 	"github.com/hashicorp/nomad/helper/uuid"
@@ -23,6 +27,7 @@ import (
 	nconfig "github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -67,6 +72,51 @@ func TestAllocations_Restart(t *testing.T) {
 	})
 }
 
+func TestAllocations_RestartAllTasks(t *testing.T) {
+	ci.Parallel(t)
+
+	require := require.New(t)
+	client, cleanup := TestClient(t, nil)
+	defer cleanup()
+
+	alloc := mock.LifecycleAlloc()
+	require.Nil(client.addAlloc(alloc, ""))
+
+	// setup process wranglers for our tasks to make sure they work with restart
+	client.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "web"})
+	client.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "init"})
+	client.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "side"})
+	client.wranglers.Setup(proclib.Task{AllocID: alloc.ID, Task: "poststart"})
+
+	// Can't restart all tasks while specifying a task name.
+	req := &nstructs.AllocRestartRequest{
+		AllocID:  alloc.ID,
+		AllTasks: true,
+		TaskName: "web",
+	}
+	var resp nstructs.GenericResponse
+	err := client.ClientRPC("Allocations.Restart", &req, &resp)
+	require.Error(err)
+
+	// Good request.
+	req = &nstructs.AllocRestartRequest{
+		AllocID:  alloc.ID,
+		AllTasks: true,
+	}
+
+	testutil.WaitForResult(func() (bool, error) {
+		var resp2 nstructs.GenericResponse
+		err := client.ClientRPC("Allocations.Restart", &req, &resp2)
+		if err != nil && strings.Contains(err.Error(), "not running") {
+			return false, err
+		}
+
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+}
+
 func TestAllocations_Restart_ACL(t *testing.T) {
 	ci.Parallel(t)
 	require := require.New(t)
@@ -96,7 +146,7 @@ func TestAllocations_Restart_ACL(t *testing.T) {
 		var resp nstructs.GenericResponse
 		err := client.ClientRPC("Allocations.Restart", &req, &resp)
 		require.NotNil(err)
-		require.EqualError(err, nstructs.ErrPermissionDenied.Error())
+		require.ErrorContains(err, nstructs.ErrPermissionDenied.Error())
 	}
 
 	// Try request with an invalid token and expect failure
@@ -283,7 +333,7 @@ func TestAllocations_GarbageCollect_ACL(t *testing.T) {
 		var resp nstructs.GenericResponse
 		err := client.ClientRPC("Allocations.GarbageCollect", &req, &resp)
 		require.NotNil(err)
-		require.EqualError(err, nstructs.ErrPermissionDenied.Error())
+		require.ErrorContains(err, nstructs.ErrPermissionDenied.Error())
 	}
 
 	// Try request with an invalid token and expect failure
@@ -380,7 +430,7 @@ func TestAllocations_Signal_ACL(t *testing.T) {
 		var resp nstructs.GenericResponse
 		err := client.ClientRPC("Allocations.Signal", &req, &resp)
 		require.NotNil(err)
-		require.EqualError(err, nstructs.ErrPermissionDenied.Error())
+		require.ErrorContains(err, nstructs.ErrPermissionDenied.Error())
 	}
 
 	// Try request with an invalid token and expect failure
@@ -486,7 +536,7 @@ func TestAllocations_Stats_ACL(t *testing.T) {
 		var resp cstructs.AllocStatsResponse
 		err := client.ClientRPC("Allocations.Stats", &req, &resp)
 		require.NotNil(err)
-		require.EqualError(err, nstructs.ErrPermissionDenied.Error())
+		require.ErrorContains(err, nstructs.ErrPermissionDenied.Error())
 	}
 
 	// Try request with an invalid token and expect failure
@@ -527,6 +577,92 @@ func TestAllocations_Stats_ACL(t *testing.T) {
 		err := client.ClientRPC("Allocations.Stats", &req, &resp)
 		require.NoError(err)
 	}
+}
+
+func TestAlloc_Checks(t *testing.T) {
+	ci.Parallel(t)
+
+	client, cleanup := TestClient(t, nil)
+	t.Cleanup(func() {
+		must.NoError(t, cleanup())
+	})
+
+	now := time.Date(2022, 3, 4, 5, 6, 7, 8, time.UTC).Unix()
+
+	qr1 := &nstructs.CheckQueryResult{
+		ID:        "abc123",
+		Mode:      "healthiness",
+		Status:    "passing",
+		Output:    "nomad: http ok",
+		Timestamp: now,
+		Group:     "group",
+		Task:      "task",
+		Service:   "service",
+		Check:     "check",
+	}
+
+	qr2 := &nstructs.CheckQueryResult{
+		ID:        "def456",
+		Mode:      "readiness",
+		Status:    "passing",
+		Output:    "nomad: http ok",
+		Timestamp: now,
+		Group:     "group",
+		Service:   "service2",
+		Check:     "check",
+	}
+
+	t.Run("alloc does not exist", func(t *testing.T) {
+		request := cstructs.AllocChecksRequest{AllocID: "d3e34248-4843-be75-d4fd-4899975cfb38"}
+		var response cstructs.AllocChecksResponse
+		err := client.ClientRPC("Allocations.Checks", &request, &response)
+		must.EqError(t, err, `Unknown allocation "d3e34248-4843-be75-d4fd-4899975cfb38"`)
+	})
+
+	t.Run("no checks for alloc", func(t *testing.T) {
+		alloc := mock.Alloc()
+		must.NoError(t, client.addAlloc(alloc, ""))
+
+		request := cstructs.AllocChecksRequest{AllocID: alloc.ID}
+		var response cstructs.AllocChecksResponse
+		err := client.ClientRPC("Allocations.Checks", &request, &response)
+		must.NoError(t, err)
+		must.MapEmpty(t, response.Results)
+	})
+
+	t.Run("two in one alloc", func(t *testing.T) {
+		alloc := mock.Alloc()
+		must.NoError(t, client.addAlloc(alloc, ""))
+		must.NoError(t, client.checkStore.Set(alloc.ID, qr1))
+		must.NoError(t, client.checkStore.Set(alloc.ID, qr2))
+
+		request := cstructs.AllocChecksRequest{AllocID: alloc.ID}
+		var response cstructs.AllocChecksResponse
+		err := client.ClientRPC("Allocations.Checks", &request, &response)
+		must.NoError(t, err)
+		must.MapEq(t, map[nstructs.CheckID]*nstructs.CheckQueryResult{
+			"abc123": qr1,
+			"def456": qr2,
+		}, response.Results)
+	})
+
+	t.Run("ignore unrelated alloc", func(t *testing.T) {
+		alloc1 := mock.Alloc()
+		must.NoError(t, client.addAlloc(alloc1, ""))
+
+		alloc2 := mock.Alloc()
+		must.NoError(t, client.addAlloc(alloc2, ""))
+		must.NoError(t, client.checkStore.Set(alloc1.ID, qr1))
+		must.NoError(t, client.checkStore.Set(alloc2.ID, qr2))
+
+		request := cstructs.AllocChecksRequest{AllocID: alloc1.ID}
+		var response cstructs.AllocChecksResponse
+		err := client.ClientRPC("Allocations.Checks", &request, &response)
+		must.NoError(t, err)
+		must.MapEq(t, map[nstructs.CheckID]*nstructs.CheckQueryResult{
+			"abc123": qr1,
+		}, response.Results)
+	})
 }
 
 func TestAlloc_ExecStreaming(t *testing.T) {
@@ -992,6 +1128,7 @@ func TestAlloc_ExecStreaming_ACL_WithIsolation_Image(t *testing.T) {
 // TestAlloc_ExecStreaming_ACL_WithIsolation_Chroot asserts that token only needs
 // alloc-exec acl policy when chroot isolation is used
 func TestAlloc_ExecStreaming_ACL_WithIsolation_Chroot(t *testing.T) {
+	ci.SkipSlow(t, "flaky on GHA; too much disk IO")
 	ci.Parallel(t)
 
 	if runtime.GOOS != "linux" || unix.Geteuid() != 0 {

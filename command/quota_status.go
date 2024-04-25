@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -26,13 +29,26 @@ Usage: nomad quota status [options] <quota>
 
 General Options:
 
-  ` + generalOptionsUsage(usageOptsDefault)
+  ` + generalOptionsUsage(usageOptsDefault) + `
+
+Status Specific Options:
+	
+  -json
+    Output the latest quota status information in a JSON format.
+	
+  -t
+    Format and display quota status information using a Go template.
+`
 
 	return strings.TrimSpace(helpText)
 }
 
 func (c *QuotaStatusCommand) AutocompleteFlags() complete.Flags {
-	return c.Meta.AutocompleteFlags(FlagSetClient)
+	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
+		complete.Flags{
+			"-json": complete.PredictNothing,
+			"-t":    complete.PredictAnything,
+		})
 }
 
 func (c *QuotaStatusCommand) AutocompleteArgs() complete.Predictor {
@@ -46,8 +62,13 @@ func (c *QuotaStatusCommand) Synopsis() string {
 func (c *QuotaStatusCommand) Name() string { return "quota status" }
 
 func (c *QuotaStatusCommand) Run(args []string) int {
+	var json bool
+	var tmpl string
+
 	flags := c.Meta.FlagSet(c.Name(), FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
+	flags.BoolVar(&json, "json", false, "")
+	flags.StringVar(&tmpl, "t", "", "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -81,6 +102,17 @@ func (c *QuotaStatusCommand) Run(args []string) int {
 	if len(possible) != 0 {
 		c.Ui.Error(fmt.Sprintf("Prefix matched multiple quotas\n\n%s", formatQuotaSpecs(possible)))
 		return 1
+	}
+
+	if json || len(tmpl) > 0 {
+		out, err := Format(json, tmpl, spec)
+		if err != nil {
+			c.Ui.Error(err.Error())
+			return 1
+		}
+
+		c.Ui.Output(out)
+		return 0
 	}
 
 	// Format the basics
@@ -158,7 +190,7 @@ func formatQuotaLimits(spec *api.QuotaSpec, usages map[string]*api.QuotaUsage) s
 	sort.Sort(api.QuotaLimitSort(spec.Limits))
 
 	limits := make([]string, len(spec.Limits)+1)
-	limits[0] = "Region|CPU Usage|Memory Usage|Memory Max Usage|Network Usage"
+	limits[0] = "Region|CPU Usage|Memory Usage|Memory Max Usage|Variables Usage"
 	i := 0
 	for _, specLimit := range spec.Limits {
 		i++
@@ -174,18 +206,14 @@ func formatQuotaLimits(spec *api.QuotaSpec, usages map[string]*api.QuotaUsage) s
 			return used, ok
 		}
 
-		specBits := 0
-		if len(specLimit.RegionLimit.Networks) == 1 {
-			specBits = *specLimit.RegionLimit.Networks[0].MBits
-		}
-
 		used, ok := lookupUsage()
 		if !ok {
 			cpu := fmt.Sprintf("- / %s", formatQuotaLimitInt(specLimit.RegionLimit.CPU))
 			memory := fmt.Sprintf("- / %s", formatQuotaLimitInt(specLimit.RegionLimit.MemoryMB))
 			memoryMax := fmt.Sprintf("- / %s", formatQuotaLimitInt(specLimit.RegionLimit.MemoryMaxMB))
-			net := fmt.Sprintf("- / %s", formatQuotaLimitInt(&specBits))
-			limits[i] = fmt.Sprintf("%s|%s|%s|%s|%s", specLimit.Region, cpu, memory, memoryMax, net)
+
+			vars := fmt.Sprintf("- / %s", formatQuotaLimitInt(specLimit.VariablesLimit))
+			limits[i] = fmt.Sprintf("%s|%s|%s|%s|%s", specLimit.Region, cpu, memory, memoryMax, vars)
 			continue
 		}
 
@@ -200,11 +228,8 @@ func formatQuotaLimits(spec *api.QuotaSpec, usages map[string]*api.QuotaUsage) s
 		memory := fmt.Sprintf("%d / %s", orZero(used.RegionLimit.MemoryMB), formatQuotaLimitInt(specLimit.RegionLimit.MemoryMB))
 		memoryMax := fmt.Sprintf("%d / %s", orZero(used.RegionLimit.MemoryMaxMB), formatQuotaLimitInt(specLimit.RegionLimit.MemoryMaxMB))
 
-		net := fmt.Sprintf("- / %s", formatQuotaLimitInt(&specBits))
-		if len(used.RegionLimit.Networks) == 1 {
-			net = fmt.Sprintf("%d / %s", *used.RegionLimit.Networks[0].MBits, formatQuotaLimitInt(&specBits))
-		}
-		limits[i] = fmt.Sprintf("%s|%s|%s|%s|%s", specLimit.Region, cpu, memory, memoryMax, net)
+		vars := fmt.Sprintf("%d / %s", orZero(used.VariablesLimit), formatQuotaLimitInt(specLimit.VariablesLimit))
+		limits[i] = fmt.Sprintf("%s|%s|%s|%s|%s", specLimit.Region, cpu, memory, memoryMax, vars)
 	}
 
 	return formatList(limits)

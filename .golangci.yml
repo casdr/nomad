@@ -1,10 +1,14 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 run:
-  # timeout for analysis, e.g. 30s, 5m, default is 1m
+  # Timeout for analysis.
   deadline: 10m
 
-  # Modules download mode. If not empty, passed as -mod=<mode> to go tools
-  module-download-mode: vendor
+  # Modules download mode (do not modify go.mod)
+  module-download-mode: readonly
 
+  # Exclude test files
   tests: false
 
   # which dirs to skip: they won't be analyzed;
@@ -55,12 +59,6 @@ linters-settings:
   gofmt:
     # simplify code: gofmt with `-s` option, true by default
     simplify: true
-  depguard:
-    # disallow packages from being used
-    list-type: blacklist
-    packages:
-      - github.com/hashicorp/consul/command/flags
-      - github.com/boltdb/bolt
   gocritic:
     disabled-checks:
       - commentFormatting
@@ -83,16 +81,20 @@ linters:
     - gocritic
     - misspell
     - govet
-    - deadcode
-    - varcheck
     - ineffassign
-    - structcheck
     - unconvert
     - gofmt
     - gosimple
-    - depguard
     - staticcheck
-    # Stretch Goal
-    #- maligned
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - dogsled
+    - durationcheck
+    # - errchkjson (todo)
+    # - errorlint (todo)
+    - exportloopref
+    - usestdlibvars
   fast: false
 

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package codec
 
 import (
@@ -20,6 +23,9 @@ func (i *InmemCodec) ReadRequestHeader(req *rpc.Request) error {
 }
 
 func (i *InmemCodec) ReadRequestBody(args interface{}) error {
+	if args == nil {
+		return nil
+	}
 	sourceValue := reflect.Indirect(reflect.Indirect(reflect.ValueOf(i.Args)))
 	dst := reflect.Indirect(reflect.Indirect(reflect.ValueOf(args)))
 	dst.Set(sourceValue)

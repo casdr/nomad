@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 client {
   enabled = true
 
@@ -25,6 +28,12 @@ client {
       attempts    = 10
       backoff     = "15s"
       max_backoff = "20s"
+    }
+
+    nomad_retry {
+      attempts    = 15
+      backoff     = "20s"
+      max_backoff = "25s"
     }
   }
 

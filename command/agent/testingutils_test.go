@@ -1,21 +1,24 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
 )
 
 func MockJob() *api.Job {
 	job := &api.Job{
-		Region:      helper.StringToPtr("global"),
-		ID:          helper.StringToPtr(uuid.Generate()),
-		Name:        helper.StringToPtr("my-job"),
-		Type:        helper.StringToPtr("service"),
-		Priority:    helper.IntToPtr(50),
-		AllAtOnce:   helper.BoolToPtr(false),
+		Region:      pointer.Of("global"),
+		ID:          pointer.Of(uuid.Generate()),
+		Name:        pointer.Of("my-job"),
+		Type:        pointer.Of("service"),
+		Priority:    pointer.Of(50),
+		AllAtOnce:   pointer.Of(false),
 		Datacenters: []string{"dc1"},
 		Constraints: []*api.Constraint{
 			{
@@ -26,16 +29,17 @@ func MockJob() *api.Job {
 		},
 		TaskGroups: []*api.TaskGroup{
 			{
-				Name:  helper.StringToPtr("web"),
-				Count: helper.IntToPtr(10),
+				Name:  pointer.Of("web"),
+				Count: pointer.Of(10),
 				EphemeralDisk: &api.EphemeralDisk{
-					SizeMB: helper.IntToPtr(150),
+					SizeMB: pointer.Of(150),
 				},
 				RestartPolicy: &api.RestartPolicy{
-					Attempts: helper.IntToPtr(3),
-					Interval: helper.TimeToPtr(10 * time.Minute),
-					Delay:    helper.TimeToPtr(1 * time.Minute),
-					Mode:     helper.StringToPtr("delay"),
+					Attempts:        pointer.Of(3),
+					Interval:        pointer.Of(10 * time.Minute),
+					Delay:           pointer.Of(1 * time.Minute),
+					Mode:            pointer.Of("delay"),
+					RenderTemplates: pointer.Of(false),
 				},
 				Networks: []*api.NetworkResource{
 					{
@@ -74,10 +78,23 @@ func MockJob() *api.Job {
 								PortLabel: "admin",
 							},
 						},
+						// actions
+						Actions: []*api.Action{
+							{
+								Name:    "date-test",
+								Command: "/bin/date",
+								Args:    []string{"-u"},
+							},
+							{
+								Name:    "echo-test",
+								Command: "/bin/echo",
+								Args:    []string{"hello world"},
+							},
+						},
 						LogConfig: api.DefaultLogConfig(),
 						Resources: &api.Resources{
-							CPU:      helper.IntToPtr(500),
-							MemoryMB: helper.IntToPtr(256),
+							CPU:      pointer.Of(500),
+							MemoryMB: pointer.Of(256),
 						},
 						Meta: map[string]string{
 							"foo": "bar",
@@ -101,6 +118,24 @@ func MockJob() *api.Job {
 
 func MockRegionalJob() *api.Job {
 	j := MockJob()
-	j.Region = helper.StringToPtr("north-america")
+	j.Region = pointer.Of("north-america")
 	return j
+}
+
+// MockRunnableJob returns a mock job that has a configuration that allows it to be
+// placed on a TestAgent.
+func MockRunnableJob() *api.Job {
+	job := MockJob()
+
+	// Configure job so it can be run on a TestAgent
+	job.Constraints = nil
+	job.TaskGroups[0].Constraints = nil
+	job.TaskGroups[0].Count = pointer.Of(1)
+	job.TaskGroups[0].Tasks[0].Driver = "mock_driver"
+	job.TaskGroups[0].Tasks[0].Services = nil
+	job.TaskGroups[0].Tasks[0].Config = map[string]interface{}{
+		"run_for": "10s",
+	}
+
+	return job
 }

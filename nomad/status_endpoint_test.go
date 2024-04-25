@@ -1,9 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
 	"testing"
 
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/helper/uuid"
@@ -21,7 +24,7 @@ func TestStatusPing(t *testing.T) {
 	defer cleanupS1()
 	codec := rpcClient(t, s1)
 
-	arg := struct{}{}
+	arg := &structs.GenericRequest{}
 	var out struct{}
 	if err := msgpackrpc.CallWithCodec(codec, "Status.Ping", arg, &out); err != nil {
 		t.Fatalf("err: %v", err)

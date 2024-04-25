@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -10,18 +13,17 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/time/rate"
-
-	metrics "github.com/armon/go-metrics"
-	log "github.com/hashicorp/go-hclog"
-	memdb "github.com/hashicorp/go-memdb"
-	version "github.com/hashicorp/go-version"
+	"github.com/armon/go-metrics"
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
-	"github.com/pkg/errors"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -46,9 +48,41 @@ var minSchedulerConfigVersion = version.Must(version.NewVersion("0.9.0"))
 
 var minClusterIDVersion = version.Must(version.NewVersion("0.10.4"))
 
-var minJobRegisterAtomicEvalVersion = version.Must(version.NewVersion("0.12.1"))
-
 var minOneTimeAuthenticationTokenVersion = version.Must(version.NewVersion("1.1.0"))
+
+// minACLRoleVersion is the Nomad version at which the ACL role table was
+// introduced. It forms the minimum version all federated servers must meet
+// before the feature can be used.
+var minACLRoleVersion = version.Must(version.NewVersion("1.4.0"))
+
+// minACLAuthMethodVersion is the Nomad version at which the ACL auth methods
+// table was introduced. It forms the minimum version all federated servers must
+// meet before the feature can be used.
+var minACLAuthMethodVersion = version.Must(version.NewVersion("1.5.0"))
+
+// minACLJWTAuthMethodVersion is the Nomad version at which the ACL JWT auth method type
+// was introduced. It forms the minimum version all federated servers must
+// meet before the feature can be used.
+var minACLJWTAuthMethodVersion = version.Must(version.NewVersion("1.5.4"))
+
+// minACLBindingRuleVersion is the Nomad version at which the ACL binding rules
+// table was introduced. It forms the minimum version all federated servers
+// must meet before the feature can be used.
+var minACLBindingRuleVersion = version.Must(version.NewVersion("1.5.0"))
+
+// minNomadServiceRegistrationVersion is the Nomad version at which the service
+// registrations table was introduced. It forms the minimum version all local
+// servers must meet before the feature can be used.
+var minNomadServiceRegistrationVersion = version.Must(version.NewVersion("1.3.0"))
+
+// Any writes to node pools requires that all servers are on version 1.6.0 to
+// prevent older versions of the server from crashing.
+var minNodePoolsVersion = version.Must(version.NewVersion("1.6.0"))
+
+// minVersionMultiIdentities is the Nomad version at which users can add
+// multiple identity blocks to tasks and workload identities can be
+// automatically added to jobs that need access to Consul or Vault
+var minVersionMultiIdentities = version.Must(version.NewVersion("1.7.0"))
 
 // monitorLeadership is used to monitor if we acquire or lose our role
 // as the leader in the Raft cluster. There is some work the leader is
@@ -118,6 +152,50 @@ func (s *Server) monitorLeadership() {
 			return
 		}
 	}
+}
+
+func (s *Server) leadershipTransferToServer(to structs.RaftIDAddress) error {
+	if l := structs.NewRaftIDAddress(s.raft.LeaderWithID()); l == to {
+		s.logger.Debug("leadership transfer to current leader is a no-op")
+		return nil
+	}
+	retryCount := 3
+	var lastError error
+	for i := 0; i < retryCount; i++ {
+		err := s.raft.LeadershipTransferToServer(to.ID, to.Address).Error()
+		if err == nil {
+			s.logger.Info("successfully transferred leadership")
+			return nil
+		}
+
+		// "cannot transfer leadership to itself"
+		// Handled at top of function, but reapplied here to prevent retrying if
+		// it occurs while we are retrying
+		if err.Error() == "cannot transfer leadership to itself" {
+			s.logger.Debug("leadership transfer to current leader is a no-op")
+			return nil
+		}
+
+		// ErrRaftShutdown: Don't retry if raft is shut down.
+		if err == raft.ErrRaftShutdown {
+			return err
+		}
+
+		// ErrUnsupportedProtocol: Don't retry if the Raft version doesn't
+		// support leadership transfer since this will never succeed.
+		if err == raft.ErrUnsupportedProtocol {
+			return fmt.Errorf("leadership transfer not supported with Raft version lower than 3")
+		}
+
+		// ErrEnqueueTimeout: This seems to be the valid time to retry.
+		s.logger.Error("failed to transfer leadership attempt, will retry",
+			"attempt", i,
+			"retry_limit", retryCount,
+			"error", err,
+		)
+		lastError = err
+	}
+	return fmt.Errorf("failed to transfer leadership in %d attempts. last error: %w", retryCount, lastError)
 }
 
 func (s *Server) leadershipTransfer() error {
@@ -289,14 +367,16 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 
 	// Initialize and start the autopilot routine
 	s.getOrCreateAutopilotConfig()
-	s.autopilot.Start()
+	s.autopilot.Start(s.shutdownCtx)
 
-	// Initialize scheduler configuration
-	s.getOrCreateSchedulerConfig()
+	// Initialize scheduler configuration.
+	schedulerConfig := s.getOrCreateSchedulerConfig()
 
-	// Initialize the ClusterID
-	_, _ = s.ClusterID()
-	// todo: use cluster ID for stuff, later!
+	// Initialize the Cluster metadata
+	clusterMetadata, err := s.ClusterMetadata()
+	if err != nil {
+		return err
+	}
 
 	// Enable the plan queue, since we are now the leader
 	s.planQueue.SetEnabled(true)
@@ -304,12 +384,9 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	// Start the plan evaluator
 	go s.planApply()
 
-	// Enable the eval broker, since we are now the leader
-	s.evalBroker.SetEnabled(true)
-
-	// Enable the blocked eval tracker, since we are now the leader
-	s.blockedEvals.SetEnabled(true)
-	s.blockedEvals.SetTimetable(s.fsm.TimeTable())
+	// Start the eval broker and blocked eval broker if these are not paused by
+	// the operator.
+	restoreEvals := s.handleEvalBrokerStateChange(schedulerConfig)
 
 	// Enable the deployment watcher, since we are now the leader
 	s.deploymentWatcher.SetEnabled(true, s.State())
@@ -320,9 +397,12 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	// Enable the volume watcher, since we are now the leader
 	s.volumeWatcher.SetEnabled(true, s.State(), s.getLeaderAcl())
 
-	// Restore the eval broker state
-	if err := s.restoreEvals(); err != nil {
-		return err
+	// Restore the eval broker state and blocked eval state. If these are
+	// currently paused, we do not need to do this.
+	if restoreEvals {
+		if err := s.restoreEvals(); err != nil {
+			return err
+		}
 	}
 
 	// Activate the vault client
@@ -338,12 +418,16 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 
 	// Further clean ups and follow up that don't block RPC consistency
 
+	// Create the first root key if it doesn't already exist
+	go s.initializeKeyring(stopCh)
+
 	// Restore the periodic dispatcher state
 	if err := s.restorePeriodicDispatcher(); err != nil {
 		return err
 	}
 
-	// Scheduler periodic jobs
+	// Schedule periodic jobs which include expired local ACL token garbage
+	// collection.
 	go s.schedulePeriodic(stopCh)
 
 	// Reap any failed evaluations
@@ -351,6 +435,9 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 
 	// Reap any duplicate blocked evaluations
 	go s.reapDupBlockedEvaluations(stopCh)
+
+	// Reap any cancelable evaluations
+	s.reapCancelableEvalsCh = s.reapCancelableEvaluations(stopCh)
 
 	// Periodically unblock failed allocations
 	go s.periodicUnblockFailedEvals(stopCh)
@@ -360,6 +447,17 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 
 	// Periodically publish job status metrics
 	go s.publishJobStatusMetrics(stopCh)
+
+	// Populate the variable lock TTL timers, so we can start tracking renewals
+	// and expirations.
+	if err := s.restoreLockTTLTimers(); err != nil {
+		return err
+	}
+
+	// Periodically publish metrics for the lock timer trackers which are only
+	// run on the leader.
+	go s.lockTTLTimer.EmitMetrics(1*time.Second, stopCh)
+	go s.lockDelayTimer.EmitMetrics(1*time.Second, stopCh)
 
 	// Setup the heartbeat timers. This is done both when starting up or when
 	// a leader fail over happens. Since the timers are maintained by the leader
@@ -375,16 +473,30 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 		return err
 	}
 
-	// Start replication of ACLs and Policies if they are enabled,
-	// and we are not the authoritative region.
-	if s.config.ACLEnabled && s.config.Region != s.config.AuthoritativeRegion {
-		go s.replicateACLPolicies(stopCh)
-		go s.replicateACLTokens(stopCh)
-		go s.replicateNamespaces(stopCh)
+	// If ACLs are enabled, the leader needs to start a number of long-lived
+	// routines. Exactly which routines, depends on whether this leader is
+	// running within the authoritative region or not.
+	if s.config.ACLEnabled {
+
+		// The authoritative region is responsible for garbage collecting
+		// expired global tokens. Otherwise, non-authoritative regions need to
+		// replicate policies, tokens, and namespaces.
+		switch s.config.AuthoritativeRegion {
+		case s.config.Region:
+			go s.schedulePeriodicAuthoritative(stopCh)
+		default:
+			go s.replicateACLPolicies(stopCh)
+			go s.replicateACLTokens(stopCh)
+			go s.replicateACLRoles(stopCh)
+			go s.replicateACLAuthMethods(stopCh)
+			go s.replicateACLBindingRules(stopCh)
+			go s.replicateNamespaces(stopCh)
+			go s.replicateNodePools(stopCh)
+		}
 	}
 
 	// Setup any enterprise systems required.
-	if err := s.establishEnterpriseLeadership(stopCh); err != nil {
+	if err := s.establishEnterpriseLeadership(stopCh, clusterMetadata); err != nil {
 		return err
 	}
 
@@ -551,6 +663,146 @@ func diffNamespaces(state *state.StateStore, minIndex uint64, remoteList []*stru
 	return
 }
 
+// replicateNodePools is used to replicate node pools from the authoritative
+// region to this region.
+func (s *Server) replicateNodePools(stopCh chan struct{}) {
+	req := structs.NodePoolListRequest{
+		QueryOptions: structs.QueryOptions{
+			Region:     s.config.AuthoritativeRegion,
+			AllowStale: true,
+		},
+	}
+	limiter := rate.NewLimiter(replicationRateLimit, int(replicationRateLimit))
+	s.logger.Debug("starting node pool replication from authoritative region", "region", req.Region)
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		// Rate limit how often we attempt replication
+		limiter.Wait(context.Background())
+
+		if !ServersMeetMinimumVersion(
+			s.serf.Members(), s.Region(), minNodePoolsVersion, true) {
+			s.logger.Trace(
+				"all servers must be upgraded to 1.6.0 before Node Pools can be replicated")
+			if s.replicationBackoffContinue(stopCh) {
+				continue
+			} else {
+				return
+			}
+		}
+
+		var resp structs.NodePoolListResponse
+		req.AuthToken = s.ReplicationToken()
+		err := s.forwardRegion(s.config.AuthoritativeRegion, "NodePool.List", &req, &resp)
+		if err != nil {
+			s.logger.Error("failed to fetch node pools from authoritative region", "error", err)
+			if s.replicationBackoffContinue(stopCh) {
+				continue
+			} else {
+				return
+			}
+		}
+
+		// Perform a two-way diff
+		delete, update := diffNodePools(s.State(), req.MinQueryIndex, resp.NodePools)
+
+		// A significant amount of time could pass between the last check
+		// on whether we should stop the replication process. Therefore, do
+		// a check here, before calling Raft.
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		// Delete node pools that should not exist
+		if len(delete) > 0 {
+			args := &structs.NodePoolDeleteRequest{
+				Names: delete,
+			}
+			_, _, err := s.raftApply(structs.NodePoolDeleteRequestType, args)
+			if err != nil {
+				s.logger.Error("failed to delete node pools", "error", err)
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+		}
+
+		// Update local node pools
+		if len(update) > 0 {
+			args := &structs.NodePoolUpsertRequest{
+				NodePools: update,
+			}
+			_, _, err := s.raftApply(structs.NodePoolUpsertRequestType, args)
+			if err != nil {
+				s.logger.Error("failed to update node pools", "error", err)
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+		}
+
+		// Update the minimum query index, blocks until there is a change.
+		req.MinQueryIndex = resp.Index
+	}
+}
+
+// diffNodePools is used to perform a two-way diff between the local node pools
+// and the remote node pools to determine which node pools need to be deleted or
+// updated.
+func diffNodePools(store *state.StateStore, minIndex uint64, remoteList []*structs.NodePool) (delete []string, update []*structs.NodePool) {
+	// Construct a set of the local and remote node pools
+	local := make(map[string][]byte)
+	remote := make(map[string]struct{})
+
+	// Add all the local node pools
+	iter, err := store.NodePools(nil, state.SortDefault)
+	if err != nil {
+		panic("failed to iterate local node pools")
+	}
+	for {
+		raw := iter.Next()
+		if raw == nil {
+			break
+		}
+		pool := raw.(*structs.NodePool)
+		local[pool.Name] = pool.Hash
+	}
+
+	for _, rnp := range remoteList {
+		remote[rnp.Name] = struct{}{}
+
+		if localHash, ok := local[rnp.Name]; !ok {
+			// Node pools that are missing locally should be added
+			update = append(update, rnp)
+
+		} else if rnp.ModifyIndex > minIndex && !bytes.Equal(localHash, rnp.Hash) {
+			// Node pools that have been added/updated more recently than the
+			// last index we saw, and have a hash mismatch with what we have
+			// locally, should be updated.
+			update = append(update, rnp)
+		}
+	}
+
+	// Node pools that don't exist on the remote should be deleted
+	for lnp := range local {
+		if _, ok := remote[lnp]; !ok {
+			delete = append(delete, lnp)
+		}
+	}
+	return
+}
+
 // restoreEvals is used to restore pending evaluations into the eval broker and
 // blocked evaluations into the blocked eval tracker. The broker and blocked
 // eval tracker is maintained only by the leader, so it must be restored anytime
@@ -571,7 +823,7 @@ func (s *Server) restoreEvals() error {
 		eval := raw.(*structs.Evaluation)
 
 		if eval.ShouldEnqueue() {
-			s.evalBroker.Enqueue(eval)
+			s.evalBroker.Restore(eval)
 		} else if eval.ShouldBlock() {
 			s.blockedEvals.Block(eval)
 		}
@@ -640,7 +892,7 @@ func (s *Server) revokeSITokenAccessorsOnRestore() error {
 	fsmState := s.fsm.State()
 	iter, err := fsmState.SITokenAccessors(ws)
 	if err != nil {
-		return errors.Wrap(err, "failed to get SI token accessors")
+		return fmt.Errorf("failed to get SI token accessors: %w", err)
 	}
 
 	var toRevoke []*structs.SITokenAccessor
@@ -650,7 +902,7 @@ func (s *Server) revokeSITokenAccessorsOnRestore() error {
 		// Check the allocation
 		alloc, err := fsmState.AllocByID(ws, accessor.AllocID)
 		if err != nil {
-			return errors.Wrapf(err, "failed to lookup alloc %q", accessor.AllocID)
+			return fmt.Errorf("failed to lookup alloc %q: %w", accessor.AllocID, err)
 		}
 		if alloc == nil || alloc.Terminated() {
 			// no longer running and associated accessors should be revoked
@@ -661,7 +913,7 @@ func (s *Server) revokeSITokenAccessorsOnRestore() error {
 		// Check the node
 		node, err := fsmState.NodeByID(ws, accessor.NodeID)
 		if err != nil {
-			return errors.Wrapf(err, "failed to lookup node %q", accessor.NodeID)
+			return fmt.Errorf("failed to lookup node %q: %w", accessor.NodeID, err)
 		}
 		if node == nil || node.TerminalStatus() {
 			// node is terminal and associated accessors should be revoked
@@ -737,14 +989,43 @@ func (s *Server) restorePeriodicDispatcher() error {
 			continue
 		}
 
-		if _, err := s.periodicDispatcher.ForceRun(job.Namespace, job.ID); err != nil {
+		// We skip if the job doesn't allow overlap and there are already
+		// instances running
+		allowed, err := s.cronJobOverlapAllowed(job)
+		if err != nil {
+			return fmt.Errorf("failed to get job status: %v", err)
+		}
+		if !allowed {
+			continue
+		}
+
+		if _, err := s.periodicDispatcher.ForceEval(job.Namespace, job.ID); err != nil {
 			logger.Error("force run of periodic job failed", "job", job.NamespacedID(), "error", err)
 			return fmt.Errorf("force run of periodic job %q failed: %v", job.NamespacedID(), err)
 		}
-		logger.Debug("periodic job force runned during leadership establishment", "job", job.NamespacedID())
+
+		logger.Debug("periodic job force run during leadership establishment", "job", job.NamespacedID())
 	}
 
 	return nil
+}
+
+// cronJobOverlapAllowed checks if the job allows for overlap and if there are already
+// instances of the job running in order to determine if a new evaluation needs to
+// be created upon periodic dispatcher restore
+func (s *Server) cronJobOverlapAllowed(job *structs.Job) (bool, error) {
+	if job.Periodic.ProhibitOverlap {
+		running, err := s.periodicDispatcher.dispatcher.RunningChildren(job)
+		if err != nil {
+			return false, fmt.Errorf("failed to determine if periodic job has running children %q error %q", job.NamespacedID(), err)
+		}
+
+		if running {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 // schedulePeriodic is used to do periodic job dispatch while we are leader
@@ -763,58 +1044,102 @@ func (s *Server) schedulePeriodic(stopCh chan struct{}) {
 	defer csiVolumeClaimGC.Stop()
 	oneTimeTokenGC := time.NewTicker(s.config.OneTimeTokenGCInterval)
 	defer oneTimeTokenGC.Stop()
+	rootKeyGC := time.NewTicker(s.config.RootKeyGCInterval)
+	defer rootKeyGC.Stop()
+	variablesRekey := time.NewTicker(s.config.VariablesRekeyInterval)
+	defer variablesRekey.Stop()
 
-	// getLatest grabs the latest index from the state store. It returns true if
-	// the index was retrieved successfully.
-	getLatest := func() (uint64, bool) {
-		snapshotIndex, err := s.fsm.State().LatestIndex()
-		if err != nil {
-			s.logger.Error("failed to determine state store's index", "error", err)
-			return 0, false
-		}
-
-		return snapshotIndex, true
-	}
+	// Set up the expired ACL local token garbage collection timer.
+	localTokenExpiredGC, localTokenExpiredGCStop := helper.NewSafeTimer(s.config.ACLTokenExpirationGCInterval)
+	defer localTokenExpiredGCStop()
 
 	for {
 
 		select {
 		case <-evalGC.C:
-			if index, ok := getLatest(); ok {
+			if index, ok := s.getLatestIndex(); ok {
 				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobEvalGC, index))
 			}
 		case <-nodeGC.C:
-			if index, ok := getLatest(); ok {
+			if index, ok := s.getLatestIndex(); ok {
 				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobNodeGC, index))
 			}
 		case <-jobGC.C:
-			if index, ok := getLatest(); ok {
+			if index, ok := s.getLatestIndex(); ok {
 				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobJobGC, index))
 			}
 		case <-deploymentGC.C:
-			if index, ok := getLatest(); ok {
+			if index, ok := s.getLatestIndex(); ok {
 				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobDeploymentGC, index))
 			}
 		case <-csiPluginGC.C:
-			if index, ok := getLatest(); ok {
+			if index, ok := s.getLatestIndex(); ok {
 				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobCSIPluginGC, index))
 			}
 		case <-csiVolumeClaimGC.C:
-			if index, ok := getLatest(); ok {
+			if index, ok := s.getLatestIndex(); ok {
 				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobCSIVolumeClaimGC, index))
 			}
 		case <-oneTimeTokenGC.C:
-			if !ServersMeetMinimumVersion(s.Members(), minOneTimeAuthenticationTokenVersion, false) {
+			if !ServersMeetMinimumVersion(s.Members(), s.Region(), minOneTimeAuthenticationTokenVersion, false) {
 				continue
 			}
 
-			if index, ok := getLatest(); ok {
+			if index, ok := s.getLatestIndex(); ok {
 				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobOneTimeTokenGC, index))
+			}
+		case <-localTokenExpiredGC.C:
+			if index, ok := s.getLatestIndex(); ok {
+				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobLocalTokenExpiredGC, index))
+			}
+			localTokenExpiredGC.Reset(s.config.ACLTokenExpirationGCInterval)
+		case <-rootKeyGC.C:
+			if index, ok := s.getLatestIndex(); ok {
+				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobRootKeyRotateOrGC, index))
+			}
+		case <-variablesRekey.C:
+			if index, ok := s.getLatestIndex(); ok {
+				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobVariablesRekey, index))
 			}
 		case <-stopCh:
 			return
 		}
 	}
+}
+
+// schedulePeriodicAuthoritative is a long-lived routine intended for use on
+// the leader within the authoritative region only. It periodically queues work
+// onto the _core scheduler for ACL based activities such as removing expired
+// global ACL tokens.
+func (s *Server) schedulePeriodicAuthoritative(stopCh chan struct{}) {
+
+	// Set up the expired ACL global token garbage collection timer.
+	globalTokenExpiredGC, globalTokenExpiredGCStop := helper.NewSafeTimer(s.config.ACLTokenExpirationGCInterval)
+	defer globalTokenExpiredGCStop()
+
+	for {
+		select {
+		case <-globalTokenExpiredGC.C:
+			if index, ok := s.getLatestIndex(); ok {
+				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobGlobalTokenExpiredGC, index))
+			}
+			globalTokenExpiredGC.Reset(s.config.ACLTokenExpirationGCInterval)
+		case <-stopCh:
+			return
+		}
+	}
+}
+
+// getLatestIndex is a helper function which returns the latest index from the
+// state store. The boolean return indicates whether the call has been
+// successful or not.
+func (s *Server) getLatestIndex() (uint64, bool) {
+	snapshotIndex, err := s.fsm.State().LatestIndex()
+	if err != nil {
+		s.logger.Error("failed to determine state store's index", "error", err)
+		return 0, false
+	}
+	return snapshotIndex, true
 }
 
 // coreJobEval returns an evaluation for a core job
@@ -854,7 +1179,7 @@ func (s *Server) reapFailedEvaluations(stopCh chan struct{}) {
 			updateEval.Status = structs.EvalStatusFailed
 			updateEval.StatusDescription = fmt.Sprintf("evaluation reached delivery limit (%d)", s.config.EvalDeliveryLimit)
 			s.logger.Warn("eval reached delivery limit, marking as failed",
-				"eval", log.Fmt("%#v", updateEval))
+				"eval", hclog.Fmt("%#v", updateEval))
 
 			// Core job evals that fail or span leader elections will never
 			// succeed because the follow-up doesn't have the leader ACL. We
@@ -878,7 +1203,7 @@ func (s *Server) reapFailedEvaluations(stopCh chan struct{}) {
 				}
 				if _, _, err := s.raftApply(structs.EvalUpdateRequestType, &req); err != nil {
 					s.logger.Error("failed to update failed eval and create a follow-up",
-						"eval", log.Fmt("%#v", updateEval), "error", err)
+						"eval", hclog.Fmt("%#v", updateEval), "error", err)
 					continue
 				}
 			}
@@ -917,11 +1242,73 @@ func (s *Server) reapDupBlockedEvaluations(stopCh chan struct{}) {
 				Evals: cancel,
 			}
 			if _, _, err := s.raftApply(structs.EvalUpdateRequestType, &req); err != nil {
-				s.logger.Error("failed to update duplicate evals", "evals", log.Fmt("%#v", cancel), "error", err)
+				s.logger.Error("failed to update duplicate evals", "evals", hclog.Fmt("%#v", cancel), "error", err)
 				continue
 			}
 		}
 	}
+}
+
+// reapCancelableEvaluations is used to reap evaluations that were marked
+// cancelable by the eval broker and should be canceled. These get swept up
+// whenever an eval Acks, but this ensures that we don't have a straggling batch
+// when the cluster doesn't have any more work to do. Returns a wake-up channel
+// that can be used to trigger a new reap without waiting for the timer
+func (s *Server) reapCancelableEvaluations(stopCh chan struct{}) chan struct{} {
+
+	wakeCh := make(chan struct{}, 1)
+	go func() {
+
+		timer, cancel := helper.NewSafeTimer(s.config.EvalReapCancelableInterval)
+		defer cancel()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-wakeCh:
+				cancelCancelableEvals(s)
+			case <-timer.C:
+				cancelCancelableEvals(s)
+				timer.Reset(s.config.EvalReapCancelableInterval)
+			}
+		}
+	}()
+
+	return wakeCh
+}
+
+const cancelableEvalsBatchSize = 728 // structs.MaxUUIDsPerWriteRequest / 10
+
+// cancelCancelableEvals pulls a batch of cancelable evaluations from the eval
+// broker and updates their status to canceled.
+func cancelCancelableEvals(srv *Server) error {
+
+	const cancelDesc = "canceled after more recent eval was processed"
+
+	// We *can* send larger raft logs but rough benchmarks show that a smaller
+	// page size strikes a balance between throughput and time we block the FSM
+	// apply for other operations
+	cancelable := srv.evalBroker.Cancelable(cancelableEvalsBatchSize)
+	if len(cancelable) > 0 {
+		for i, eval := range cancelable {
+			eval = eval.Copy()
+			eval.Status = structs.EvalStatusCancelled
+			eval.StatusDescription = cancelDesc
+			eval.UpdateModifyTime()
+			cancelable[i] = eval
+		}
+
+		update := &structs.EvalUpdateRequest{
+			Evals:        cancelable,
+			WriteRequest: structs.WriteRequest{Region: srv.Region()},
+		}
+		_, _, err := srv.raftApply(structs.EvalUpdateRequestType, update)
+		if err != nil {
+			srv.logger.Warn("eval cancel failed", "error", err, "method", "ack")
+			return err
+		}
+	}
+	return nil
 }
 
 // periodicUnblockFailedEvals periodically unblocks failed, blocked evaluations.
@@ -1035,6 +1422,8 @@ func (s *Server) iterateJobSummaryMetrics(summary *structs.JobSummary) {
 			float32(tgSummary.Starting), labels)
 		metrics.SetGaugeWithLabels([]string{"nomad", "job_summary", "lost"},
 			float32(tgSummary.Lost), labels)
+		metrics.SetGaugeWithLabels([]string{"nomad", "job_summary", "unknown"},
+			float32(tgSummary.Unknown), labels)
 	}
 }
 
@@ -1049,13 +1438,13 @@ func (s *Server) publishJobStatusMetrics(stopCh chan struct{}) {
 			return
 		case <-timer.C:
 			timer.Reset(s.config.StatsCollectionInterval)
-			state, err := s.State().Snapshot()
+			snap, err := s.State().Snapshot()
 			if err != nil {
 				s.logger.Error("failed to get state", "error", err)
 				continue
 			}
 			ws := memdb.NewWatchSet()
-			iter, err := state.Jobs(ws)
+			iter, err := snap.Jobs(ws, state.SortDefault)
 			if err != nil {
 				s.logger.Error("failed to get job statuses", "error", err)
 				continue
@@ -1110,11 +1499,13 @@ func (s *Server) revokeLeadership() error {
 	// Disable the plan queue, since we are no longer leader
 	s.planQueue.SetEnabled(false)
 
-	// Disable the eval broker, since it is only useful as a leader
+	// Disable the eval broker and blocked evals. We do not need to check the
+	// scheduler configuration paused eval broker value, as the brokers should
+	// always be paused on the non-leader.
+	s.brokerLock.Lock()
 	s.evalBroker.SetEnabled(false)
-
-	// Disable the blocked eval tracker, since it is only useful as a leader
 	s.blockedEvals.SetEnabled(false)
+	s.brokerLock.Unlock()
 
 	// Disable the periodic dispatcher, since it is only useful as a leader
 	s.periodicDispatcher.SetEnabled(false)
@@ -1135,6 +1526,10 @@ func (s *Server) revokeLeadership() error {
 	if err := s.revokeEnterpriseLeadership(); err != nil {
 		return err
 	}
+
+	// Stop all the tracked variable lock TTL and delay timers.
+	s.lockTTLTimer.StopAndRemoveAll()
+	s.lockDelayTimer.RemoveAll()
 
 	// Clear the heartbeat timers on either shutdown or step down,
 	// since we are no longer responsible for TTL expirations.
@@ -1237,7 +1632,7 @@ func (s *Server) addRaftPeer(m serf.Member, parts *serverParts) error {
 	// but we want to avoid doing that if possible to prevent useless Raft
 	// log entries. If the address is the same but the ID changed, remove the
 	// old server before adding the new one.
-	minRaftProtocol, err := s.autopilot.MinRaftProtocol()
+	minRaftProtocol, err := s.MinRaftProtocol()
 	if err != nil {
 		return err
 	}
@@ -1307,29 +1702,33 @@ func (s *Server) removeRaftPeer(m serf.Member, parts *serverParts) error {
 		return err
 	}
 
-	minRaftProtocol, err := s.autopilot.MinRaftProtocol()
+	minRaftProtocol, err := s.MinRaftProtocol()
 	if err != nil {
 		return err
 	}
 
 	// Pick which remove API to use based on how the server was added.
 	for _, server := range configFuture.Configuration().Servers {
-		// If we understand the new add/remove APIs and the server was added by ID, use the new remove API
-		if minRaftProtocol >= 2 && server.ID == raft.ServerID(parts.ID) {
-			s.logger.Info("removing server by ID", "id", server.ID)
-			future := s.raft.RemoveServer(raft.ServerID(parts.ID), 0, 0)
-			if err := future.Error(); err != nil {
-				s.logger.Error("failed to remove raft peer", "id", server.ID, "error", err)
-				return err
-			}
-			break
-		} else if server.Address == raft.ServerAddress(addr) {
-			// If not, use the old remove API
-			s.logger.Info("removing server by address", "address", server.Address)
-			future := s.raft.RemovePeer(raft.ServerAddress(addr))
-			if err := future.Error(); err != nil {
-				s.logger.Error("failed to remove raft peer", "address", addr, "error", err)
-				return err
+		// Check if this is the server to remove based on how it was registered.
+		// Raft v2 servers are registered by address.
+		// Raft v3 servers are registered by ID.
+		if server.ID == raft.ServerID(parts.ID) || server.Address == raft.ServerAddress(addr) {
+			// Use the new add/remove APIs if we understand them.
+			if minRaftProtocol >= 2 {
+				s.logger.Info("removing server by ID", "id", server.ID)
+				future := s.raft.RemoveServer(server.ID, 0, 0)
+				if err := future.Error(); err != nil {
+					s.logger.Error("failed to remove raft peer", "id", server.ID, "error", err)
+					return err
+				}
+			} else {
+				// If not, use the old remove API
+				s.logger.Info("removing server by address", "address", server.Address)
+				future := s.raft.RemovePeer(raft.ServerAddress(addr))
+				if err := future.Error(); err != nil {
+					s.logger.Error("failed to remove raft peer", "address", addr, "error", err)
+					return err
+				}
 			}
 			break
 		}
@@ -1621,6 +2020,653 @@ func diffACLTokens(store *state.StateStore, minIndex uint64, remoteList []*struc
 	return
 }
 
+// replicateACLRoles is used to replicate ACL Roles from the authoritative
+// region to this region. The loop should only be run on the leader within the
+// federated region.
+func (s *Server) replicateACLRoles(stopCh chan struct{}) {
+
+	// Generate our request object. We only need to do this once and reuse it
+	// for every RPC request. The MinQueryIndex is updated after every
+	// successful replication loop, so the next query acts as a blocking query
+	// and only returns upon a change in the authoritative region.
+	req := structs.ACLRolesListRequest{
+		QueryOptions: structs.QueryOptions{
+			AllowStale: true,
+			Region:     s.config.AuthoritativeRegion,
+		},
+	}
+
+	// Create our replication rate limiter for ACL roles and log a lovely
+	// message to indicate the process is starting.
+	limiter := rate.NewLimiter(replicationRateLimit, int(replicationRateLimit))
+	s.logger.Debug("starting ACL Role replication from authoritative region",
+		"authoritative_region", req.Region)
+
+	// Enter the main ACL Role replication loop that will only exit when the
+	// stopCh is closed.
+	//
+	// Any error encountered will use the replicationBackoffContinue function
+	// which handles replication backoff and shutdown coordination in the event
+	// of an error inside the loop.
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+
+			// Rate limit how often we attempt replication. It is OK to ignore
+			// the error as the context will never be cancelled and the limit
+			// parameters are controlled internally.
+			_ = limiter.Wait(context.Background())
+
+			if !ServersMeetMinimumVersion(
+				s.serf.Members(), s.Region(), minACLRoleVersion, true) {
+				s.logger.Trace(
+					"all servers must be upgraded to 1.4.0 or later before ACL Roles can be replicated")
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
+			// Set the replication token on each replication iteration so that
+			// it is always current and can handle agent SIGHUP reloads.
+			req.AuthToken = s.ReplicationToken()
+
+			var resp structs.ACLRolesListResponse
+
+			// Make the list RPC request to the authoritative region, so we
+			// capture the latest ACL role listing.
+			err := s.forwardRegion(s.config.AuthoritativeRegion, structs.ACLListRolesRPCMethod, &req, &resp)
+			if err != nil {
+				s.logger.Error("failed to fetch ACL Roles from authoritative region", "error", err)
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
+			// Perform a two-way diff on the ACL roles.
+			toDelete, toUpdate := diffACLRoles(s.State(), req.MinQueryIndex, resp.ACLRoles)
+
+			// A significant amount of time could pass between the last check
+			// on whether we should stop the replication process. Therefore, do
+			// a check here, before calling Raft.
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+
+			// If we have ACL roles to delete, make this call directly to Raft.
+			if len(toDelete) > 0 {
+				args := structs.ACLRolesDeleteByIDRequest{ACLRoleIDs: toDelete}
+				_, _, err := s.raftApply(structs.ACLRolesDeleteByIDRequestType, &args)
+
+				// If the error was because we lost leadership while calling
+				// Raft, avoid logging as this can be confusing to operators.
+				if err != nil {
+					if err != raft.ErrLeadershipLost {
+						s.logger.Error("failed to delete ACL roles", "error", err)
+					}
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+			}
+
+			// Fetch any outdated policies.
+			var fetched []*structs.ACLRole
+			if len(toUpdate) > 0 {
+				req := structs.ACLRolesByIDRequest{
+					ACLRoleIDs: toUpdate,
+					QueryOptions: structs.QueryOptions{
+						Region:        s.config.AuthoritativeRegion,
+						AuthToken:     s.ReplicationToken(),
+						AllowStale:    true,
+						MinQueryIndex: resp.Index - 1,
+					},
+				}
+				var reply structs.ACLRolesByIDResponse
+				if err := s.forwardRegion(s.config.AuthoritativeRegion, structs.ACLGetRolesByIDRPCMethod, &req, &reply); err != nil {
+					s.logger.Error("failed to fetch ACL Roles from authoritative region", "error", err)
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+				for _, aclRole := range reply.ACLRoles {
+					fetched = append(fetched, aclRole)
+				}
+			}
+
+			// Update local tokens
+			if len(fetched) > 0 {
+
+				// The replication of ACL roles and policies are independent,
+				// therefore we cannot ensure the policies linked within the
+				// role are present. We must set allow missing to true.
+				args := structs.ACLRolesUpsertRequest{
+					ACLRoles:             fetched,
+					AllowMissingPolicies: true,
+				}
+
+				// Perform the upsert directly via Raft.
+				_, _, err := s.raftApply(structs.ACLRolesUpsertRequestType, &args)
+				if err != nil {
+					s.logger.Error("failed to update ACL roles", "error", err)
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+			}
+
+			// Update the minimum query index, blocks until there is a change.
+			req.MinQueryIndex = resp.Index
+		}
+	}
+}
+
+// diffACLRoles is used to perform a two-way diff between the local ACL Roles
+// and the remote Roles to determine which tokens need to be deleted or
+// updated. The returned array's contain ACL Role IDs.
+func diffACLRoles(
+	store *state.StateStore, minIndex uint64, remoteList []*structs.ACLRoleListStub) (
+	delete []string, update []string) {
+
+	// The local ACL role tracking is keyed by the role ID and the value is the
+	// hash of the role.
+	local := make(map[string][]byte)
+
+	// The remote ACL role tracking is keyed by the role ID; the value is an
+	// empty struct as we already have the full object.
+	remote := make(map[string]struct{})
+
+	// Read all the ACL role currently held within our local state. This panic
+	// will only happen as a developer making a mistake with naming the index
+	// to use.
+	iter, err := store.GetACLRoles(nil)
+	if err != nil {
+		panic(fmt.Sprintf("failed to iterate local ACL roles: %v", err))
+	}
+
+	// Iterate the local ACL roles and add them to our tracking of local roles.
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		aclRole := raw.(*structs.ACLRole)
+		local[aclRole.ID] = aclRole.Hash
+	}
+
+	// Iterate over the remote ACL roles.
+	for _, remoteACLRole := range remoteList {
+		remote[remoteACLRole.ID] = struct{}{}
+
+		// Identify whether the ACL role is within the local state. If it is
+		// not, add this to our update list.
+		if localHash, ok := local[remoteACLRole.ID]; !ok {
+			update = append(update, remoteACLRole.ID)
+
+			// Check if ACL role is newer remotely and there is a hash
+			// mismatch.
+		} else if remoteACLRole.ModifyIndex > minIndex && !bytes.Equal(localHash, remoteACLRole.Hash) {
+			update = append(update, remoteACLRole.ID)
+		}
+	}
+
+	// If we have ACL roles within state which are no longer present in the
+	// authoritative region we should delete them.
+	for localACLRole := range local {
+		if _, ok := remote[localACLRole]; !ok {
+			delete = append(delete, localACLRole)
+		}
+	}
+	return
+}
+
+// replicateACLAuthMethods is used to replicate ACL Authentication Methods from
+// the authoritative region to this region. The loop should only be run on the
+// leader within the federated region.
+func (s *Server) replicateACLAuthMethods(stopCh chan struct{}) {
+
+	// Generate our request object. We only need to do this once and reuse it
+	// for every RPC request. The MinQueryIndex is updated after every
+	// successful replication loop, so the next query acts as a blocking query
+	// and only returns upon a change in the authoritative region.
+	req := structs.ACLAuthMethodListRequest{
+		QueryOptions: structs.QueryOptions{
+			AllowStale: true,
+			Region:     s.config.AuthoritativeRegion,
+		},
+	}
+
+	// Create our replication rate limiter for ACL auth-methods and log a
+	// lovely message to indicate the process is starting.
+	limiter := rate.NewLimiter(replicationRateLimit, int(replicationRateLimit))
+	s.logger.Debug("starting ACL Auth-Methods replication from authoritative region",
+		"authoritative_region", req.Region)
+
+	// Enter the main ACL auth-methods replication loop that will only exit
+	// when the stopCh is closed.
+	//
+	// Any error encountered will use the replicationBackoffContinue function
+	// which handles replication backoff and shutdown coordination in the event
+	// of an error inside the loop.
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+
+			// Rate limit how often we attempt replication. It is OK to ignore
+			// the error as the context will never be cancelled and the limit
+			// parameters are controlled internally.
+			_ = limiter.Wait(context.Background())
+
+			if !ServersMeetMinimumVersion(
+				s.serf.Members(), s.Region(), minACLAuthMethodVersion, true) {
+				s.logger.Trace(
+					"all servers must be upgraded to 1.5.0 or later before ACL Auth Methods can be replicated")
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
+			// Set the replication token on each replication iteration so that
+			// it is always current and can handle agent SIGHUP reloads.
+			req.AuthToken = s.ReplicationToken()
+
+			var resp structs.ACLAuthMethodListResponse
+
+			// Make the list RPC request to the authoritative region, so we
+			// capture the latest ACL auth-method listing.
+			err := s.forwardRegion(s.config.AuthoritativeRegion, structs.ACLListAuthMethodsRPCMethod, &req, &resp)
+			if err != nil {
+				s.logger.Error("failed to fetch ACL auth-methods from authoritative region", "error", err)
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
+			// Perform a two-way diff on the ACL auth-methods.
+			toDelete, toUpdate := diffACLAuthMethods(s.State(), req.MinQueryIndex, resp.AuthMethods)
+
+			// A significant amount of time could pass between the last check
+			// on whether we should stop the replication process. Therefore, do
+			// a check here, before calling Raft.
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+
+			// If we have ACL auth-methods to delete, make this call directly
+			// to Raft.
+			if len(toDelete) > 0 {
+				args := structs.ACLAuthMethodDeleteRequest{Names: toDelete}
+				_, _, err := s.raftApply(structs.ACLAuthMethodsDeleteRequestType, &args)
+
+				// If the error was because we lost leadership while calling
+				// Raft, avoid logging as this can be confusing to operators.
+				if err != nil {
+					if err != raft.ErrLeadershipLost {
+						s.logger.Error("failed to delete ACL auth-methods", "error", err)
+					}
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+			}
+
+			// Fetch any outdated auth-methods.
+			var fetched []*structs.ACLAuthMethod
+			if len(toUpdate) > 0 {
+				req := structs.ACLAuthMethodsGetRequest{
+					Names: toUpdate,
+					QueryOptions: structs.QueryOptions{
+						Region:        s.config.AuthoritativeRegion,
+						AuthToken:     s.ReplicationToken(),
+						AllowStale:    true,
+						MinQueryIndex: resp.Index - 1,
+					},
+				}
+				var reply structs.ACLAuthMethodsGetResponse
+				if err := s.forwardRegion(s.config.AuthoritativeRegion, structs.ACLGetAuthMethodsRPCMethod, &req, &reply); err != nil {
+					s.logger.Error("failed to fetch ACL auth-methods from authoritative region", "error", err)
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+				for _, aclAuthMethod := range reply.AuthMethods {
+					fetched = append(fetched, aclAuthMethod)
+				}
+			}
+
+			// Update local auth-methods.
+			if len(fetched) > 0 {
+				args := structs.ACLAuthMethodUpsertRequest{
+					AuthMethods: fetched,
+				}
+
+				// Perform the upsert directly via Raft.
+				_, _, err := s.raftApply(structs.ACLAuthMethodsUpsertRequestType, &args)
+				if err != nil {
+					s.logger.Error("failed to update ACL auth-methods", "error", err)
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+			}
+
+			// Update the minimum query index, blocks until there is a change.
+			req.MinQueryIndex = resp.Index
+		}
+	}
+}
+
+// diffACLAuthMethods is used to perform a two-way diff between the local ACL
+// auth-methods and the remote auth-methods to determine which ones need to be
+// deleted or updated. The returned array's contain ACL auth-method names.
+func diffACLAuthMethods(
+	store *state.StateStore, minIndex uint64, remoteList []*structs.ACLAuthMethodStub) (
+	delete []string, update []string) {
+
+	// The local ACL auth-method tracking is keyed by the name and the value is
+	// the hash of the auth-method.
+	local := make(map[string][]byte)
+
+	// The remote ACL auth-method tracking is keyed by the name; the value is
+	// an empty struct as we already have the full object.
+	remote := make(map[string]struct{})
+
+	// Read all the ACL auth-methods currently held within our local state.
+	// This panic will only happen as a developer making a mistake with naming
+	// the index to use.
+	iter, err := store.GetACLAuthMethods(nil)
+	if err != nil {
+		panic(fmt.Sprintf("failed to iterate local ACL roles: %v", err))
+	}
+
+	// Iterate the local ACL auth-methods and add them to our tracking of
+	// local auth-methods
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		aclAuthMethod := raw.(*structs.ACLAuthMethod)
+		local[aclAuthMethod.Name] = aclAuthMethod.Hash
+	}
+
+	// Iterate over the remote ACL auth-methods.
+	for _, remoteACLAuthMethod := range remoteList {
+		remote[remoteACLAuthMethod.Name] = struct{}{}
+
+		// Identify whether the ACL auth-method is within the local state. If
+		// it is not, add this to our update list.
+		if localHash, ok := local[remoteACLAuthMethod.Name]; !ok {
+			update = append(update, remoteACLAuthMethod.Name)
+
+			// Check if ACL auth-method is newer remotely and there is a hash
+			// mismatch.
+		} else if remoteACLAuthMethod.ModifyIndex > minIndex && !bytes.Equal(localHash, remoteACLAuthMethod.Hash) {
+			update = append(update, remoteACLAuthMethod.Name)
+		}
+	}
+
+	// If we have ACL auth-methods within state which are no longer present in
+	// the authoritative region we should delete them.
+	for localACLAuthMethod := range local {
+		if _, ok := remote[localACLAuthMethod]; !ok {
+			delete = append(delete, localACLAuthMethod)
+		}
+	}
+	return
+}
+
+// replicateACLBindingRules is used to replicate ACL binding rules from the
+// authoritative region to this region. The loop should only be run on the
+// leader within the federated region.
+func (s *Server) replicateACLBindingRules(stopCh chan struct{}) {
+
+	// Generate our request object. We only need to do this once and reuse it
+	// for every RPC request. The MinQueryIndex is updated after every
+	// successful replication loop, so the next query acts as a blocking query
+	// and only returns upon a change in the authoritative region.
+	req := structs.ACLBindingRulesListRequest{
+		QueryOptions: structs.QueryOptions{
+			AllowStale: true,
+			Region:     s.config.AuthoritativeRegion,
+		},
+	}
+
+	// Create our replication rate limiter for ACL binding rules and log a
+	// lovely message to indicate the process is starting.
+	limiter := rate.NewLimiter(replicationRateLimit, int(replicationRateLimit))
+	s.logger.Debug("starting ACL Binding Rules replication from authoritative region",
+		"authoritative_region", req.Region)
+
+	// Enter the main ACL binding rules replication loop that will only exit
+	// when the stopCh is closed.
+	//
+	// Any error encountered will use the replicationBackoffContinue function
+	// which handles replication backoff and shutdown coordination in the event
+	// of an error inside the loop.
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+
+			// Rate limit how often we attempt replication. It is OK to ignore
+			// the error as the context will never be cancelled and the limit
+			// parameters are controlled internally.
+			_ = limiter.Wait(context.Background())
+
+			if !ServersMeetMinimumVersion(
+				s.serf.Members(), s.Region(), minACLBindingRuleVersion, true) {
+				s.logger.Trace(
+					"all servers must be upgraded to 1.5.0 or later before ACL Binding Rules can be replicated")
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
+			// Set the replication token on each replication iteration so that
+			// it is always current and can handle agent SIGHUP reloads.
+			req.AuthToken = s.ReplicationToken()
+
+			var resp structs.ACLBindingRulesListResponse
+
+			// Make the list RPC request to the authoritative region, so we
+			// capture the latest ACL binding rules listing.
+			err := s.forwardRegion(s.config.AuthoritativeRegion, structs.ACLListBindingRulesRPCMethod, &req, &resp)
+			if err != nil {
+				s.logger.Error("failed to fetch ACL binding rules from authoritative region", "error", err)
+				if s.replicationBackoffContinue(stopCh) {
+					continue
+				} else {
+					return
+				}
+			}
+
+			// Perform a two-way diff on the ACL binding rules.
+			toDelete, toUpdate := diffACLBindingRules(s.State(), req.MinQueryIndex, resp.ACLBindingRules)
+
+			// A significant amount of time could pass between the last check
+			// on whether we should stop the replication process. Therefore, do
+			// a check here, before calling Raft.
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+
+			// If we have ACL binding rules to delete, make this call directly
+			// to Raft.
+			if len(toDelete) > 0 {
+				args := structs.ACLBindingRulesDeleteRequest{ACLBindingRuleIDs: toDelete}
+				_, _, err := s.raftApply(structs.ACLBindingRulesDeleteRequestType, &args)
+
+				// If the error was because we lost leadership while calling
+				// Raft, avoid logging as this can be confusing to operators.
+				if err != nil {
+					if err != raft.ErrLeadershipLost {
+						s.logger.Error("failed to delete ACL binding rules", "error", err)
+					}
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+			}
+
+			// Fetch any outdated binding rules.
+			var fetched []*structs.ACLBindingRule
+			if len(toUpdate) > 0 {
+				req := structs.ACLBindingRulesRequest{
+					ACLBindingRuleIDs: toUpdate,
+					QueryOptions: structs.QueryOptions{
+						Region:        s.config.AuthoritativeRegion,
+						AuthToken:     s.ReplicationToken(),
+						AllowStale:    true,
+						MinQueryIndex: resp.Index - 1,
+					},
+				}
+				var reply structs.ACLBindingRulesResponse
+				if err := s.forwardRegion(s.config.AuthoritativeRegion, structs.ACLGetBindingRulesRPCMethod, &req, &reply); err != nil {
+					s.logger.Error("failed to fetch ACL binding rules from authoritative region", "error", err)
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+				for _, aclBindingRule := range reply.ACLBindingRules {
+					fetched = append(fetched, aclBindingRule)
+				}
+			}
+
+			// Update local binding rules.
+			if len(fetched) > 0 {
+				args := structs.ACLBindingRulesUpsertRequest{
+					ACLBindingRules:         fetched,
+					AllowMissingAuthMethods: true,
+				}
+
+				// Perform the upsert directly via Raft.
+				_, _, err := s.raftApply(structs.ACLBindingRulesUpsertRequestType, &args)
+				if err != nil {
+					s.logger.Error("failed to update ACL binding rules", "error", err)
+					if s.replicationBackoffContinue(stopCh) {
+						continue
+					} else {
+						return
+					}
+				}
+			}
+
+			// Update the minimum query index, blocks until there is a change.
+			req.MinQueryIndex = resp.Index
+		}
+	}
+}
+
+// diffACLBindingRules is used to perform a two-way diff between the local ACL
+// binding rules and the remote binding rules to determine which ones need to be
+// deleted or updated. The returned array's contain ACL binding rule names.
+func diffACLBindingRules(
+	store *state.StateStore, minIndex uint64, remoteList []*structs.ACLBindingRuleListStub) (
+	delete []string, update []string) {
+
+	// The local ACL binding rules tracking is keyed by the name and the value
+	// is the hash of the auth-method.
+	local := make(map[string][]byte)
+
+	// The remote ACL binding rules tracking is keyed by the name; the value is
+	// an empty struct as we already have the full object.
+	remote := make(map[string]struct{})
+
+	// Read all the ACL binding rules currently held within our local state.
+	// This panic will only happen as a developer making a mistake with naming
+	// the index to use.
+	iter, err := store.GetACLBindingRules(nil)
+	if err != nil {
+		panic(fmt.Sprintf("failed to iterate local ACL binding rules: %v", err))
+	}
+
+	// Iterate the local ACL binding rules and add them to our tracking of
+	// local binding rules.
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		aclBindingRule := raw.(*structs.ACLBindingRule)
+		local[aclBindingRule.ID] = aclBindingRule.Hash
+	}
+
+	// Iterate over the remote ACL binding rules.
+	for _, remoteACLBindingRule := range remoteList {
+		remote[remoteACLBindingRule.ID] = struct{}{}
+
+		// Identify whether the ACL auth-method is within the local state. If
+		// it is not, add this to our update list.
+		if localHash, ok := local[remoteACLBindingRule.ID]; !ok {
+			update = append(update, remoteACLBindingRule.ID)
+
+			// Check if the ACL binding rule is newer remotely and there is a
+			// hash mismatch.
+		} else if remoteACLBindingRule.ModifyIndex > minIndex && !bytes.Equal(localHash, remoteACLBindingRule.Hash) {
+			update = append(update, remoteACLBindingRule.ID)
+		}
+	}
+
+	// If we have ACL binding rules within state which are no longer present in
+	// the authoritative region we should delete them.
+	for localACLBindingRules := range local {
+		if _, ok := remote[localACLBindingRules]; !ok {
+			delete = append(delete, localACLBindingRules)
+		}
+	}
+	return
+}
+
+// replicationBackoffContinue should be used when a replication loop encounters
+// an error and wants to wait until either the backoff time has been met, or
+// the stopCh has been closed. The boolean indicates whether the replication
+// process should continue.
+//
+// Typical use:
+//
+//	  if s.replicationBackoffContinue(stopCh) {
+//		   continue
+//		 } else {
+//	    return
+//	  }
+func (s *Server) replicationBackoffContinue(stopCh chan struct{}) bool {
+
+	timer, timerStopFn := helper.NewSafeTimer(s.config.ReplicationBackoff)
+	defer timerStopFn()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-stopCh:
+		return false
+	}
+}
+
 // getOrCreateAutopilotConfig is used to get the autopilot config, initializing it if necessary
 func (s *Server) getOrCreateAutopilotConfig() *structs.AutopilotConfig {
 	state := s.fsm.State()
@@ -1633,7 +2679,7 @@ func (s *Server) getOrCreateAutopilotConfig() *structs.AutopilotConfig {
 		return config
 	}
 
-	if !ServersMeetMinimumVersion(s.Members(), minAutopilotVersion, false) {
+	if !ServersMeetMinimumVersion(s.Members(), AllRegions, minAutopilotVersion, false) {
 		s.logger.Named("autopilot").Warn("can't initialize until all servers are above minimum version", "min_version", minAutopilotVersion)
 		return nil
 	}
@@ -1660,7 +2706,7 @@ func (s *Server) getOrCreateSchedulerConfig() *structs.SchedulerConfiguration {
 	if config != nil {
 		return config
 	}
-	if !ServersMeetMinimumVersion(s.Members(), minSchedulerConfigVersion, false) {
+	if !ServersMeetMinimumVersion(s.Members(), s.Region(), minSchedulerConfigVersion, false) {
 		s.logger.Named("core").Warn("can't initialize scheduler config until all servers are above minimum version", "min_version", minSchedulerConfigVersion)
 		return nil
 	}
@@ -1674,18 +2720,148 @@ func (s *Server) getOrCreateSchedulerConfig() *structs.SchedulerConfiguration {
 	return config
 }
 
-func (s *Server) generateClusterID() (string, error) {
-	if !ServersMeetMinimumVersion(s.Members(), minClusterIDVersion, false) {
+var minVersionKeyring = version.Must(version.NewVersion("1.4.0"))
+
+// initializeKeyring creates the first root key if the leader doesn't
+// already have one. The metadata will be replicated via raft and then
+// the followers will get the key material from their own key
+// replication.
+func (s *Server) initializeKeyring(stopCh <-chan struct{}) {
+
+	logger := s.logger.Named("keyring")
+
+	store := s.fsm.State()
+	keyMeta, err := store.GetActiveRootKeyMeta(nil)
+	if err != nil {
+		logger.Error("failed to get active key: %v", err)
+		return
+	}
+	if keyMeta != nil {
+		return
+	}
+
+	logger.Trace("verifying cluster is ready to initialize keyring")
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		if ServersMeetMinimumVersion(s.serf.Members(), s.Region(), minVersionKeyring, true) {
+			break
+		}
+	}
+	// we might have lost leadership during the version check
+	if !s.IsLeader() {
+		return
+	}
+
+	logger.Trace("initializing keyring")
+
+	rootKey, err := structs.NewRootKey(structs.EncryptionAlgorithmAES256GCM)
+	rootKey.Meta.SetActive()
+	if err != nil {
+		logger.Error("could not initialize keyring: %v", err)
+		return
+	}
+
+	err = s.encrypter.AddKey(rootKey)
+	if err != nil {
+		logger.Error("could not add initial key to keyring", "error", err)
+		return
+	}
+
+	if _, _, err = s.raftApply(structs.RootKeyMetaUpsertRequestType,
+		structs.KeyringUpdateRootKeyMetaRequest{
+			RootKeyMeta: rootKey.Meta,
+		}); err != nil {
+		logger.Error("could not initialize keyring", "error", err)
+		return
+	}
+
+	logger.Info("initialized keyring", "id", rootKey.Meta.KeyID)
+}
+
+func (s *Server) generateClusterMetadata() (structs.ClusterMetadata, error) {
+	if !ServersMeetMinimumVersion(s.Members(), AllRegions, minClusterIDVersion, false) {
 		s.logger.Named("core").Warn("cannot initialize cluster ID until all servers are above minimum version", "min_version", minClusterIDVersion)
-		return "", errors.Errorf("cluster ID cannot be created until all servers are above minimum version %s", minClusterIDVersion)
+		return structs.ClusterMetadata{}, fmt.Errorf("cluster ID cannot be created until all servers are above minimum version %s", minClusterIDVersion)
 	}
 
 	newMeta := structs.ClusterMetadata{ClusterID: uuid.Generate(), CreateTime: time.Now().UnixNano()}
 	if _, _, err := s.raftApply(structs.ClusterMetadataRequestType, newMeta); err != nil {
 		s.logger.Named("core").Error("failed to create cluster ID", "error", err)
-		return "", errors.Wrap(err, "failed to create cluster ID")
+		return structs.ClusterMetadata{}, fmt.Errorf("failed to create cluster ID: %w", err)
 	}
 
 	s.logger.Named("core").Info("established cluster id", "cluster_id", newMeta.ClusterID, "create_time", newMeta.CreateTime)
-	return newMeta.ClusterID, nil
+	return newMeta, nil
+}
+
+// handleEvalBrokerStateChange handles changing the evalBroker and blockedEvals
+// enabled status based on the passed scheduler configuration. The boolean
+// response indicates whether the caller needs to call restoreEvals() due to
+// the brokers being enabled. It is for use when the change must take the
+// scheduler configuration into account. This is not needed when calling
+// revokeLeadership, as the configuration doesn't matter, and we need to ensure
+// the brokers are stopped.
+//
+// The function checks the server is the leader and uses a mutex to avoid any
+// potential timings problems. Consider the following timings:
+//   - operator updates the configuration via the API
+//   - the RPC handler applies the change via Raft
+//   - leadership transitions with write barrier
+//   - the RPC handler call this function to enact the change
+//
+// The mutex also protects against a situation where leadership is revoked
+// while this function is being called. Ensuring the correct series of actions
+// occurs so that state stays consistent.
+func (s *Server) handleEvalBrokerStateChange(schedConfig *structs.SchedulerConfiguration) bool {
+
+	// Grab the lock first. Once we have this we can be sure to run everything
+	// needed before any leader transition can attempt to modify the state.
+	s.brokerLock.Lock()
+	defer s.brokerLock.Unlock()
+
+	// If we are no longer the leader, exit early.
+	if !s.IsLeader() {
+		return false
+	}
+
+	// enableEvalBroker tracks whether the evalBroker and blockedEvals
+	// processes should be enabled or not. It allows us to answer this question
+	// whether using a persisted Raft configuration, or the default bootstrap
+	// config.
+	var enableBrokers, restoreEvals bool
+
+	// The scheduler config can only be persisted to Raft once quorum has been
+	// established. If this is a fresh cluster, we need to use the default
+	// scheduler config, otherwise we can use the persisted object.
+	switch schedConfig {
+	case nil:
+		enableBrokers = !s.config.DefaultSchedulerConfig.PauseEvalBroker
+	default:
+		enableBrokers = !schedConfig.PauseEvalBroker
+	}
+
+	// If the evalBroker status is changing, set the new state.
+	if enableBrokers != s.evalBroker.Enabled() {
+		s.logger.Info("eval broker status modified", "paused", !enableBrokers)
+		s.evalBroker.SetEnabled(enableBrokers)
+		restoreEvals = enableBrokers
+	}
+
+	// If the blockedEvals status is changing, set the new state.
+	if enableBrokers != s.blockedEvals.Enabled() {
+		s.logger.Info("blocked evals status modified", "paused", !enableBrokers)
+		s.blockedEvals.SetEnabled(enableBrokers)
+		restoreEvals = enableBrokers
+
+		if enableBrokers {
+			s.blockedEvals.SetTimetable(s.fsm.TimeTable())
+		}
+	}
+
+	return restoreEvals
 }

@@ -1,9 +1,17 @@
-import Controller from '@ember/controller';
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
 
-export default class RunController extends Controller {
-  onSubmit(id, namespace) {
-    this.transitionToRoute('jobs.job', id, {
-      queryParams: { namespace },
-    });
+import Controller from '@ember/controller';
+import { action } from '@ember/object';
+import { tracked } from '@glimmer/tracking';
+
+export default class JobsRunController extends Controller {
+  @tracked jsonTemplate = null;
+
+  @action
+  setTemplate(template) {
+    this.jsonTemplate = template;
   }
 }

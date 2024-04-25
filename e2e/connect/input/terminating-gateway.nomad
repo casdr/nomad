@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "countdash-terminating" {
 
   datacenters = ["dc1"]
@@ -24,7 +27,7 @@ job "countdash-terminating" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/counter-api:v3"
+        image        = "hashicorpdev/counter-api:v3"
         network_mode = "host"
       }
     }
@@ -50,7 +53,7 @@ job "countdash-terminating" {
             #   port    = <generated listener port>
             # }
             # Additional options are documented at
-            # https://www.nomadproject.io/docs/job-specification/gateway#proxy-parameters
+            # https://developer.hashicorp.com/nomad/docs/job-specification/gateway#proxy-parameters
           }
 
           terminating {
@@ -58,7 +61,7 @@ job "countdash-terminating" {
             # given the parameters in the terminating block.
             #
             # Additional options are documented at
-            # https://www.nomadproject.io/docs/job-specification/gateway#terminating-parameters
+            # https://developer.hashicorp.com/nomad/docs/job-specification/gateway#terminating-parameters
             service {
               name = "count-api"
             }
@@ -102,7 +105,7 @@ job "countdash-terminating" {
       }
 
       config {
-        image = "hashicorpnomad/counter-dashboard:v3"
+        image = "hashicorpdev/counter-dashboard:v3"
       }
     }
   }

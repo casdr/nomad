@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 // Package servers provides an interface for choosing Servers to communicate
 // with from a Nomad Client perspective.  The package does not provide any API
 // guarantees and should be called only by `hashicorp/nomad`.
@@ -11,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/consul/lib"
 	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/helper"
 )
 
 const (
@@ -345,8 +348,8 @@ func (m *Manager) refreshServerRebalanceTimer() time.Duration {
 	// clusterWideRebalanceConnsPerSec operations/s across numLANMembers.
 	clusterWideRebalanceConnsPerSec := float64(numServers * newRebalanceConnsPerSecPerServer)
 
-	connRebalanceTimeout := lib.RateScaledInterval(clusterWideRebalanceConnsPerSec, clientRPCMinReuseDuration, int(m.numNodes))
-	connRebalanceTimeout += lib.RandomStagger(connRebalanceTimeout)
+	connRebalanceTimeout := helper.RateScaledInterval(clusterWideRebalanceConnsPerSec, clientRPCMinReuseDuration, int(m.numNodes))
+	connRebalanceTimeout += helper.RandomStagger(connRebalanceTimeout)
 
 	m.rebalanceTimer.Reset(connRebalanceTimeout)
 	return connRebalanceTimeout

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable qunit/require-expect */
 import { currentURL, visit } from '@ember/test-helpers';
 import { module, test } from 'qunit';
@@ -6,7 +11,8 @@ import { setupMirage } from 'ember-cli-mirage/test-support';
 import a11yAudit from 'nomad-ui/tests/helpers/a11y-audit';
 import pageSizeSelect from './behaviors/page-size-select';
 import VolumesList from 'nomad-ui/tests/pages/storage/volumes/list';
-import Layout from 'nomad-ui/tests/pages/layout';
+import percySnapshot from '@percy/ember';
+import faker from 'nomad-ui/mirage/faker';
 
 const assignWriteAlloc = (volume, alloc) => {
   volume.writeAllocs.add(alloc);
@@ -25,6 +31,8 @@ module('Acceptance | volumes list', function (hooks) {
   setupMirage(hooks);
 
   hooks.beforeEach(function () {
+    faker.seed(1);
+    server.create('node-pool');
     server.create('node');
     server.create('csi-plugin', { createVolumes: false });
     window.localStorage.clear();
@@ -53,6 +61,8 @@ module('Acceptance | volumes list', function (hooks) {
     server.createList('csi-volume', volumeCount);
 
     await VolumesList.visit();
+
+    await percySnapshot(assert);
 
     const sortedVolumes = server.db.csiVolumes.sortBy('id');
     assert.equal(VolumesList.volumes.length, VolumesList.pageSize);
@@ -126,6 +136,8 @@ module('Acceptance | volumes list', function (hooks) {
   test('when there are no volumes, there is an empty message', async function (assert) {
     await VolumesList.visit();
 
+    await percySnapshot(assert);
+
     assert.ok(VolumesList.isEmpty);
     assert.equal(VolumesList.emptyState.headline, 'No Volumes');
   });
@@ -186,19 +198,6 @@ module('Acceptance | volumes list', function (hooks) {
 
     assert.equal(VolumesList.volumes.length, 1);
     assert.equal(VolumesList.volumes.objectAt(0).name, volume2.id);
-  });
-
-  test('the active namespace is carried over to the jobs pages', async function (assert) {
-    server.createList('namespace', 2);
-
-    const namespace = server.db.namespaces[1];
-    await VolumesList.visit();
-    await VolumesList.facets.namespace.toggle();
-    await VolumesList.facets.namespace.options.objectAt(2).select();
-
-    await Layout.gutter.visitJobs();
-
-    assert.equal(currentURL(), `/jobs?namespace=${namespace.id}`);
   });
 
   test('when accessing volumes is forbidden, a message is shown with a link to the tokens page', async function (assert) {

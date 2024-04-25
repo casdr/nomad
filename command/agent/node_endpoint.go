@@ -1,6 +1,10 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -9,7 +13,7 @@ import (
 )
 
 func (s *HTTPServer) NodesRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
-	if req.Method != "GET" {
+	if req.Method != http.MethodGet {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 
@@ -18,16 +22,12 @@ func (s *HTTPServer) NodesRequest(resp http.ResponseWriter, req *http.Request) (
 		return nil, nil
 	}
 
-	// Parse resources field selection
-	resources, err := parseBool(req, "resources")
+	// Parse fields selection.
+	fields, err := parseNodeListStubFields(req)
 	if err != nil {
-		return nil, err
+		return nil, CodedError(http.StatusBadRequest, fmt.Errorf("Failed to parse node list fields: %v", err).Error())
 	}
-	if resources != nil {
-		args.Fields = &structs.NodeStubFields{
-			Resources: *resources,
-		}
-	}
+	args.Fields = fields
 
 	var out structs.NodeListResponse
 	if err := s.agent.RPC("Node.List", &args, &out); err != nil {
@@ -38,6 +38,7 @@ func (s *HTTPServer) NodesRequest(resp http.ResponseWriter, req *http.Request) (
 	if out.Nodes == nil {
 		out.Nodes = make([]*structs.NodeListStub, 0)
 	}
+
 	return out.Nodes, nil
 }
 
@@ -66,7 +67,7 @@ func (s *HTTPServer) NodeSpecificRequest(resp http.ResponseWriter, req *http.Req
 
 func (s *HTTPServer) nodeForceEvaluate(resp http.ResponseWriter, req *http.Request,
 	nodeID string) (interface{}, error) {
-	if req.Method != "PUT" && req.Method != "POST" {
+	if req.Method != http.MethodPut && req.Method != http.MethodPost {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 	args := structs.NodeEvaluateRequest{
@@ -84,7 +85,7 @@ func (s *HTTPServer) nodeForceEvaluate(resp http.ResponseWriter, req *http.Reque
 
 func (s *HTTPServer) nodeAllocations(resp http.ResponseWriter, req *http.Request,
 	nodeID string) (interface{}, error) {
-	if req.Method != "GET" {
+	if req.Method != http.MethodGet {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 	args := structs.NodeSpecificRequest{
@@ -111,7 +112,7 @@ func (s *HTTPServer) nodeAllocations(resp http.ResponseWriter, req *http.Request
 
 func (s *HTTPServer) nodeToggleDrain(resp http.ResponseWriter, req *http.Request,
 	nodeID string) (interface{}, error) {
-	if req.Method != "PUT" && req.Method != "POST" {
+	if req.Method != http.MethodPut && req.Method != http.MethodPost {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 
@@ -147,7 +148,7 @@ func (s *HTTPServer) nodeToggleDrain(resp http.ResponseWriter, req *http.Request
 
 func (s *HTTPServer) nodeToggleEligibility(resp http.ResponseWriter, req *http.Request,
 	nodeID string) (interface{}, error) {
-	if req.Method != "PUT" && req.Method != "POST" {
+	if req.Method != http.MethodPut && req.Method != http.MethodPost {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 
@@ -171,7 +172,7 @@ func (s *HTTPServer) nodeToggleEligibility(resp http.ResponseWriter, req *http.R
 
 func (s *HTTPServer) nodeQuery(resp http.ResponseWriter, req *http.Request,
 	nodeID string) (interface{}, error) {
-	if req.Method != "GET" {
+	if req.Method != http.MethodGet {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 	args := structs.NodeSpecificRequest{
@@ -194,7 +195,7 @@ func (s *HTTPServer) nodeQuery(resp http.ResponseWriter, req *http.Request,
 }
 
 func (s *HTTPServer) nodePurge(resp http.ResponseWriter, req *http.Request, nodeID string) (interface{}, error) {
-	if req.Method != "PUT" && req.Method != "POST" {
+	if req.Method != http.MethodPut && req.Method != http.MethodPost {
 		return nil, CodedError(405, ErrInvalidMethod)
 	}
 	args := structs.NodeDeregisterRequest{

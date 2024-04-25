@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package allocrunner
 
 import (
@@ -8,9 +11,10 @@ import (
 	consulapi "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
-	"github.com/hashicorp/nomad/client/consul"
+	"github.com/hashicorp/nomad/client/serviceregistration"
+	regMock "github.com/hashicorp/nomad/client/serviceregistration/mock"
 	cstructs "github.com/hashicorp/nomad/client/structs"
-	agentconsul "github.com/hashicorp/nomad/command/agent/consul"
+	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
@@ -93,10 +97,12 @@ func TestHealthHook_PrerunPostrun(t *testing.T) {
 	b := cstructs.NewAllocBroadcaster(logger)
 	defer b.Close()
 
-	consul := consul.NewMockConsulServiceClient(t, logger)
+	consul := regMock.NewServiceRegistrationHandler(logger)
 	hs := &mockHealthSetter{}
 
-	h := newAllocHealthWatcherHook(logger, mock.Alloc(), hs, b.Listen(), consul)
+	checks := new(mock.CheckShim)
+	alloc := mock.Alloc()
+	h := newAllocHealthWatcherHook(logger, alloc.Copy(), taskEnvBuilderFactory(alloc), hs, b.Listen(), consul, checks)
 
 	// Assert we implemented the right interfaces
 	prerunh, ok := h.(interfaces.RunnerPrerunHook)
@@ -131,10 +137,11 @@ func TestHealthHook_PrerunUpdatePostrun(t *testing.T) {
 	b := cstructs.NewAllocBroadcaster(logger)
 	defer b.Close()
 
-	consul := consul.NewMockConsulServiceClient(t, logger)
+	consul := regMock.NewServiceRegistrationHandler(logger)
 	hs := &mockHealthSetter{}
 
-	h := newAllocHealthWatcherHook(logger, alloc.Copy(), hs, b.Listen(), consul).(*allocHealthWatcherHook)
+	checks := new(mock.CheckShim)
+	h := newAllocHealthWatcherHook(logger, alloc.Copy(), taskEnvBuilderFactory(alloc), hs, b.Listen(), consul, checks).(*allocHealthWatcherHook)
 
 	// Prerun
 	require.NoError(h.Prerun())
@@ -170,10 +177,11 @@ func TestHealthHook_UpdatePrerunPostrun(t *testing.T) {
 	b := cstructs.NewAllocBroadcaster(logger)
 	defer b.Close()
 
-	consul := consul.NewMockConsulServiceClient(t, logger)
+	consul := regMock.NewServiceRegistrationHandler(logger)
 	hs := &mockHealthSetter{}
 
-	h := newAllocHealthWatcherHook(logger, alloc.Copy(), hs, b.Listen(), consul).(*allocHealthWatcherHook)
+	checks := new(mock.CheckShim)
+	h := newAllocHealthWatcherHook(logger, alloc.Copy(), taskEnvBuilderFactory(alloc), hs, b.Listen(), consul, checks).(*allocHealthWatcherHook)
 
 	// Set a DeploymentID to cause ClearHealth to be called
 	alloc.DeploymentID = uuid.Generate()
@@ -211,10 +219,12 @@ func TestHealthHook_Postrun(t *testing.T) {
 	b := cstructs.NewAllocBroadcaster(logger)
 	defer b.Close()
 
-	consul := consul.NewMockConsulServiceClient(t, logger)
+	consul := regMock.NewServiceRegistrationHandler(logger)
 	hs := &mockHealthSetter{}
 
-	h := newAllocHealthWatcherHook(logger, mock.Alloc(), hs, b.Listen(), consul).(*allocHealthWatcherHook)
+	alloc := mock.Alloc()
+	checks := new(mock.CheckShim)
+	h := newAllocHealthWatcherHook(logger, alloc.Copy(), taskEnvBuilderFactory(alloc), hs, b.Listen(), consul, checks).(*allocHealthWatcherHook)
 
 	// Postrun
 	require.NoError(h.Postrun())
@@ -244,9 +254,9 @@ func TestHealthHook_SetHealth_healthy(t *testing.T) {
 		Name:   task.Services[0].Checks[0].Name,
 		Status: consulapi.HealthPassing,
 	}
-	taskRegs := map[string]*agentconsul.ServiceRegistrations{
+	taskRegs := map[string]*serviceregistration.ServiceRegistrations{
 		task.Name: {
-			Services: map[string]*agentconsul.ServiceRegistration{
+			Services: map[string]*serviceregistration.ServiceRegistration{
 				task.Services[0].Name: {
 					Service: &consulapi.AgentService{
 						ID:      "foo",
@@ -264,14 +274,14 @@ func TestHealthHook_SetHealth_healthy(t *testing.T) {
 
 	// Don't reply on the first call
 	called := false
-	consul := consul.NewMockConsulServiceClient(t, logger)
-	consul.AllocRegistrationsFn = func(string) (*agentconsul.AllocRegistration, error) {
+	consul := regMock.NewServiceRegistrationHandler(logger)
+	consul.AllocRegistrationsFn = func(string) (*serviceregistration.AllocRegistration, error) {
 		if !called {
 			called = true
 			return nil, nil
 		}
 
-		reg := &agentconsul.AllocRegistration{
+		reg := &serviceregistration.AllocRegistration{
 			Tasks: taskRegs,
 		}
 
@@ -280,7 +290,8 @@ func TestHealthHook_SetHealth_healthy(t *testing.T) {
 
 	hs := newMockHealthSetter()
 
-	h := newAllocHealthWatcherHook(logger, alloc.Copy(), hs, b.Listen(), consul).(*allocHealthWatcherHook)
+	checks := new(mock.CheckShim)
+	h := newAllocHealthWatcherHook(logger, alloc.Copy(), taskEnvBuilderFactory(alloc), hs, b.Listen(), consul, checks).(*allocHealthWatcherHook)
 
 	// Prerun
 	require.NoError(h.Prerun())
@@ -332,9 +343,9 @@ func TestHealthHook_SetHealth_unhealthy(t *testing.T) {
 		Name:   task.Services[0].Checks[1].Name,
 		Status: consulapi.HealthCritical,
 	}
-	taskRegs := map[string]*agentconsul.ServiceRegistrations{
+	taskRegs := map[string]*serviceregistration.ServiceRegistrations{
 		task.Name: {
-			Services: map[string]*agentconsul.ServiceRegistration{
+			Services: map[string]*serviceregistration.ServiceRegistration{
 				task.Services[0].Name: {
 					Service: &consulapi.AgentService{
 						ID:      "foo",
@@ -352,14 +363,14 @@ func TestHealthHook_SetHealth_unhealthy(t *testing.T) {
 
 	// Don't reply on the first call
 	called := false
-	consul := consul.NewMockConsulServiceClient(t, logger)
-	consul.AllocRegistrationsFn = func(string) (*agentconsul.AllocRegistration, error) {
+	consul := regMock.NewServiceRegistrationHandler(logger)
+	consul.AllocRegistrationsFn = func(string) (*serviceregistration.AllocRegistration, error) {
 		if !called {
 			called = true
 			return nil, nil
 		}
 
-		reg := &agentconsul.AllocRegistration{
+		reg := &serviceregistration.AllocRegistration{
 			Tasks: taskRegs,
 		}
 
@@ -368,7 +379,8 @@ func TestHealthHook_SetHealth_unhealthy(t *testing.T) {
 
 	hs := newMockHealthSetter()
 
-	h := newAllocHealthWatcherHook(logger, alloc.Copy(), hs, b.Listen(), consul).(*allocHealthWatcherHook)
+	checks := new(mock.CheckShim)
+	h := newAllocHealthWatcherHook(logger, alloc.Copy(), taskEnvBuilderFactory(alloc), hs, b.Listen(), consul, checks).(*allocHealthWatcherHook)
 
 	// Prerun
 	require.NoError(h.Prerun())
@@ -389,7 +401,8 @@ func TestHealthHook_SetHealth_unhealthy(t *testing.T) {
 func TestHealthHook_SystemNoop(t *testing.T) {
 	ci.Parallel(t)
 
-	h := newAllocHealthWatcherHook(testlog.HCLogger(t), mock.SystemAlloc(), nil, nil, nil)
+	alloc := mock.SystemAlloc()
+	h := newAllocHealthWatcherHook(testlog.HCLogger(t), alloc.Copy(), taskEnvBuilderFactory(alloc), nil, nil, nil, nil)
 
 	// Assert that it's the noop impl
 	_, ok := h.(noopAllocHealthWatcherHook)
@@ -410,9 +423,16 @@ func TestHealthHook_SystemNoop(t *testing.T) {
 func TestHealthHook_BatchNoop(t *testing.T) {
 	ci.Parallel(t)
 
-	h := newAllocHealthWatcherHook(testlog.HCLogger(t), mock.BatchAlloc(), nil, nil, nil)
+	alloc := mock.BatchAlloc()
+	h := newAllocHealthWatcherHook(testlog.HCLogger(t), alloc.Copy(), taskEnvBuilderFactory(alloc), nil, nil, nil, nil)
 
 	// Assert that it's the noop impl
 	_, ok := h.(noopAllocHealthWatcherHook)
 	require.True(t, ok)
+}
+
+func taskEnvBuilderFactory(alloc *structs.Allocation) func() *taskenv.Builder {
+	return func() *taskenv.Builder {
+		return taskenv.NewBuilder(mock.Node(), alloc, nil, alloc.Job.Region)
+	}
 }

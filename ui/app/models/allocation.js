@@ -1,9 +1,15 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { inject as service } from '@ember/service';
 import { computed } from '@ember/object';
 import { equal, none } from '@ember/object/computed';
 import Model from '@ember-data/model';
 import { attr, belongsTo, hasMany } from '@ember-data/model';
 import { fragment, fragmentArray } from 'ember-data-model-fragments/attributes';
+import isEqual from 'lodash.isequal';
 import intersection from 'lodash.intersection';
 import shortUUIDProperty from '../utils/properties/short-uuid';
 import classic from 'ember-classic-decorator';
@@ -12,18 +18,21 @@ const STATUS_ORDER = {
   pending: 1,
   running: 2,
   complete: 3,
-  failed: 4,
-  lost: 5,
+  unknown: 4,
+  failed: 5,
+  lost: 6,
 };
 
 @classic
 export default class Allocation extends Model {
   @service token;
+  @service store;
 
   @shortUUIDProperty('id') shortId;
   @belongsTo('job') job;
   @belongsTo('node') node;
   @attr('string') namespace;
+  @attr('string') nodeID;
   @attr('string') name;
   @attr('string') taskGroupName;
   @fragment('resources') resources;
@@ -38,6 +47,55 @@ export default class Allocation extends Model {
 
   @attr('string') clientStatus;
   @attr('string') desiredStatus;
+  @attr() desiredTransition;
+  @attr() deploymentStatus;
+
+  get isCanary() {
+    return this.deploymentStatus?.Canary;
+  }
+
+  // deploymentStatus.Healthy can be true, false, or null. Null implies pending
+  get isHealthy() {
+    return this.deploymentStatus?.Healthy;
+  }
+
+  get isUnhealthy() {
+    return this.deploymentStatus?.Healthy === false;
+  }
+
+  get willNotRestart() {
+    return this.clientStatus === 'failed' || this.clientStatus === 'lost';
+  }
+
+  get willNotReschedule() {
+    return (
+      this.willNotRestart &&
+      !this.get('nextAllocation.content') &&
+      !this.get('followUpEvaluation.content')
+    );
+  }
+
+  get hasBeenRescheduled() {
+    return this.get('followUpEvaluation.content');
+  }
+
+  get hasBeenRestarted() {
+    return this.states
+      .map((s) => s.events?.content)
+      .flat()
+      .find((e) => e?.type === 'Restarting');
+  }
+
+  @attr healthChecks;
+
+  async getServiceHealth() {
+    const data = await this.store.adapterFor('allocation').check(this);
+
+    // Compare Results
+    if (!isEqual(this.healthChecks, data)) {
+      this.set('healthChecks', data);
+    }
+  }
 
   @computed('')
   get plainJobId() {
@@ -83,6 +141,7 @@ export default class Allocation extends Model {
       complete: 'is-complete',
       failed: 'is-error',
       lost: 'is-light',
+      unknown: 'is-unknown',
     };
 
     return classMap[this.clientStatus] || 'is-dark';
@@ -119,6 +178,13 @@ export default class Allocation extends Model {
     return [];
   }
 
+  // When per_alloc is set to true on a volume, the volumes are duplicated between active allocations.
+  // We differentiate them with a [#] suffix, inferred from a volume's allocation's name property.
+  @computed('name')
+  get volumeExtension() {
+    return this.name.substring(this.name.lastIndexOf('['));
+  }
+
   @fragmentArray('task-state') states;
   @fragmentArray('reschedule-event') rescheduleEvents;
 
@@ -146,6 +212,10 @@ export default class Allocation extends Model {
 
   restart(taskName) {
     return this.store.adapterFor('allocation').restart(this, taskName);
+  }
+
+  restartAll() {
+    return this.store.adapterFor('allocation').restartAll(this);
   }
 
   ls(path) {

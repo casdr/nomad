@@ -1,8 +1,11 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package fingerprint
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -82,7 +85,7 @@ func (f *EnvDigitalOceanFingerprint) Get(attribute string, format string) (strin
 		return "", err
 	}
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
 		f.logger.Error("failed to read metadata", "attribute", attribute, "error", err, "resp_code", res.StatusCode)
@@ -127,7 +130,7 @@ func (f *EnvDigitalOceanFingerprint) Fingerprint(request *FingerprintRequest, re
 		resp, err := f.Get(attr.path, "text")
 		v := strings.TrimSpace(resp)
 		if err != nil {
-			f.logger.Warn("failed to read attribute", "attribute", k, "err", err)
+			f.logger.Warn("failed to read attribute", "attribute", k, "error", err)
 			continue
 		} else if v == "" {
 			f.logger.Debug("read an empty value", "attribute", k)

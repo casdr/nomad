@@ -1,11 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/hashicorp/nomad/ci"
 	"github.com/mitchellh/cli"
+	"github.com/shoenig/test/must"
 )
 
 func TestAgentInfoCommand_Implements(t *testing.T) {
@@ -22,9 +25,7 @@ func TestAgentInfoCommand_Run(t *testing.T) {
 	cmd := &AgentInfoCommand{Meta: Meta{Ui: ui}}
 
 	code := cmd.Run([]string{"-address=" + url})
-	if code != 0 {
-		t.Fatalf("expected exit 0, got: %d", code)
-	}
+	must.Zero(t, code)
 }
 
 func TestAgentInfoCommand_Run_JSON(t *testing.T) {
@@ -36,12 +37,10 @@ func TestAgentInfoCommand_Run_JSON(t *testing.T) {
 	cmd := &AgentInfoCommand{Meta: Meta{Ui: ui}}
 
 	code := cmd.Run([]string{"-address=" + url, "-json"})
-	if code != 0 {
-		t.Fatalf("expected exit 0, got: %d", code)
-	}
-	if out := ui.OutputWriter.String(); !strings.Contains(out, "\"config\": {") {
-		t.Fatalf("expected config stanza in output json")
-	}
+	must.Zero(t, code)
+
+	out := ui.OutputWriter.String()
+	must.StrContains(t, out, `"config"`)
 }
 
 func TestAgentInfoCommand_Run_Gotemplate(t *testing.T) {
@@ -53,12 +52,10 @@ func TestAgentInfoCommand_Run_Gotemplate(t *testing.T) {
 	cmd := &AgentInfoCommand{Meta: Meta{Ui: ui}}
 
 	code := cmd.Run([]string{"-address=" + url, "-t", "{{.Stats.raft}}"})
-	if code != 0 {
-		t.Fatalf("expected exit 0, got: %d", code)
-	}
-	if out := ui.OutputWriter.String(); !strings.Contains(out, "last_log_index") {
-		t.Fatalf("expected raft stats in gotemplate output")
-	}
+	must.Zero(t, code)
+
+	out := ui.OutputWriter.String()
+	must.StrContains(t, out, "last_log_index")
 }
 
 func TestAgentInfoCommand_Fails(t *testing.T) {
@@ -67,19 +64,18 @@ func TestAgentInfoCommand_Fails(t *testing.T) {
 	cmd := &AgentInfoCommand{Meta: Meta{Ui: ui}}
 
 	// Fails on misuse
-	if code := cmd.Run([]string{"some", "bad", "args"}); code != 1 {
-		t.Fatalf("expected exit code 1, got: %d", code)
-	}
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, commandErrorText(cmd)) {
-		t.Fatalf("expected help output, got: %s", out)
-	}
+	code := cmd.Run([]string{"some", "bad", "args"})
+	must.One(t, code)
+
+	out := ui.ErrorWriter.String()
+	must.StrContains(t, out, commandErrorText(cmd))
+
 	ui.ErrorWriter.Reset()
 
 	// Fails on connection failure
-	if code := cmd.Run([]string{"-address=nope"}); code != 1 {
-		t.Fatalf("expected exit code 1, got: %d", code)
-	}
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error querying agent info") {
-		t.Fatalf("expected failed query error, got: %s", out)
-	}
+	code = cmd.Run([]string{"-address=nope"})
+	must.One(t, code)
+
+	out = ui.ErrorWriter.String()
+	must.StrContains(t, out, "Error querying agent info")
 }

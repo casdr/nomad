@@ -1,17 +1,129 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package consul
 
 import (
 	"fmt"
+	"maps"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/client/serviceregistration"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSyncLogic_maybeTweakTaggedAddresses(t *testing.T) {
+	ci.Parallel(t)
+
+	cases := []struct {
+		name     string
+		wanted   map[string]api.ServiceAddress
+		existing map[string]api.ServiceAddress
+		id       string
+		exp      []string
+	}{
+		{
+			name:   "not managed by nomad",
+			id:     "_nomad-other-hello",
+			wanted: map[string]api.ServiceAddress{
+				// empty
+			},
+			existing: map[string]api.ServiceAddress{
+				"lan_ipv4": {},
+				"wan_ipv4": {},
+				"custom":   {},
+			},
+			exp: []string{"lan_ipv4", "wan_ipv4", "custom"},
+		},
+		{
+			name: "remove defaults",
+			id:   "_nomad-task-hello",
+			wanted: map[string]api.ServiceAddress{
+				"lan_custom": {},
+				"wan_custom": {},
+			},
+			existing: map[string]api.ServiceAddress{
+				"lan_ipv4":   {},
+				"wan_ipv4":   {},
+				"lan_ipv6":   {},
+				"wan_ipv6":   {},
+				"lan_custom": {},
+				"wan_custom": {},
+			},
+			exp: []string{"lan_custom", "wan_custom"},
+		},
+		{
+			name: "overridden defaults",
+			id:   "_nomad-task-hello",
+			wanted: map[string]api.ServiceAddress{
+				"lan_ipv4": {},
+				"wan_ipv4": {},
+				"lan_ipv6": {},
+				"wan_ipv6": {},
+				"custom":   {},
+			},
+			existing: map[string]api.ServiceAddress{
+				"lan_ipv4": {},
+				"wan_ipv4": {},
+				"lan_ipv6": {},
+				"wan_ipv6": {},
+				"custom":   {},
+			},
+			exp: []string{"lan_ipv4", "wan_ipv4", "lan_ipv6", "wan_ipv6", "custom"},
+		},
+		{
+			name: "applies to nomad client",
+			id:   "_nomad-client-12345",
+			wanted: map[string]api.ServiceAddress{
+				"custom": {},
+			},
+			existing: map[string]api.ServiceAddress{
+				"lan_ipv4": {},
+				"wan_ipv4": {},
+				"lan_ipv6": {},
+				"wan_ipv6": {},
+				"custom":   {},
+			},
+			exp: []string{"custom"},
+		},
+		{
+			name: "applies to nomad server",
+			id:   "_nomad-server-12345",
+			wanted: map[string]api.ServiceAddress{
+				"custom": {},
+			},
+			existing: map[string]api.ServiceAddress{
+				"lan_ipv4": {},
+				"wan_ipv4": {},
+				"lan_ipv6": {},
+				"wan_ipv6": {},
+				"custom":   {},
+			},
+			exp: []string{"custom"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			asr := &api.AgentServiceRegistration{
+				ID:              tc.id,
+				TaggedAddresses: maps.Clone(tc.wanted),
+			}
+			as := &api.AgentService{
+				TaggedAddresses: maps.Clone(tc.existing),
+			}
+			maybeTweakTaggedAddresses(asr, as)
+			must.MapContainsKeys(t, as.TaggedAddresses, tc.exp)
+		})
+	}
+}
 
 func TestSyncLogic_agentServiceUpdateRequired(t *testing.T) {
 	ci.Parallel(t)
@@ -27,6 +139,9 @@ func TestSyncLogic_agentServiceUpdateRequired(t *testing.T) {
 			Address:           "1.1.1.1",
 			EnableTagOverride: true,
 			Meta:              map[string]string{"foo": "1"},
+			TaggedAddresses: map[string]api.ServiceAddress{
+				"public_wan": {Address: "1.2.3.4", Port: 8080},
+			},
 			Connect: &api.AgentServiceConnect{
 				Native: false,
 				SidecarService: &api.AgentServiceRegistration{
@@ -55,6 +170,9 @@ func TestSyncLogic_agentServiceUpdateRequired(t *testing.T) {
 		Address:           "1.1.1.1",
 		EnableTagOverride: true,
 		Meta:              map[string]string{"foo": "1"},
+		TaggedAddresses: map[string]api.ServiceAddress{
+			"public_wan": {Address: "1.2.3.4", Port: 8080},
+		},
 	}
 
 	sidecar := &api.AgentService{
@@ -77,12 +195,16 @@ func TestSyncLogic_agentServiceUpdateRequired(t *testing.T) {
 	type asr = api.AgentServiceRegistration
 	type tweaker func(w asr) *asr // create a conveniently modifiable copy
 
+	s := &ServiceClient{
+		logger: testlog.HCLogger(t),
+	}
+
 	try := func(
 		t *testing.T,
 		exp bool,
 		reason syncReason,
 		tweak tweaker) {
-		result := agentServiceUpdateRequired(reason, tweak(wanted()), existing, sidecar)
+		result := s.agentServiceUpdateRequired(reason, tweak(wanted()), existing, sidecar)
 		require.Equal(t, exp, result)
 	}
 
@@ -211,6 +333,15 @@ func TestSyncLogic_agentServiceUpdateRequired(t *testing.T) {
 		})
 	})
 
+	t.Run("different tagged addresses", func(t *testing.T) {
+		try(t, true, syncNewOps, func(w asr) *asr {
+			w.TaggedAddresses = map[string]api.ServiceAddress{
+				"public_wan": {Address: "5.6.7.8", Port: 8080},
+			}
+			return &w
+		})
+	})
+
 	// for remaining tests, EnableTagOverride = false
 	existing.EnableTagOverride = false
 
@@ -250,39 +381,6 @@ func TestSyncLogic_agentServiceUpdateRequired(t *testing.T) {
 			w.Connect.SidecarService.Tags = []string{"other", "tags"}
 			return &w
 		})
-	})
-}
-
-func TestSyncLogic_tagsDifferent(t *testing.T) {
-	ci.Parallel(t)
-
-	t.Run("nil nil", func(t *testing.T) {
-		require.False(t, tagsDifferent(nil, nil))
-	})
-
-	t.Run("empty nil", func(t *testing.T) {
-		// where reflect.DeepEqual does not work
-		require.False(t, tagsDifferent([]string{}, nil))
-	})
-
-	t.Run("empty empty", func(t *testing.T) {
-		require.False(t, tagsDifferent([]string{}, []string{}))
-	})
-
-	t.Run("set empty", func(t *testing.T) {
-		require.True(t, tagsDifferent([]string{"A"}, []string{}))
-	})
-
-	t.Run("set nil", func(t *testing.T) {
-		require.True(t, tagsDifferent([]string{"A"}, nil))
-	})
-
-	t.Run("different content", func(t *testing.T) {
-		require.True(t, tagsDifferent([]string{"A"}, []string{"B"}))
-	})
-
-	t.Run("different lengths", func(t *testing.T) {
-		require.True(t, tagsDifferent([]string{"A"}, []string{"A", "B"}))
 	})
 }
 
@@ -369,7 +467,7 @@ func TestSyncLogic_maybeTweakTags_emptySC(t *testing.T) {
 		existing := &api.AgentService{Tags: []string{"a", "b"}}
 		sidecar := &api.AgentService{Tags: []string{"a", "b"}}
 		maybeTweakTags(asr, existing, sidecar)
-		require.False(t, !tagsDifferent([]string{"original"}, asr.Tags))
+		must.NotEq(t, []string{"original"}, asr.Tags)
 	}
 
 	try(&api.AgentServiceRegistration{
@@ -398,9 +496,11 @@ func TestServiceRegistration_CheckOnUpdate(t *testing.T) {
 	sc := NewServiceClient(mockAgent, namespacesClient, logger, true)
 
 	allocID := uuid.Generate()
-	ws := &WorkloadServices{
-		AllocID:   allocID,
-		Task:      "taskname",
+	ws := &serviceregistration.WorkloadServices{
+		AllocInfo: structs.AllocInfo{
+			AllocID: allocID,
+			Task:    "taskname",
+		},
 		Restarter: &restartRecorder{},
 		Services: []*structs.Service{
 			{
@@ -449,7 +549,7 @@ func TestServiceRegistration_CheckOnUpdate(t *testing.T) {
 	}
 
 	// Update
-	wsUpdate := new(WorkloadServices)
+	wsUpdate := new(serviceregistration.WorkloadServices)
 	*wsUpdate = *ws
 	wsUpdate.Services[0].Checks[0].OnUpdate = structs.OnUpdateRequireHealthy
 
@@ -604,6 +704,51 @@ func TestSyncLogic_proxyUpstreamsDifferent(t *testing.T) {
 			upstream2(),
 		}
 	})
+
+	try(t, "different destination peer", func(p proxy) {
+		diff := upstream1()
+		diff.DestinationPeer = "foo"
+		p.Upstreams = []api.Upstream{
+			diff,
+			upstream2(),
+		}
+	})
+
+	try(t, "different destination partition", func(p proxy) {
+		diff := upstream1()
+		diff.DestinationPartition = "foo"
+		p.Upstreams = []api.Upstream{
+			diff,
+			upstream2(),
+		}
+	})
+
+	try(t, "different destination type", func(p proxy) {
+		diff := upstream1()
+		diff.DestinationType = "service"
+		p.Upstreams = []api.Upstream{
+			diff,
+			upstream2(),
+		}
+	})
+
+	try(t, "different local bind socket path", func(p proxy) {
+		diff := upstream1()
+		diff.LocalBindSocketPath = "/var/run.sock"
+		p.Upstreams = []api.Upstream{
+			diff,
+			upstream2(),
+		}
+	})
+
+	try(t, "different local bind socket mode", func(p proxy) {
+		diff := upstream1()
+		diff.LocalBindSocketMode = "foo"
+		p.Upstreams = []api.Upstream{
+			diff,
+			upstream2(),
+		}
+	})
 }
 
 func TestSyncReason_String(t *testing.T) {
@@ -646,4 +791,180 @@ func TestSyncLogic_maybeSidecarProxyCheck(t *testing.T) {
 	try("service:_nomad-task-2f5fb517-57d4-44ee-7780-dc1cb6e103cd-group-api-count-api-9001-sidecar-proxy:X", false)
 	try("service:_nomad-task-2f5fb517-57d4-44ee-7780-dc1cb6e103cd-group-api-count-api-9001-sidecar-proxy: ", false)
 	try("service", false)
+}
+
+func TestSyncLogic_parseTaggedAddresses(t *testing.T) {
+	ci.Parallel(t)
+
+	t.Run("nil", func(t *testing.T) {
+		m, err := parseTaggedAddresses(nil, 0)
+		must.NoError(t, err)
+		must.MapEmpty(t, m)
+	})
+
+	t.Run("parse fail", func(t *testing.T) {
+		ta := map[string]string{
+			"public_wan": "not an address",
+		}
+		result, err := parseTaggedAddresses(ta, 8080)
+		must.Error(t, err)
+		must.MapEmpty(t, result)
+	})
+
+	t.Run("parse address", func(t *testing.T) {
+		ta := map[string]string{
+			"public_wan": "1.2.3.4",
+		}
+		result, err := parseTaggedAddresses(ta, 8080)
+		must.NoError(t, err)
+		must.MapEq(t, map[string]api.ServiceAddress{
+			"public_wan": {Address: "1.2.3.4", Port: 8080},
+		}, result)
+	})
+
+	t.Run("parse address and port", func(t *testing.T) {
+		ta := map[string]string{
+			"public_wan": "1.2.3.4:9999",
+		}
+		result, err := parseTaggedAddresses(ta, 8080)
+		must.NoError(t, err)
+		must.MapEq(t, map[string]api.ServiceAddress{
+			"public_wan": {Address: "1.2.3.4", Port: 9999},
+		}, result)
+	})
+}
+
+// TestServiceClient_ConsulTokens exercises the lifecycle of Consul tokens
+// associated with each service and the service client for each cluster.
+func TestServiceClient_ConsulTokens(t *testing.T) {
+	ci.Parallel(t)
+
+	mockAgent := NewMockAgent(ossFeatures)
+	nsClientA := NewNamespacesClient(NewMockNamespaces(nil), mockAgent)
+	nsClientB := NewNamespacesClient(NewMockNamespaces(nil), mockAgent)
+	logger := testlog.HCLogger(t)
+
+	scA := NewServiceClient(mockAgent, nsClientA, logger, true)
+	scB := NewServiceClient(mockAgent, nsClientB, logger, true)
+	scA.shutdownWait = time.Millisecond
+	scB.shutdownWait = time.Millisecond
+
+	scw := NewServiceClientWrapper()
+	scw.AddClient("A", scA)
+	scw.AddClient("B", scB)
+
+	allocID := uuid.Generate()
+	serviceTokenA, serviceTokenB := "uuid-service-token-a", "uuid-service-token-b"
+
+	ws := &serviceregistration.WorkloadServices{
+		AllocInfo: structs.AllocInfo{
+			AllocID: allocID,
+			Task:    "taskname",
+		},
+		Services: []*structs.Service{
+			{Name: "serviceA", Cluster: "A", PortLabel: "a"},
+			{Name: "serviceB", Cluster: "B", PortLabel: "b"},
+		},
+		Networks: []*structs.NetworkResource{
+			{DynamicPorts: []structs.Port{{Label: "a", Value: xPort}}},
+			{DynamicPorts: []structs.Port{{Label: "b", Value: xPort}}},
+		},
+		Tokens: map[string]string{
+			"serviceA": serviceTokenA,
+			"serviceB": serviceTokenB},
+	}
+
+	must.NoError(t, scw.RegisterWorkload(ws))
+
+	idA := serviceregistration.MakeAllocServiceID(allocID, ws.Name(), ws.Services[0])
+	idB := serviceregistration.MakeAllocServiceID(allocID, ws.Name(), ws.Services[1])
+
+	must.Eq(t, serviceTokenA, scA.getServiceToken(idA))
+	must.Eq(t, "", scA.getServiceToken(idB))
+
+	allocReg, err := scw.AllocRegistrations(allocID)
+	must.NoError(t, err)
+	must.Eq(t, 2, allocReg.NumServices())
+
+	scw.RemoveWorkload(ws)
+
+	// test hack: removing the workload doesn't actually remove the token until
+	// the service is confirmed deregistered, which we can't do without the
+	// running sync.
+	scA.explicitlyDeregisteredServices.Insert(idA)
+	scB.explicitlyDeregisteredServices.Insert(idB)
+	must.Eq(t, serviceTokenA, scA.getServiceToken(idA))
+	must.Eq(t, "", scA.getServiceToken(idB))
+
+	scA.clearExplicitlyDeregistered()
+	scB.clearExplicitlyDeregistered()
+	must.Eq(t, "", scA.getServiceToken(idA))
+	must.Eq(t, "", scB.getServiceToken(idB))
+
+	allocReg, err = scw.AllocRegistrations(allocID)
+	must.NoError(t, err)
+	must.Eq(t, 0, allocReg.NumServices())
+}
+
+// TestServiceClient_MultiClusterUpdates updates a workload in the service
+// client wrapper to ensure we're sending the updates to the right service
+// client for each cluster.
+func TestServiceClient_MultiClusterUpdates(t *testing.T) {
+	ci.Parallel(t)
+
+	mockAgent := NewMockAgent(ossFeatures)
+	nsClientA := NewNamespacesClient(NewMockNamespaces(nil), mockAgent)
+	nsClientB := NewNamespacesClient(NewMockNamespaces(nil), mockAgent)
+	logger := testlog.HCLogger(t)
+
+	scA := NewServiceClient(mockAgent, nsClientA, logger, true)
+	scB := NewServiceClient(mockAgent, nsClientB, logger, true)
+	scA.shutdownWait = time.Millisecond
+	scB.shutdownWait = time.Millisecond
+
+	scw := NewServiceClientWrapper()
+	scw.AddClient("A", scA)
+	scw.AddClient("B", scB)
+
+	allocID := uuid.Generate()
+	serviceTokenA, serviceTokenB := "uuid-service-token-a", "uuid-service-token-b"
+
+	ws := &serviceregistration.WorkloadServices{
+		AllocInfo: structs.AllocInfo{
+			AllocID: allocID,
+			Task:    "taskname",
+		},
+		Services: []*structs.Service{
+			{Name: "serviceA", Cluster: "A", PortLabel: "a"},
+			{Name: "serviceB", Cluster: "B", PortLabel: "b"},
+		},
+		Networks: []*structs.NetworkResource{
+			{DynamicPorts: []structs.Port{{Label: "a", Value: xPort}}},
+			{DynamicPorts: []structs.Port{{Label: "b", Value: xPort}}},
+		},
+		Tokens: map[string]string{
+			"serviceA": serviceTokenA,
+			"serviceB": serviceTokenB},
+	}
+
+	must.NoError(t, scw.RegisterWorkload(ws))
+	allocReg, err := scw.AllocRegistrations(allocID)
+	must.NoError(t, err)
+	must.Eq(t, 2, allocReg.NumServices())
+
+	newWs := ws.Copy()
+	newWs.Services = append(newWs.Services,
+		&structs.Service{Name: "serviceB2", Cluster: "B", PortLabel: "b2"})
+	newWs.Networks = append(newWs.Networks,
+		&structs.NetworkResource{DynamicPorts: []structs.Port{{Label: "b2", Value: yPort}}})
+	newWs.Tokens["serviceB2"] = "uuid-service-token-b2"
+
+	scw.UpdateWorkload(ws, newWs)
+
+	allocReg, err = scw.AllocRegistrations(allocID)
+	must.NoError(t, err)
+	must.Eq(t, 3, allocReg.NumServices())
+
+	idB2 := serviceregistration.MakeAllocServiceID(allocID, ws.Name(), newWs.Services[2])
+	must.Eq(t, "uuid-service-token-b2", scB.getServiceToken(idB2))
 }

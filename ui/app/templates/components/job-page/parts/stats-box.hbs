@@ -1,3 +1,8 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 {{! template-lint-disable no-inline-styles }}
 <div class="boxed-section is-small">
   <div class="boxed-section-body inline-definitions">
@@ -14,6 +19,11 @@
       <span class="term">Version</span>
       {{@job.version}}
     </span>
+    {{#if (and (can "list variables") @job.pathLinkedVariable)}}
+      <span class="pair" data-test-job-stat="variables">
+        <LinkTo @route="variables.variable" @model={{@job.pathLinkedVariable.id}}>Variables</LinkTo>
+      </span>
+    {{/if}}
     {{yield to="before-namespace"}}
     {{#if (and @job.namespace this.system.shouldShowNamespaces)}}
       <span class="pair" data-test-job-stat="namespace">
@@ -21,6 +31,10 @@
         {{@job.namespace.name}}
       </span>
     {{/if}}
+    <span class="pair" data-test-job-stat="node-pool">
+      <span class="term">Node Pool</span>
+      {{#if @job.nodePool}}{{@job.nodePool}}{{else}}-{{/if}}
+    </span>
     {{yield to="after-namespace"}}
   </div>
 

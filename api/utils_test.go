@@ -1,14 +1,18 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
 	"testing"
 
 	"github.com/hashicorp/nomad/api/internal/testutil"
-	"github.com/stretchr/testify/require"
+	"github.com/shoenig/test/must"
 )
 
 func TestFormatRoundedFloat(t *testing.T) {
 	testutil.Parallel(t)
+
 	cases := []struct {
 		input    float64
 		expected string
@@ -36,6 +40,17 @@ func TestFormatRoundedFloat(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		require.Equal(t, c.expected, formatFloat(c.input, 3))
+		must.Eq(t, c.expected, formatFloat(c.input, 3))
 	}
+}
+
+func Test_PointerOf(t *testing.T) {
+	s := "hello"
+	sPtr := pointerOf(s)
+
+	must.Eq(t, s, *sPtr)
+
+	b := "bye"
+	sPtr = &b
+	must.NotEq(t, s, *sPtr)
 }

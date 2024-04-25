@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable ember/avoid-leaking-state-in-ember-objects */
 import { module, test } from 'qunit';
 import { setupTest } from 'ember-qunit';
@@ -251,18 +256,17 @@ module('Unit | Ability | job', function (hooks) {
     this.owner.register('service:token', mockToken);
 
     assert.ok(
-      this.can.cannot('run job', null, { namespace: 'production-web' })
+      this.can.can(
+        'run job',
+        null,
+        { namespace: 'production-web' },
+        'The existence of a single namespace where a job can be run means that can run is enabled'
+      )
     );
     assert.ok(this.can.can('run job', null, { namespace: 'production-api' }));
     assert.ok(this.can.can('run job', null, { namespace: 'production-other' }));
     assert.ok(
       this.can.can('run job', null, { namespace: 'something-suffixed' })
-    );
-    assert.ok(
-      this.can.cannot('run job', null, {
-        namespace: 'something-more-suffixed',
-      }),
-      'expected the namespace with the greatest number of matched characters to be chosen'
     );
     assert.ok(
       this.can.can('run job', null, { namespace: '000-abc-999' }),

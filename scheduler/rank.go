@@ -1,11 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package scheduler
 
 import (
 	"fmt"
 	"math"
 
-	"github.com/hashicorp/nomad/lib/cpuset"
-
+	"github.com/hashicorp/nomad/client/lib/idset"
+	"github.com/hashicorp/nomad/client/lib/numalib/hw"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -52,8 +55,10 @@ func (r *RankedNode) ProposedAllocs(ctx Context) ([]*structs.Allocation, error) 
 	return p, nil
 }
 
-func (r *RankedNode) SetTaskResources(task *structs.Task,
-	resource *structs.AllocatedTaskResources) {
+func (r *RankedNode) SetTaskResources(
+	task *structs.Task,
+	resource *structs.AllocatedTaskResources,
+) {
 	if r.TaskResources == nil {
 		r.TaskResources = make(map[string]*structs.AllocatedTaskResources)
 		r.TaskLifecycles = make(map[string]*structs.TaskLifecycleConfig)
@@ -161,24 +166,18 @@ type BinPackIterator struct {
 
 // NewBinPackIterator returns a BinPackIterator which tries to fit tasks
 // potentially evicting other tasks based on a given priority.
-func NewBinPackIterator(ctx Context, source RankIterator, evict bool, priority int, schedConfig *structs.SchedulerConfiguration) *BinPackIterator {
+func NewBinPackIterator(ctx Context, source RankIterator, evict bool, priority int) *BinPackIterator {
+	return &BinPackIterator{
+		ctx:      ctx,
+		source:   source,
+		evict:    evict,
+		priority: priority,
 
-	algorithm := schedConfig.EffectiveSchedulerAlgorithm()
-	scoreFn := structs.ScoreFitBinPack
-	if algorithm == structs.SchedulerAlgorithmSpread {
-		scoreFn = structs.ScoreFitSpread
+		// These are default values that may be overwritten by
+		// SetSchedulerConfiguration.
+		memoryOversubscription: false,
+		scoreFit:               structs.ScoreFitBinPack,
 	}
-
-	iter := &BinPackIterator{
-		ctx:                    ctx,
-		source:                 source,
-		evict:                  evict,
-		priority:               priority,
-		memoryOversubscription: schedConfig != nil && schedConfig.MemoryOversubscriptionEnabled,
-		scoreFit:               scoreFn,
-	}
-	iter.ctx.Logger().Named("binpack").Trace("NewBinPackIterator created", "algorithm", algorithm)
-	return iter
 }
 
 func (iter *BinPackIterator) SetJob(job *structs.Job) {
@@ -190,6 +189,19 @@ func (iter *BinPackIterator) SetTaskGroup(taskGroup *structs.TaskGroup) {
 	iter.taskGroup = taskGroup
 }
 
+func (iter *BinPackIterator) SetSchedulerConfiguration(schedConfig *structs.SchedulerConfiguration) {
+	// Set scoring function.
+	algorithm := schedConfig.EffectiveSchedulerAlgorithm()
+	scoreFn := structs.ScoreFitBinPack
+	if algorithm == structs.SchedulerAlgorithmSpread {
+		scoreFn = structs.ScoreFitSpread
+	}
+	iter.scoreFit = scoreFn
+
+	// Set memory oversubscription.
+	iter.memoryOversubscription = schedConfig != nil && schedConfig.MemoryOversubscriptionEnabled
+}
+
 func (iter *BinPackIterator) Next() *RankedNode {
 OUTER:
 	for {
@@ -199,7 +211,8 @@ OUTER:
 			return nil
 		}
 
-		// Get the proposed allocations
+		// Get the allocations that already exist on the node + those allocs
+		// that have been placed as part of this same evaluation
 		proposed, err := option.ProposedAllocs(iter.ctx)
 		if err != nil {
 			iter.ctx.Logger().Named("binpack").Error("failed retrieving proposed allocations", "error", err)
@@ -211,13 +224,13 @@ OUTER:
 		// the node. If it does collide though, it means we found a bug! So
 		// collect as much information as possible.
 		netIdx := structs.NewNetworkIndex()
-		if collide, reason := netIdx.SetNode(option.Node); collide {
+		if err := netIdx.SetNode(option.Node); err != nil {
 			iter.ctx.SendEvent(&PortCollisionEvent{
-				Reason:   reason,
+				Reason:   err.Error(),
 				NetIndex: netIdx.Copy(),
 				Node:     option.Node,
 			})
-			iter.ctx.Metrics().ExhaustedNode(option.Node, "network: port collision")
+			iter.ctx.Metrics().ExhaustedNode(option.Node, "network: invalid node")
 			continue
 		}
 		if collide, reason := netIdx.AddAllocs(proposed); collide {
@@ -274,7 +287,7 @@ OUTER:
 			for i, port := range ask.DynamicPorts {
 				if port.HostNetwork != "" {
 					if hostNetworkValue, hostNetworkOk := resolveTarget(port.HostNetwork, option.Node); hostNetworkOk {
-						ask.DynamicPorts[i].HostNetwork = hostNetworkValue.(string)
+						ask.DynamicPorts[i].HostNetwork = hostNetworkValue
 					} else {
 						iter.ctx.Logger().Named("binpack").Error(fmt.Sprintf("Invalid template for %s host network in port %s", port.HostNetwork, port.Label))
 						netIdx.Release()
@@ -285,7 +298,7 @@ OUTER:
 			for i, port := range ask.ReservedPorts {
 				if port.HostNetwork != "" {
 					if hostNetworkValue, hostNetworkOk := resolveTarget(port.HostNetwork, option.Node); hostNetworkOk {
-						ask.ReservedPorts[i].HostNetwork = hostNetworkValue.(string)
+						ask.ReservedPorts[i].HostNetwork = hostNetworkValue
 					} else {
 						iter.ctx.Logger().Named("binpack").Error(fmt.Sprintf("Invalid template for %s host network in port %s", port.HostNetwork, port.Label))
 						netIdx.Release()
@@ -309,6 +322,8 @@ OUTER:
 				netPreemptions := preemptor.PreemptForNetwork(ask, netIdx)
 				if netPreemptions == nil {
 					iter.ctx.Logger().Named("binpack").Debug("preemption not possible ", "network_resource", ask)
+					iter.ctx.Metrics().ExhaustedNode(option.Node,
+						fmt.Sprintf("network: %s", err))
 					netIdx.Release()
 					continue OUTER
 				}
@@ -326,6 +341,8 @@ OUTER:
 				offer, err = netIdx.AssignPorts(ask)
 				if err != nil {
 					iter.ctx.Logger().Named("binpack").Debug("unexpected error, unable to create network offer after considering preemption", "error", err)
+					iter.ctx.Metrics().ExhaustedNode(option.Node,
+						fmt.Sprintf("network: %s", err))
 					netIdx.Release()
 					continue OUTER
 				}
@@ -363,7 +380,7 @@ OUTER:
 			// Check if we need a network resource
 			if len(task.Resources.Networks) > 0 {
 				ask := task.Resources.Networks[0].Copy()
-				offer, err := netIdx.AssignNetwork(ask)
+				offer, err := netIdx.AssignTaskNetwork(ask)
 				if offer == nil {
 					// If eviction is not enabled, mark this node as exhausted and continue
 					if !iter.evict {
@@ -379,6 +396,8 @@ OUTER:
 					netPreemptions := preemptor.PreemptForNetwork(ask, netIdx)
 					if netPreemptions == nil {
 						iter.ctx.Logger().Named("binpack").Debug("preemption not possible ", "network_resource", ask)
+						iter.ctx.Metrics().ExhaustedNode(option.Node,
+							fmt.Sprintf("network: %s", err))
 						netIdx.Release()
 						continue OUTER
 					}
@@ -393,14 +412,15 @@ OUTER:
 					netIdx.SetNode(option.Node)
 					netIdx.AddAllocs(proposed)
 
-					offer, err = netIdx.AssignNetwork(ask)
+					offer, err = netIdx.AssignTaskNetwork(ask)
 					if offer == nil {
 						iter.ctx.Logger().Named("binpack").Debug("unexpected error, unable to create network offer after considering preemption", "error", err)
+						iter.ctx.Metrics().ExhaustedNode(option.Node,
+							fmt.Sprintf("network: %s", err))
 						netIdx.Release()
 						continue OUTER
 					}
 				}
-
 				// Reserve this to prevent another task from colliding
 				netIdx.AddReserved(offer)
 
@@ -424,6 +444,7 @@ OUTER:
 
 					if devicePreemptions == nil {
 						iter.ctx.Logger().Named("binpack").Debug("preemption not possible", "requested_device", req)
+						iter.ctx.Metrics().ExhaustedNode(option.Node, fmt.Sprintf("devices: %s", err))
 						netIdx.Release()
 						continue OUTER
 					}
@@ -440,6 +461,7 @@ OUTER:
 					offer, sumAffinities, err = devAllocator.AssignDevice(req)
 					if offer == nil {
 						iter.ctx.Logger().Named("binpack").Debug("unexpected error, unable to create device offer after considering preemption", "error", err)
+						iter.ctx.Metrics().ExhaustedNode(option.Node, fmt.Sprintf("devices: %s", err))
 						continue OUTER
 					}
 				}
@@ -457,36 +479,50 @@ OUTER:
 				}
 			}
 
-			// Check if we need to allocate any reserved cores
-			if task.Resources.Cores > 0 {
-				// set of reservable CPUs for the node
-				nodeCPUSet := cpuset.New(option.Node.NodeResources.Cpu.ReservableCpuCores...)
-				// set of all reserved CPUs on the node
-				allocatedCPUSet := cpuset.New()
-				for _, alloc := range proposed {
-					allocatedCPUSet = allocatedCPUSet.Union(cpuset.New(alloc.ComparableResources().Flattened.Cpu.ReservedCores...))
+			// Handle CPU core reservations
+			if wantedCores := task.Resources.Cores; wantedCores > 0 {
+				// set of cores on this node allowable for use by nomad
+				nodeCores := option.Node.NodeResources.Processors.Topology.UsableCores()
+
+				// set of consumed cores on this node
+				consumedCores := idset.Empty[hw.CoreID]()
+				for _, alloc := range proposed { // proposed is existing + proposal
+					allocCores := alloc.AllocatedResources.Comparable().Flattened.Cpu.ReservedCores
+					idset.InsertSlice(consumedCores, allocCores...)
 				}
 
-				// add any cores that were reserved for other tasks
+				// add cores reserved for other tasks
 				for _, tr := range total.Tasks {
-					allocatedCPUSet = allocatedCPUSet.Union(cpuset.New(tr.Cpu.ReservedCores...))
+					taskCores := tr.Cpu.ReservedCores
+					idset.InsertSlice(consumedCores, taskCores...)
 				}
 
-				// set of CPUs not yet reserved on the node
-				availableCPUSet := nodeCPUSet.Difference(allocatedCPUSet)
+				// usable cores not yet reserved on this node
+				availableCores := nodeCores.Difference(consumedCores)
 
-				// If not enough cores are available mark the node as exhausted
-				if availableCPUSet.Size() < task.Resources.Cores {
-					// TODO preemption
+				// mark the node as exhausted if not enough cores available
+				if availableCores.Size() < wantedCores {
 					iter.ctx.Metrics().ExhaustedNode(option.Node, "cores")
 					continue OUTER
 				}
 
-				// Set the task's reserved cores
-				taskResources.Cpu.ReservedCores = availableCPUSet.ToSlice()[0:task.Resources.Cores]
-				// Total CPU usage on the node is still tracked by CPUShares. Even though the task will have the entire
-				// core reserved, we still track overall usage by cpu shares.
-				taskResources.Cpu.CpuShares = option.Node.NodeResources.Cpu.SharesPerCore() * int64(task.Resources.Cores)
+				// set the task's reserved cores
+				cores, bandwidth := (&coreSelector{
+					topology:       option.Node.NodeResources.Processors.Topology,
+					availableCores: availableCores,
+					shuffle:        randomizeCores,
+				}).Select(task.Resources)
+
+				// mark the node as exhausted if not enough cores available given
+				// the NUMA preference
+				if cores == nil {
+					iter.ctx.Metrics().ExhaustedNode(option.Node, "numa-cores")
+					continue OUTER
+				}
+
+				// set the cores and bandwidth consumed by the task
+				taskResources.Cpu.ReservedCores = cores
+				taskResources.Cpu.CpuShares = int64(bandwidth)
 			}
 
 			// Store the task resource

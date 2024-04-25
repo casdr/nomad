@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 //go:build !windows
 // +build !windows
 
@@ -7,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"syscall"
 	"testing"
@@ -31,13 +33,9 @@ func TestTaskRunner_LogmonHook_StartCrashStop(t *testing.T) {
 	alloc := mock.BatchAlloc()
 	task := alloc.Job.TaskGroups[0].Tasks[0]
 
-	dir, err := ioutil.TempDir("", "nomadtest")
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	dir := t.TempDir()
 
-	hookConf := newLogMonHookConfig(task.Name, dir)
+	hookConf := newLogMonHookConfig(task.Name, task.LogConfig, dir)
 	runner := &TaskRunner{logmonHookConfig: hookConf}
 	hook := newLogMonHook(runner, testlog.HCLogger(t))
 
@@ -84,7 +82,7 @@ func TestTaskRunner_LogmonHook_StartCrashStop(t *testing.T) {
 		logmonReattachKey: origHookData,
 	}
 	resp = interfaces.TaskPrestartResponse{}
-	err = hook.Prestart(context.Background(), &req, &resp)
+	err := hook.Prestart(context.Background(), &req, &resp)
 	require.NoError(t, err)
 	require.NotEqual(t, origState, resp.State)
 
@@ -100,13 +98,9 @@ func TestTaskRunner_LogmonHook_ShutdownMidStart(t *testing.T) {
 	alloc := mock.BatchAlloc()
 	task := alloc.Job.TaskGroups[0].Tasks[0]
 
-	dir, err := ioutil.TempDir("", "nomadtest")
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	dir := t.TempDir()
 
-	hookConf := newLogMonHookConfig(task.Name, dir)
+	hookConf := newLogMonHookConfig(task.Name, task.LogConfig, dir)
 	runner := &TaskRunner{logmonHookConfig: hookConf}
 	hook := newLogMonHook(runner, testlog.HCLogger(t))
 

@@ -1,6 +1,10 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -13,6 +17,7 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/hashicorp/raft"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -243,7 +248,7 @@ func TestPlanApply_applyPlanWithNormalizedAllocs(t *testing.T) {
 	ci.Parallel(t)
 
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
-		c.Build = "0.9.2"
+		c.Build = "1.4.0"
 	})
 	defer cleanupS1()
 	testutil.WaitForLeader(t, s1.RPC)
@@ -390,6 +395,78 @@ func TestPlanApply_applyPlanWithNormalizedAllocs(t *testing.T) {
 	assert.Equal(index, evalOut.ModifyIndex)
 }
 
+func TestPlanApply_signAllocIdentities(t *testing.T) {
+	// note: this is mutated by the method under test
+	alloc := mockAlloc()
+	job := alloc.Job
+	taskName := job.TaskGroups[0].Tasks[0].Name // "web"
+	allocs := []*structs.Allocation{alloc}
+
+	signErr := errors.New("could not sign the thing")
+
+	cases := []struct {
+		name      string
+		signer    *mockSigner
+		expectErr error
+		callNum   int
+	}{
+		{
+			name: "signer error",
+			signer: &mockSigner{
+				nextErr: signErr,
+			},
+			expectErr: signErr,
+			callNum:   1,
+		},
+		{
+			name: "first signing",
+			signer: &mockSigner{
+				nextToken: "first-token",
+				nextKeyID: "first-key",
+			},
+			callNum: 1,
+		},
+		{
+			name: "second signing",
+			signer: &mockSigner{
+				nextToken: "dont-sign-token",
+				nextKeyID: "dont-sign-key",
+			},
+			callNum: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			err := signAllocIdentities(tc.signer, job, allocs, time.Now())
+
+			if tc.expectErr != nil {
+				must.Error(t, err)
+				must.ErrorIs(t, err, tc.expectErr)
+			} else {
+				must.NoError(t, err)
+				// assert mutations happened
+				must.MapLen(t, 1, allocs[0].SignedIdentities)
+				// we should always keep the first signing
+				must.Eq(t, "first-token", allocs[0].SignedIdentities[taskName])
+				must.Eq(t, "first-key", allocs[0].SigningKeyID)
+			}
+
+			must.Len(t, tc.callNum, tc.signer.calls, must.Sprint("unexpected call count"))
+			if tc.callNum > 0 {
+				call := tc.signer.calls[tc.callNum-1]
+				must.NotNil(t, call)
+				must.Eq(t, call.AllocationID, alloc.ID)
+				must.Eq(t, call.Namespace, alloc.Namespace)
+				must.Eq(t, call.JobID, job.ID)
+				must.Eq(t, call.TaskName, taskName)
+			}
+
+		})
+	}
+}
+
 func TestPlanApply_EvalPlan_Simple(t *testing.T) {
 	ci.Parallel(t)
 	state := testStateStore(t)
@@ -439,8 +516,10 @@ func TestPlanApply_EvalPlan_Preemption(t *testing.T) {
 	state := testStateStore(t)
 	node := mock.Node()
 	node.NodeResources = &structs.NodeResources{
-		Cpu: structs.NodeCpuResources{
-			CpuShares: 2000,
+		Cpu: structs.LegacyNodeCpuResources{
+			CpuShares:          2000,
+			TotalCpuCores:      2,
+			ReservableCpuCores: []uint16{0, 1},
 		},
 		Memory: structs.NodeMemoryResources{
 			MemoryMB: 4192,
@@ -456,6 +535,8 @@ func TestPlanApply_EvalPlan_Preemption(t *testing.T) {
 			},
 		},
 	}
+	node.NodeResources.Compatibility()
+
 	state.UpsertNode(structs.MsgTypeTestSetup, 1000, node)
 
 	preemptedAlloc := mock.Alloc()
@@ -887,6 +968,39 @@ func TestPlanApply_EvalNodePlan_UpdateExisting(t *testing.T) {
 	}
 }
 
+func TestPlanApply_EvalNodePlan_UpdateExisting_Ineligible(t *testing.T) {
+	ci.Parallel(t)
+	alloc := mock.Alloc()
+	state := testStateStore(t)
+	node := mock.Node()
+	node.ReservedResources = nil
+	node.Reserved = nil
+	node.SchedulingEligibility = structs.NodeSchedulingIneligible
+	alloc.NodeID = node.ID
+	alloc.AllocatedResources = structs.NodeResourcesToAllocatedResources(node.NodeResources)
+	state.UpsertNode(structs.MsgTypeTestSetup, 1000, node)
+	state.UpsertAllocs(structs.MsgTypeTestSetup, 1001, []*structs.Allocation{alloc})
+	snap, _ := state.Snapshot()
+
+	plan := &structs.Plan{
+		Job: alloc.Job,
+		NodeAllocation: map[string][]*structs.Allocation{
+			node.ID: {alloc},
+		},
+	}
+
+	fit, reason, err := evaluateNodePlan(snap, plan, node.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !fit {
+		t.Fatalf("bad")
+	}
+	if reason != "" {
+		t.Fatalf("bad")
+	}
+}
+
 func TestPlanApply_EvalNodePlan_NodeFull_Evict(t *testing.T) {
 	ci.Parallel(t)
 	alloc := mock.Alloc()
@@ -990,5 +1104,81 @@ func TestPlanApply_EvalNodePlan_NodeDown_EvictOnly(t *testing.T) {
 	}
 	if reason != "" {
 		t.Fatalf("bad")
+	}
+}
+
+// TestPlanApply_EvalNodePlan_Node_Disconnected tests that plans for disconnected
+// nodes can only contain allocs with client status unknown.
+func TestPlanApply_EvalNodePlan_Node_Disconnected(t *testing.T) {
+	ci.Parallel(t)
+
+	state := testStateStore(t)
+	node := mock.Node()
+	node.Status = structs.NodeStatusDisconnected
+	_ = state.UpsertNode(structs.MsgTypeTestSetup, 1000, node)
+	snap, _ := state.Snapshot()
+
+	unknownAlloc := mock.Alloc()
+	unknownAlloc.ClientStatus = structs.AllocClientStatusUnknown
+
+	runningAlloc := unknownAlloc.Copy()
+	runningAlloc.ClientStatus = structs.AllocClientStatusRunning
+
+	job := unknownAlloc.Job
+
+	type testCase struct {
+		name           string
+		nodeAllocs     map[string][]*structs.Allocation
+		expectedFit    bool
+		expectedReason string
+	}
+
+	testCases := []testCase{
+		{
+			name: "unknown-valid",
+			nodeAllocs: map[string][]*structs.Allocation{
+				node.ID: {unknownAlloc},
+			},
+			expectedFit:    true,
+			expectedReason: "",
+		},
+		{
+			name: "running-invalid",
+			nodeAllocs: map[string][]*structs.Allocation{
+				node.ID: {runningAlloc},
+			},
+			expectedFit:    false,
+			expectedReason: "node is disconnected and contains invalid updates",
+		},
+		{
+			name: "multiple-invalid",
+			nodeAllocs: map[string][]*structs.Allocation{
+				node.ID: {runningAlloc, unknownAlloc},
+			},
+			expectedFit:    false,
+			expectedReason: "node is disconnected and contains invalid updates",
+		},
+		{
+			name: "multiple-valid",
+			nodeAllocs: map[string][]*structs.Allocation{
+				node.ID: {unknownAlloc, unknownAlloc.Copy()},
+			},
+			expectedFit:    true,
+			expectedReason: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := &structs.Plan{
+				Job:            job,
+				NodeAllocation: tc.nodeAllocs,
+			}
+
+			fit, reason, err := evaluateNodePlan(snap, plan, node.ID)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedFit, fit)
+			require.Equal(t, tc.expectedReason, reason)
+		})
 	}
 }

@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "multi-ingress" {
 
   datacenters = ["dc1"]
@@ -98,7 +101,7 @@ job "multi-ingress" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/uuid-api:v5"
+        image        = "hashicorpdev/uuid-api:v5"
         network_mode = "host"
       }
 
@@ -128,7 +131,7 @@ job "multi-ingress" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/uuid-api:v5"
+        image        = "hashicorpdev/uuid-api:v5"
         network_mode = "host"
       }
 
@@ -158,7 +161,7 @@ job "multi-ingress" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/uuid-api:v5"
+        image        = "hashicorpdev/uuid-api:v5"
         network_mode = "host"
       }
 

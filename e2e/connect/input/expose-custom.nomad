@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "expose-custom" {
   datacenters = ["dc1"]
 
@@ -39,7 +42,7 @@ job "expose-custom" {
       driver = "docker"
 
       config {
-        image = "hashicorpnomad/counter-api:v3"
+        image = "hashicorpdev/counter-api:v3"
       }
     }
   }

@@ -1,14 +1,18 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/mitchellh/cli"
+	"github.com/shoenig/test/must"
 )
 
 func TestValidateCommand_Implements(t *testing.T) {
@@ -16,44 +20,72 @@ func TestValidateCommand_Implements(t *testing.T) {
 	var _ cli.Command = &JobValidateCommand{}
 }
 
-func TestValidateCommand(t *testing.T) {
-	ci.Parallel(t)
-	// Create a server
-	s := testutil.NewTestServer(t, nil)
+func TestValidateCommand_Files(t *testing.T) {
+
+	// Create a Vault server
+	v := testutil.NewTestVault(t)
+	defer v.Stop()
+
+	// Create a Nomad server
+	s := testutil.NewTestServer(t, func(c *testutil.TestServerConfig) {
+		c.Vaults[0].Address = v.HTTPAddr
+		c.Vaults[0].Enabled = true
+		c.Vaults[0].AllowUnauthenticated = pointer.Of(false)
+		c.Vaults[0].Token = v.RootToken
+	})
 	defer s.Stop()
 
-	ui := cli.NewMockUi()
-	cmd := &JobValidateCommand{Meta: Meta{Ui: ui, flagAddress: "http://" + s.HTTPAddr}}
+	t.Run("basic", func(t *testing.T) {
+		ui := cli.NewMockUi()
+		cmd := &JobValidateCommand{Meta: Meta{Ui: ui, flagAddress: "http://" + s.HTTPAddr}}
+		args := []string{"testdata/example-basic.nomad"}
+		code := cmd.Run(args)
+		must.Zero(t, code)
+	})
 
-	fh, err := ioutil.TempFile("", "nomad")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Remove(fh.Name())
-	_, err = fh.WriteString(`
-job "job1" {
-	type = "service"
-	datacenters = [ "dc1" ]
-	group "group1" {
-		count = 1
-		task "task1" {
-			driver = "exec"
-			config {
-				command = "/bin/sleep"
-			}
-			resources {
-				cpu = 1000
-				memory = 512
-			}
-		}
-	}
-}`)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if code := cmd.Run([]string{fh.Name()}); code != 0 {
-		t.Fatalf("expect exit 0, got: %d: %s", code, ui.ErrorWriter.String())
-	}
+	t.Run("vault no token", func(t *testing.T) {
+		ui := cli.NewMockUi()
+		cmd := &JobValidateCommand{Meta: Meta{Ui: ui}}
+		args := []string{"-address", "http://" + s.HTTPAddr, "testdata/example-vault.nomad"}
+		code := cmd.Run(args)
+		must.StrContains(t, ui.ErrorWriter.String(), "* Vault used in the job but missing Vault token")
+		must.One(t, code)
+	})
+
+	t.Run("vault bad token via flag", func(t *testing.T) {
+		ui := cli.NewMockUi()
+		cmd := &JobValidateCommand{Meta: Meta{Ui: ui}}
+		args := []string{"-address", "http://" + s.HTTPAddr, "-vault-token=abc123", "testdata/example-vault.nomad"}
+		code := cmd.Run(args)
+		must.StrContains(t, ui.ErrorWriter.String(), "* bad token")
+		must.One(t, code)
+	})
+
+	t.Run("vault token bad via env", func(t *testing.T) {
+		t.Setenv("VAULT_TOKEN", "abc123")
+		ui := cli.NewMockUi()
+		cmd := &JobValidateCommand{Meta: Meta{Ui: ui}}
+		args := []string{"-address", "http://" + s.HTTPAddr, "testdata/example-vault.nomad"}
+		code := cmd.Run(args)
+		must.StrContains(t, ui.ErrorWriter.String(), "* bad token")
+		must.One(t, code)
+	})
+}
+func TestValidateCommand_hcl1_hcl2_strict(t *testing.T) {
+	ci.Parallel(t)
+
+	_, _, addr := testServer(t, false, nil)
+
+	t.Run("-hcl1 implies -hcl2-strict is false", func(t *testing.T) {
+		ui := cli.NewMockUi()
+		cmd := &JobValidateCommand{Meta: Meta{Ui: ui}}
+		got := cmd.Run([]string{
+			"-hcl1", "-hcl2-strict",
+			"-address", addr,
+			"asset/example-short.nomad.hcl",
+		})
+		must.Zero(t, got)
+	})
 }
 
 func TestValidateCommand_Fails(t *testing.T) {
@@ -80,7 +112,7 @@ func TestValidateCommand_Fails(t *testing.T) {
 	ui.ErrorWriter.Reset()
 
 	// Fails on invalid HCL
-	fh1, err := ioutil.TempFile("", "nomad")
+	fh1, err := os.CreateTemp("", "nomad")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -97,7 +129,7 @@ func TestValidateCommand_Fails(t *testing.T) {
 	ui.ErrorWriter.Reset()
 
 	// Fails on invalid job spec
-	fh2, err := ioutil.TempFile("", "nomad")
+	fh2, err := os.CreateTemp("", "nomad")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -175,4 +207,23 @@ func TestValidateCommand_From_URL(t *testing.T) {
 	if out := ui.ErrorWriter.String(); !strings.Contains(out, "Error getting jobfile") {
 		t.Fatalf("expected error getting jobfile, got: %s", out)
 	}
+}
+
+func TestValidateCommand_JSON(t *testing.T) {
+	ci.Parallel(t)
+
+	_, _, addr := testServer(t, false, nil)
+
+	ui := cli.NewMockUi()
+	cmd := &JobValidateCommand{
+		Meta: Meta{Ui: ui},
+	}
+
+	code := cmd.Run([]string{"-address", addr, "-json", "testdata/example-short.json"})
+
+	must.Zero(t, code)
+
+	code = cmd.Run([]string{"-address", addr, "-json", "testdata/example-short-bad.json"})
+
+	must.One(t, code)
 }

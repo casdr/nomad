@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package jobspec2
 
 import (
@@ -10,6 +13,7 @@ import (
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hcldec"
 	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/gocty"
 )
@@ -116,7 +120,7 @@ func decodeAffinity(body hcl.Body, ctx *hcl.EvalContext, val interface{}) hcl.Di
 	weight := v.GetAttr("weight")
 	if !weight.IsNull() {
 		w, _ := weight.AsBigFloat().Int64()
-		a.Weight = int8ToPtr(int8(w))
+		a.Weight = pointer.Of(int8(w))
 	}
 
 	// If "version" is provided, set the operand
@@ -231,8 +235,11 @@ func decodeConstraint(body hcl.Body, ctx *hcl.EvalContext, val interface{}) hcl.
 		c.RTarget = constraint
 	}
 
-	if d := v.GetAttr(api.ConstraintDistinctHosts); !d.IsNull() && d.True() {
+	// The shortcut form of the distinct_hosts constraint is a cty.Bool
+	// so it can not use the `attr` func defined earlier
+	if d := v.GetAttr(api.ConstraintDistinctHosts); !d.IsNull() {
 		c.Operand = api.ConstraintDistinctHosts
+		c.RTarget = fmt.Sprint(d.True())
 	}
 
 	if property := attr(api.ConstraintDistinctProperty); property != "" {
@@ -341,9 +348,10 @@ func decodeTask(body hcl.Body, ctx *hcl.EvalContext, val interface{}) hcl.Diagno
 //
 // ```hcl
 // # block assignment
-// env {
-//   ENV = "production"
-// }
+//
+//	env {
+//	  ENV = "production"
+//	}
 //
 // # as attribute
 // env = { ENV: "production" }
@@ -357,7 +365,6 @@ func decodeTask(body hcl.Body, ctx *hcl.EvalContext, val interface{}) hcl.Diagno
 // found map, the remaining body and diagnostics. If the named field is found
 // with block syntax, it returns a nil map, and caller falls back to reading
 // with block syntax.
-//
 func decodeAsAttribute(body hcl.Body, ctx *hcl.EvalContext, name string) (map[string]string, hcl.Body, hcl.Diagnostics) {
 	b, remain, diags := body.PartialContent(&hcl.BodySchema{
 		Attributes: []hcl.AttributeSchema{

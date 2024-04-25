@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 // Package boltdd contains a wrapper around BBoltDB to deduplicate writes and encode
 // values using mgspack.  (dd stands for de-duplicate)
 package boltdd
@@ -8,7 +11,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"go.etcd.io/bbolt"
 	"golang.org/x/crypto/blake2b"
@@ -350,6 +353,39 @@ func (b *Bucket) Get(key []byte, obj interface{}) error {
 		return fmt.Errorf("failed to decode data into passed object: %v", err)
 	}
 
+	return nil
+}
+
+// Iterate iterates each key in Bucket b that starts with prefix. fn is called on
+// the key and msg-pack decoded value. If prefix is empty or nil, all keys in the
+// bucket are iterated.
+//
+// b must already exist.
+func Iterate[T any](b *Bucket, prefix []byte, fn func([]byte, T)) error {
+	c := b.boltBucket.Cursor()
+	for k, data := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, data = c.Next() {
+		var obj T
+		if err := codec.NewDecoderBytes(data, structs.MsgpackHandle).Decode(&obj); err != nil {
+			return fmt.Errorf("failed to decode data into passed object: %v", err)
+		}
+		fn(k, obj)
+	}
+	return nil
+}
+
+// DeletePrefix removes all keys starting with prefix from the bucket. If no keys
+// with prefix exist then nothing is done and a nil error is returned. Returns an
+// error if the bucket was created from a read-only transaction.
+//
+// b must already exist.
+func (b *Bucket) DeletePrefix(prefix []byte) error {
+	c := b.boltBucket.Cursor()
+	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+		if err := c.Delete(); err != nil {
+			return err
+		}
+		b.bm.delHash(string(k))
+	}
 	return nil
 }
 

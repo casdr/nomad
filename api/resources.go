@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
@@ -14,6 +17,7 @@ type Resources struct {
 	DiskMB      *int               `mapstructure:"disk" hcl:"disk,optional"`
 	Networks    []*NetworkResource `hcl:"network,block"`
 	Devices     []*RequestedDevice `hcl:"device,block"`
+	NUMA        *NUMAResource      `hcl:"numa,block"`
 
 	// COMPAT(0.10)
 	// XXX Deprecated. Please do not use. The field will be removed in Nomad
@@ -38,7 +42,7 @@ func (r *Resources) Canonicalize() {
 	// CPU will be set to the default if cores is nil above.
 	// If cpu is nil here then cores has been set and cpu should be 0
 	if r.CPU == nil {
-		r.CPU = intToPtr(0)
+		r.CPU = pointerOf(0)
 	}
 
 	if r.MemoryMB == nil {
@@ -47,6 +51,8 @@ func (r *Resources) Canonicalize() {
 	for _, d := range r.Devices {
 		d.Canonicalize()
 	}
+
+	r.NUMA.Canonicalize()
 }
 
 // DefaultResources is a small resources object that contains the
@@ -55,9 +61,9 @@ func (r *Resources) Canonicalize() {
 // and should be kept in sync.
 func DefaultResources() *Resources {
 	return &Resources{
-		CPU:      intToPtr(100),
-		Cores:    intToPtr(0),
-		MemoryMB: intToPtr(300),
+		CPU:      pointerOf(100),
+		Cores:    pointerOf(0),
+		MemoryMB: pointerOf(300),
 	}
 }
 
@@ -68,9 +74,9 @@ func DefaultResources() *Resources {
 // IN nomad/structs/structs.go and should be kept in sync.
 func MinResources() *Resources {
 	return &Resources{
-		CPU:      intToPtr(1),
-		Cores:    intToPtr(0),
-		MemoryMB: intToPtr(10),
+		CPU:      pointerOf(1),
+		Cores:    pointerOf(0),
+		MemoryMB: pointerOf(10),
 	}
 }
 
@@ -94,13 +100,42 @@ func (r *Resources) Merge(other *Resources) {
 	if len(other.Devices) != 0 {
 		r.Devices = other.Devices
 	}
+	if other.NUMA != nil {
+		r.NUMA = other.NUMA.Copy()
+	}
+}
+
+// NUMAResource contains the NUMA affinity request for scheduling purposes.
+//
+// Applies only to Nomad Enterprise.
+type NUMAResource struct {
+	// Affinity must be one of "none", "prefer", "require".
+	Affinity string `hcl:"affinity,optional"`
+}
+
+func (n *NUMAResource) Copy() *NUMAResource {
+	if n == nil {
+		return nil
+	}
+	return &NUMAResource{
+		Affinity: n.Affinity,
+	}
+}
+
+func (n *NUMAResource) Canonicalize() {
+	if n == nil {
+		return
+	}
+	if n.Affinity == "" {
+		n.Affinity = "none"
+	}
 }
 
 type Port struct {
 	Label       string `hcl:",label"`
-	Value       int    `mapstructure:"static" hcl:"static,optional"`
-	To          int    `mapstructure:"to" hcl:"to,optional"`
-	HostNetwork string `mapstructure:"host_network" hcl:"host_network,optional"`
+	Value       int    `hcl:"static,optional"`
+	To          int    `hcl:"to,optional"`
+	HostNetwork string `hcl:"host_network,optional"`
 }
 
 type DNSConfig struct {
@@ -268,7 +303,7 @@ type RequestedDevice struct {
 
 func (d *RequestedDevice) Canonicalize() {
 	if d.Count == nil {
-		d.Count = uint64ToPtr(1)
+		d.Count = pointerOf(uint64(1))
 	}
 
 	for _, a := range d.Affinities {

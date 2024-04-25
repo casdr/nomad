@@ -1,10 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state
 
 import (
 	"fmt"
 
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/pkg/errors"
 )
 
 // StateRestore is used to optimize the performance when restoring state by
@@ -32,8 +34,27 @@ func (r *StateRestore) NodeRestore(node *structs.Node) error {
 	return nil
 }
 
+// NodePoolRestore is used to restore a node pool
+func (r *StateRestore) NodePoolRestore(pool *structs.NodePool) error {
+	if err := r.txn.Insert(TableNodePools, pool); err != nil {
+		return fmt.Errorf("node pool insert failed: %v", err)
+	}
+	return nil
+}
+
 // JobRestore is used to restore a job
 func (r *StateRestore) JobRestore(job *structs.Job) error {
+
+	// When upgrading a cluster pre to post 1.6, the existing jobs will not
+	// have a node pool set. Inserting this into the table will fail, as this
+	// is indexed and cannot be empty.
+	//
+	// This cannot happen within the job canonicalize function, as it would
+	// break the node pools and governance feature.
+	if job.NodePool == "" {
+		job.NodePool = structs.NodePoolDefault
+	}
+
 	if err := r.txn.Insert("jobs", job); err != nil {
 		return fmt.Errorf("job insert failed: %v", err)
 	}
@@ -107,7 +128,7 @@ func (r *StateRestore) VaultAccessorRestore(accessor *structs.VaultAccessor) err
 // SITokenAccessorRestore is used to restore an SI token accessor
 func (r *StateRestore) SITokenAccessorRestore(accessor *structs.SITokenAccessor) error {
 	if err := r.txn.Insert(siTokenAccessorTable, accessor); err != nil {
-		return errors.Wrap(err, "si token accessor insert failed")
+		return fmt.Errorf("si token accessor insert failed: %w", err)
 	}
 	return nil
 }
@@ -184,8 +205,82 @@ func (r *StateRestore) ScalingEventsRestore(jobEvents *structs.JobScalingEvents)
 
 // NamespaceRestore is used to restore a namespace
 func (r *StateRestore) NamespaceRestore(ns *structs.Namespace) error {
+	// Handle upgrade path.
+	ns.Canonicalize()
 	if err := r.txn.Insert(TableNamespaces, ns); err != nil {
 		return fmt.Errorf("namespace insert failed: %v", err)
+	}
+	return nil
+}
+
+// ServiceRegistrationRestore is used to restore a single service registration
+// into the service_registrations table.
+func (r *StateRestore) ServiceRegistrationRestore(service *structs.ServiceRegistration) error {
+	if err := r.txn.Insert(TableServiceRegistrations, service); err != nil {
+		return fmt.Errorf("service registration insert failed: %v", err)
+	}
+	return nil
+}
+
+// VariablesRestore is used to restore a single variable into the variables
+// table.
+func (r *StateRestore) VariablesRestore(variable *structs.VariableEncrypted) error {
+	if err := r.txn.Insert(TableVariables, variable); err != nil {
+		return fmt.Errorf("variable insert failed: %v", err)
+	}
+	return nil
+}
+
+// VariablesQuotaRestore is used to restore a single variable quota into the
+// variables_quota table.
+func (r *StateRestore) VariablesQuotaRestore(quota *structs.VariablesQuota) error {
+	if err := r.txn.Insert(TableVariablesQuotas, quota); err != nil {
+		return fmt.Errorf("variable quota insert failed: %v", err)
+	}
+	return nil
+}
+
+// RootKeyMetaQuotaRestore is used to restore a single root key meta into the
+// root_key_meta table.
+func (r *StateRestore) RootKeyMetaRestore(quota *structs.RootKeyMeta) error {
+	if err := r.txn.Insert(TableRootKeyMeta, quota); err != nil {
+		return fmt.Errorf("root key meta insert failed: %v", err)
+	}
+	return nil
+}
+
+// ACLRoleRestore is used to restore a single ACL role into the acl_roles
+// table.
+func (r *StateRestore) ACLRoleRestore(aclRole *structs.ACLRole) error {
+	if err := r.txn.Insert(TableACLRoles, aclRole); err != nil {
+		return fmt.Errorf("ACL role insert failed: %v", err)
+	}
+	return nil
+}
+
+// ACLAuthMethodRestore is used to restore a single ACL auth method into the
+// acl_auth_methods table.
+func (r *StateRestore) ACLAuthMethodRestore(aclAuthMethod *structs.ACLAuthMethod) error {
+	if err := r.txn.Insert(TableACLAuthMethods, aclAuthMethod); err != nil {
+		return fmt.Errorf("ACL auth method insert failed: %v", err)
+	}
+	return nil
+}
+
+// ACLBindingRuleRestore is used to restore a single ACL binding rule into the
+// acl_binding_rules table.
+func (r *StateRestore) ACLBindingRuleRestore(aclBindingRule *structs.ACLBindingRule) error {
+	if err := r.txn.Insert(TableACLBindingRules, aclBindingRule); err != nil {
+		return fmt.Errorf("ACL binding rule insert failed: %v", err)
+	}
+	return nil
+}
+
+// JobSubmissionRestore is used to restore a single job submission into the
+// job_submission table.
+func (r *StateRestore) JobSubmissionRestore(jobSubmission *structs.JobSubmission) error {
+	if err := r.txn.Insert(TableJobSubmission, jobSubmission); err != nil {
+		return fmt.Errorf("job submission insert failed: %v", err)
 	}
 	return nil
 }

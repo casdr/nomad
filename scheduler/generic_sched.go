@@ -1,13 +1,19 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package scheduler
 
 import (
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"time"
 
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -24,6 +30,10 @@ const (
 	// allocNotNeeded is the status used when a job no longer requires an allocation
 	allocNotNeeded = "alloc not needed due to job update"
 
+	// allocReconnected is the status to use when a replacement allocation is stopped
+	// because a disconnected node reconnects.
+	allocReconnected = "alloc not needed due to disconnected client reconnect"
+
 	// allocMigrating is the status used when we must migrate an allocation
 	allocMigrating = "alloc is being migrated"
 
@@ -32,6 +42,9 @@ const (
 
 	// allocLost is the status used when an allocation is lost
 	allocLost = "alloc is lost since its node is down"
+
+	// allocUnknown is the status used when an allocation is unknown
+	allocUnknown = "alloc is unknown since its node is disconnected"
 
 	// allocInPlace is the status used when speculating on an in-place update
 	allocInPlace = "alloc updating in-place"
@@ -55,10 +68,18 @@ const (
 	// up evals for delayed rescheduling
 	reschedulingFollowupEvalDesc = "created for delayed rescheduling"
 
+	// disconnectTimeoutFollowupEvalDesc is the description used when creating follow
+	// up evals for allocations that be should be stopped after its disconnect
+	// timeout has passed.
+	disconnectTimeoutFollowupEvalDesc = "created for delayed disconnect timeout"
+
 	// maxPastRescheduleEvents is the maximum number of past reschedule event
 	// that we track when unlimited rescheduling is enabled
 	maxPastRescheduleEvents = 5
 )
+
+// minVersionMaxClientDisconnect is the minimum version that supports max_client_disconnect.
+var minVersionMaxClientDisconnect = version.Must(version.NewVersion("1.3.0"))
 
 // SetStatusError is used to set the status of the evaluation to the given error
 type SetStatusError struct {
@@ -129,7 +150,8 @@ func (s *GenericScheduler) Process(eval *structs.Evaluation) (err error) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("processing eval %q panicked scheduler - please report this as a bug! - %v", eval.ID, r)
+			s.logger.Error("processing eval panicked scheduler - please report this as a bug!", "eval_id", eval.ID, "error", r, "stack_trace", string(debug.Stack()))
+			err = fmt.Errorf("failed to process eval: %v", r)
 		}
 	}()
 
@@ -148,7 +170,7 @@ func (s *GenericScheduler) Process(eval *structs.Evaluation) (err error) {
 		structs.EvalTriggerPeriodicJob, structs.EvalTriggerMaxPlans,
 		structs.EvalTriggerDeploymentWatcher, structs.EvalTriggerRetryFailedAlloc,
 		structs.EvalTriggerFailedFollowUp, structs.EvalTriggerPreemption,
-		structs.EvalTriggerScaling:
+		structs.EvalTriggerScaling, structs.EvalTriggerMaxDisconnectTimeout, structs.EvalTriggerReconnect:
 	default:
 		desc := fmt.Sprintf("scheduler cannot handle '%s' evaluation reason",
 			eval.TriggeredBy)
@@ -260,7 +282,7 @@ func (s *GenericScheduler) process() (bool, error) {
 	// Construct the placement stack
 	s.stack = NewGenericStack(s.batch, s.ctx)
 	if !s.job.Stopped() {
-		s.stack.SetJob(s.job)
+		s.setJob(s.job)
 	}
 
 	// Compute the target job allocations
@@ -361,7 +383,9 @@ func (s *GenericScheduler) computeJobAllocs() error {
 
 	reconciler := NewAllocReconciler(s.logger,
 		genericAllocUpdateFn(s.ctx, s.stack, s.eval.ID),
-		s.batch, s.eval.JobID, s.job, s.deployment, allocs, tainted, s.eval.ID, s.eval.Priority)
+		s.batch, s.eval.JobID, s.job, s.deployment, allocs, tainted, s.eval.ID,
+		s.eval.Priority, s.planner.ServersMeetMinimumVersion(minVersionMaxClientDisconnect, true))
+
 	results := reconciler.Compute()
 	s.logger.Debug("reconciled current state with desired state", "results", log.Fmt("%#v", results))
 
@@ -390,6 +414,17 @@ func (s *GenericScheduler) computeJobAllocs() error {
 	// Handle the stop
 	for _, stop := range results.stop {
 		s.plan.AppendStoppedAlloc(stop.alloc, stop.statusDescription, stop.clientStatus, stop.followupEvalID)
+	}
+
+	// Handle disconnect updates
+	for _, update := range results.disconnectUpdates {
+		s.plan.AppendUnknownAlloc(update)
+	}
+
+	// Handle reconnect updates.
+	// Reconnected allocs have a new AllocState entry.
+	for _, update := range results.reconnectUpdates {
+		s.ctx.Plan().AppendAlloc(update, nil)
 	}
 
 	// Handle the in-place updates
@@ -431,7 +466,7 @@ func (s *GenericScheduler) computeJobAllocs() error {
 		s.queuedAllocs[p.placeTaskGroup.Name] += 1
 		destructive = append(destructive, p)
 	}
-	return s.computePlacements(destructive, place)
+	return s.computePlacements(destructive, place, results.taskGroupAllocNameIndexes)
 }
 
 // downgradedJobForPlacement returns the job appropriate for non-canary placement replacement
@@ -461,7 +496,7 @@ func (s *GenericScheduler) downgradedJobForPlacement(p placementResult) (string,
 		}
 	}
 
-	// check if the non-promoted version is a job without update stanza. This version should be the latest "stable" version,
+	// check if the non-promoted version is a job without update block. This version should be the latest "stable" version,
 	// as all subsequent versions must be canaried deployments.  Otherwise, we would have found a deployment above,
 	// or the alloc would have been replaced already by a newer non-deployment job.
 	if job, err := s.state.JobByIDAndVersion(nil, ns, jobID, p.MinJobVersion()); err == nil && job != nil && job.Update.IsEmpty() {
@@ -473,9 +508,10 @@ func (s *GenericScheduler) downgradedJobForPlacement(p placementResult) (string,
 
 // computePlacements computes placements for allocations. It is given the set of
 // destructive updates to place and the set of new placements to place.
-func (s *GenericScheduler) computePlacements(destructive, place []placementResult) error {
+func (s *GenericScheduler) computePlacements(destructive, place []placementResult, nameIndex map[string]*allocNameIndex) error {
+
 	// Get the base nodes
-	nodes, _, byDC, err := readyNodesInDCs(s.state, s.job.Datacenters)
+	nodes, byDC, err := s.setNodes(s.job)
 	if err != nil {
 		return err
 	}
@@ -484,9 +520,6 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 	if s.deployment != nil && s.deployment.Active() {
 		deploymentID = s.deployment.ID
 	}
-
-	// Update the set of placement nodes
-	s.stack.SetNodes(nodes)
 
 	// Capture current time to use as the start time for any rescheduled allocations
 	now := time.Now()
@@ -498,6 +531,12 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 		for _, missing := range results {
 			// Get the task group
 			tg := missing.TaskGroup()
+
+			// This is populated from the reconciler via the compute results,
+			// therefore we cannot have an allocation belonging to a task group
+			// that has not generated and been through allocation name index
+			// tracking.
+			taskGroupNameIndex := nameIndex[tg.Name]
 
 			var downgradedJob *structs.Job
 
@@ -528,10 +567,17 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 				continue
 			}
 
-			// Use downgraded job in scheduling stack to honor
-			// old job resources and constraints
+			// Use downgraded job in scheduling stack to honor old job
+			// resources, constraints, and node pool scheduler configuration.
 			if downgradedJob != nil {
-				s.stack.SetJob(downgradedJob)
+				s.setJob(downgradedJob)
+
+				if needsToSetNodes(downgradedJob, s.job) {
+					nodes, byDC, err = s.setNodes(downgradedJob)
+					if err != nil {
+						return err
+					}
+				}
 			}
 
 			// Find the preferred node
@@ -557,13 +603,22 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 
 			// Store the available nodes by datacenter
 			s.ctx.Metrics().NodesAvailable = byDC
+			s.ctx.Metrics().NodesInPool = len(nodes)
 
 			// Compute top K scoring node metadata
 			s.ctx.Metrics().PopulateScoreMetaData()
 
-			// Restore stack job now that placement is done, to use plan job version
+			// Restore stack job and nodes now that placement is done, to use
+			// plan job version
 			if downgradedJob != nil {
-				s.stack.SetJob(s.job)
+				s.setJob(s.job)
+
+				if needsToSetNodes(downgradedJob, s.job) {
+					nodes, byDC, err = s.setNodes(s.job)
+					if err != nil {
+						return err
+					}
+				}
 			}
 
 			// Set fields based on if we found an allocation option
@@ -580,12 +635,34 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 					resources.Shared.Ports = option.AllocResources.Ports
 				}
 
+				// Pull the allocation name as a new variables, so we can alter
+				// this as needed without making changes to the original
+				// object.
+				newAllocName := missing.Name()
+
+				// Identify the index from the name, so we can check this
+				// against the allocation name index tracking for duplicates.
+				allocIndex := structs.AllocIndexFromName(newAllocName, s.job.ID, tg.Name)
+
+				// If the allocation index is a duplicate, we cannot simply
+				// create a new allocation with the same name. We need to
+				// generate a new index and use this. The log message is useful
+				// for debugging and development, but could be removed in a
+				// future version of Nomad.
+				if taskGroupNameIndex.IsDuplicate(allocIndex) {
+					oldAllocName := newAllocName
+					newAllocName = taskGroupNameIndex.Next(1)[0]
+					taskGroupNameIndex.UnsetIndex(allocIndex)
+					s.logger.Debug("duplicate alloc index found and changed",
+						"old_alloc_name", oldAllocName, "new_alloc_name", newAllocName)
+				}
+
 				// Create an allocation for this
 				alloc := &structs.Allocation{
 					ID:                 uuid.Generate(),
 					Namespace:          s.job.Namespace,
 					EvalID:             s.eval.ID,
-					Name:               missing.Name(),
+					Name:               newAllocName,
 					JobID:              s.job.ID,
 					TaskGroup:          tg.Name,
 					Metrics:            s.ctx.Metrics(),
@@ -653,6 +730,45 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 	}
 
 	return nil
+}
+
+// setJob updates the stack with the given job and job's node pool scheduler
+// configuration.
+func (s *GenericScheduler) setJob(job *structs.Job) error {
+	// Fetch node pool and global scheduler configuration to determine how to
+	// configure the scheduler.
+	pool, err := s.state.NodePoolByName(nil, job.NodePool)
+	if err != nil {
+		return fmt.Errorf("failed to get job node pool %q: %v", job.NodePool, err)
+	}
+
+	_, schedConfig, err := s.state.SchedulerConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get scheduler configuration: %v", err)
+	}
+
+	s.stack.SetJob(job)
+	s.stack.SetSchedulerConfiguration(schedConfig.WithNodePool(pool))
+	return nil
+}
+
+// setnodes updates the stack with the nodes that are ready for placement for
+// the given job.
+func (s *GenericScheduler) setNodes(job *structs.Job) ([]*structs.Node, map[string]int, error) {
+	nodes, _, byDC, err := readyNodesInDCsAndPool(s.state, job.Datacenters, job.NodePool)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.stack.SetNodes(nodes)
+	return nodes, byDC, nil
+}
+
+// needsToSetNodes returns true if jobs a and b changed in a way that requires
+// the nodes to be reset.
+func needsToSetNodes(a, b *structs.Job) bool {
+	return !helper.SliceSetEq(a.Datacenters, b.Datacenters) ||
+		a.NodePool != b.NodePool
 }
 
 // propagateTaskState copies task handles from previous allocations to
@@ -758,7 +874,11 @@ func updateRescheduleTracker(alloc *structs.Allocation, prev *structs.Allocation
 
 // findPreferredNode finds the preferred node for an allocation
 func (s *GenericScheduler) findPreferredNode(place placementResult) (*structs.Node, error) {
-	if prev := place.PreviousAllocation(); prev != nil && place.TaskGroup().EphemeralDisk.Sticky {
+	prev := place.PreviousAllocation()
+	if prev == nil {
+		return nil, nil
+	}
+	if place.TaskGroup().EphemeralDisk.Sticky || place.TaskGroup().EphemeralDisk.Migrate {
 		var preferredNode *structs.Node
 		ws := memdb.NewWatchSet()
 		preferredNode, err := s.state.NodeByID(ws, prev.NodeID)
@@ -779,6 +899,11 @@ func (s *GenericScheduler) selectNextOption(tg *structs.TaskGroup, selectOptions
 	_, schedConfig, _ := s.ctx.State().SchedulerConfig()
 
 	// Check if preemption is enabled, defaults to true
+	//
+	// The scheduler configuration is read directly from state but only
+	// values that can't be specified per node pool should be used. Other
+	// values must be merged by calling schedConfig.WithNodePool() and set in
+	// the stack by calling SetSchedulerConfiguration().
 	enablePreemption := true
 	if schedConfig != nil {
 		if s.job.Type == structs.JobTypeBatch {

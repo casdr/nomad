@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable qunit/no-conditional-assertions */
 import { module, test } from 'qunit';
 import { setupRenderingTest } from 'ember-qunit';
@@ -146,6 +151,7 @@ module('Integration | Component | lifecycle-chart', function (hooks) {
     );
 
     this.set('taskStates.4.finishedAt', new Date());
+    this.set('taskStates.4.state', 'dead');
     await settled();
 
     assert.ok(Chart.tasks[5].isFinished);

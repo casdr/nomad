@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Ember from 'ember';
 import Response from 'ember-cli-mirage/response';
 import { HOSTS } from './common';
@@ -6,6 +11,7 @@ import { generateDiff } from './factories/job-version';
 import { generateTaskGroupFailures } from './factories/evaluation';
 import { copy } from 'ember-copy';
 import formatHost from 'nomad-ui/utils/format-host';
+import faker from 'nomad-ui/mirage/faker';
 
 export function findLeader(schema) {
   const agent = schema.agents.first();
@@ -106,6 +112,19 @@ export default function () {
     return new Response(200, {}, this.serialize(job));
   });
 
+  this.get('/job/:id/submission', function (schema, req) {
+    return new Response(
+      200,
+      {},
+      JSON.stringify({
+        Source: `job "${req.params.id}" {`,
+        Format: 'hcl2',
+        VariableFlags: { X: 'x', Y: '42', Z: 'true' },
+        Variables: 'var file content',
+      })
+    );
+  });
+
   this.post('/job/:id/plan', function (schema, req) {
     const body = JSON.parse(req.requestBody);
 
@@ -120,10 +139,16 @@ export default function () {
     const FailedTGAllocs =
       body.Job.Unschedulable && generateFailedTGAllocs(body.Job);
 
+    const jobPlanWarnings = body.Job.WithWarnings && generateWarnings();
+
     return new Response(
       200,
       {},
-      JSON.stringify({ FailedTGAllocs, Diff: generateDiff(req.params.id) })
+      JSON.stringify({
+        FailedTGAllocs,
+        Warnings: jobPlanWarnings,
+        Diff: generateDiff(req.params.id),
+      })
     );
   });
 
@@ -262,7 +287,9 @@ export default function () {
   });
 
   this.get('/evaluations');
-  this.get('/evaluation/:id');
+  this.get('/evaluation/:id', function ({ evaluations }, { params }) {
+    return evaluations.find(params.id);
+  });
 
   this.get('/deployment/allocations/:id', function (schema, { params }) {
     const job = schema.jobs.find(schema.deployments.find(params.id).jobId);
@@ -278,8 +305,16 @@ export default function () {
     });
 
     if (token) {
-      const { policyIds } = token;
-      const policies = server.db.policies.find(policyIds);
+      const policyIds = token.policyIds || [];
+
+      const roleIds = token.roleIds || [];
+      const roles = server.db.roles.find(roleIds);
+      const rolePolicyIds = roles.map((role) => role.policyIds).flat();
+
+      const policies = server.db.policies.find([
+        ...policyIds,
+        ...rolePolicyIds,
+      ]);
       const hasReadPolicy = policies.find(
         (p) =>
           p.rulesJSON.Node?.Policy === 'read' ||
@@ -315,6 +350,10 @@ export default function () {
 
   this.post('/node/:id/drain', function ({ nodes }, { params }) {
     return this.serialize(nodes.find(params.id));
+  });
+
+  this.get('/node/pools', function ({ nodePools }) {
+    return this.serialize(nodePools.all());
   });
 
   this.get('/allocations');
@@ -390,20 +429,6 @@ export default function () {
     return this.serialize(volume);
   });
 
-  this.get('/namespaces', function ({ namespaces }) {
-    const records = namespaces.all();
-
-    if (records.length) {
-      return this.serialize(records);
-    }
-
-    return this.serialize([{ Name: 'default' }]);
-  });
-
-  this.get('/namespace/:id', function ({ namespaces }, { params }) {
-    return this.serialize(namespaces.find(params.id));
-  });
-
   this.get('/agent/members', function ({ agents, regions }) {
     const firstRegion = regions.first();
     return {
@@ -440,6 +465,70 @@ export default function () {
     return JSON.stringify(findLeader(schema));
   });
 
+  this.get('/acl/tokens', function ({ tokens }, req) {
+    return this.serialize(tokens.all());
+  });
+
+  this.delete('/acl/token/:id', function (schema, request) {
+    const { id } = request.params;
+    server.db.tokens.remove(id);
+    return '';
+  });
+
+  this.post('/acl/token', function (schema, request) {
+    const { Name, Policies, Type, ExpirationTTL, ExpirationTime } = JSON.parse(
+      request.requestBody
+    );
+
+    function parseDuration(duration) {
+      const [_, value, unit] = duration.match(/(\d+)(\w)/);
+      const unitMap = {
+        s: 1000,
+        m: 1000 * 60,
+        h: 1000 * 60 * 60,
+        d: 1000 * 60 * 60 * 24,
+      };
+      return value * unitMap[unit];
+    }
+
+    // If there's an expirationTime, use that. Otherwise, use the TTL.
+    const expirationTime = ExpirationTime
+      ? new Date(ExpirationTime)
+      : ExpirationTTL
+      ? new Date(Date.now() + parseDuration(ExpirationTTL))
+      : null;
+
+    return server.create('token', {
+      name: Name,
+      policyIds: Policies,
+      type: Type,
+      id: faker.random.uuid(),
+      expirationTime,
+      createTime: new Date().toISOString(),
+    });
+  });
+
+  this.post('/acl/token/:id', function (schema, request) {
+    // If both Policies and Roles arrays are empty, return an error
+    const { Policies, Roles } = JSON.parse(request.requestBody);
+    if (!Policies.length && !Roles.length) {
+      return new Response(
+        500,
+        {},
+        'Either Policies or Roles must be specified'
+      );
+    }
+    return new Response(
+      200,
+      {},
+      {
+        id: request.params.id,
+        Policies,
+        Roles,
+      }
+    );
+  });
+
   this.get('/acl/token/self', function ({ tokens }, req) {
     const secret = req.requestHeaders['X-Nomad-Token'];
     const tokenForSecret = tokens.findBy({ secretId: secret });
@@ -451,6 +540,23 @@ export default function () {
 
     // Client error if it doesn't
     return new Response(400, {}, null);
+  });
+
+  this.post('/acl/login', function (schema, { requestBody }) {
+    const { LoginToken } = JSON.parse(requestBody);
+    const tokenType = LoginToken.endsWith('management')
+      ? 'management'
+      : 'client';
+    const isBad = LoginToken.endsWith('bad');
+
+    if (isBad) {
+      return new Response(403, {}, null);
+    } else {
+      const token = schema.tokens
+        .all()
+        .models.find((token) => token.type === tokenType);
+      return this.serialize(token);
+    }
   });
 
   this.get('/acl/token/:id', function ({ tokens }, req) {
@@ -491,10 +597,9 @@ export default function () {
   );
 
   this.get('/acl/policy/:id', function ({ policies, tokens }, req) {
-    const policy = policies.find(req.params.id);
+    const policy = policies.findBy({ name: req.params.id });
     const secret = req.requestHeaders['X-Nomad-Token'];
     const tokenForSecret = tokens.findBy({ secretId: secret });
-
     if (req.params.id === 'anonymous') {
       if (policy) {
         return this.serialize(policy);
@@ -502,13 +607,15 @@ export default function () {
         return new Response(404, {}, null);
       }
     }
-
     // Return the policy only if the token that matches the request header
     // includes the policy or if the token that matches the request header
     // is of type management
     if (
       tokenForSecret &&
       (tokenForSecret.policies.includes(policy) ||
+        tokenForSecret.roles.models.any((role) =>
+          role.policies.includes(policy)
+        ) ||
         tokenForSecret.type === 'management')
     ) {
       return this.serialize(policy);
@@ -516,6 +623,140 @@ export default function () {
 
     // Return not authorized otherwise
     return new Response(403, {}, null);
+  });
+
+  this.get('/acl/roles', function ({ roles }, req) {
+    return this.serialize(roles.all());
+  });
+
+  this.get('/acl/role/:id', function ({ roles }, req) {
+    const role = roles.findBy({ id: req.params.id });
+    return this.serialize(role);
+  });
+
+  this.post('/acl/role', function (schema, request) {
+    const { Name, Description } = JSON.parse(request.requestBody);
+    return server.create('role', {
+      name: Name,
+      description: Description,
+    });
+  });
+
+  this.put('/acl/role/:id', function (schema, request) {
+    const { Policies } = JSON.parse(request.requestBody);
+    if (!Policies.length) {
+      return new Response(500, {}, 'Policies must be specified');
+    }
+    return new Response(
+      200,
+      {},
+      {
+        id: request.params.id,
+        Policies,
+      }
+    );
+  });
+
+  this.delete('/acl/role/:id', function (schema, request) {
+    const { id } = request.params;
+
+    // Also update any tokens whose policyIDs include this policy
+    const tokens =
+      server.schema.tokens.where((token) => token.roleIds?.includes(id)) || [];
+    tokens.models.forEach((token) => {
+      token.update({
+        roleIds: token.roleIds.filter((roleId) => roleId !== id),
+      });
+    });
+
+    server.db.roles.remove(id);
+    return '';
+  });
+
+  this.get('/acl/policies', function ({ policies }, req) {
+    return this.serialize(policies.all());
+  });
+
+  this.delete('/acl/policy/:id', function (schema, request) {
+    const { id } = request.params;
+
+    // Also update any tokens whose policyIDs include this policy
+    const tokens =
+      server.schema.tokens.where((token) => token.policyIds?.includes(id)) ||
+      [];
+    tokens.models.forEach((token) => {
+      token.update({
+        policyIds: token.policyIds.filter((policyId) => policyId !== id),
+      });
+    });
+
+    // Also update any roles whose policyIDs include this policy
+    const roles =
+      server.schema.roles.where((role) => role.policyIds?.includes(id)) || [];
+    roles.models.forEach((role) => {
+      role.update({
+        policyIds: role.policyIds.filter((policyId) => policyId !== id),
+      });
+    });
+
+    server.db.policies.remove(id);
+
+    return '';
+  });
+
+  this.put('/acl/policy/:id', function (schema, request) {
+    return new Response(200, {}, {});
+  });
+
+  this.post('/acl/policy/:id', function (schema, request) {
+    const { Name, Description, Rules } = JSON.parse(request.requestBody);
+    return server.create('policy', {
+      name: Name,
+      description: Description,
+      rules: Rules,
+    });
+  });
+
+  this.get('/namespaces', function ({ namespaces }) {
+    const records = namespaces.all();
+
+    if (records.length) {
+      return this.serialize(records);
+    }
+
+    return this.serialize([{ Name: 'default' }]);
+  });
+
+  this.get('/namespace/:id', function ({ namespaces }, { params }) {
+    return this.serialize(namespaces.find(params.id));
+  });
+
+  this.post('/namespace/:id', function (schema, request) {
+    const { Name, Description } = JSON.parse(request.requestBody);
+
+    return server.create('namespace', {
+      id: Name,
+      name: Name,
+      description: Description,
+    });
+  });
+
+  this.put('/namespace/:id', function () {
+    return new Response(200, {}, {});
+  });
+
+  this.delete('/namespace/:id', function (schema, request) {
+    const { id } = request.params;
+
+    // If any variables exist for the namespace, error
+    const variables =
+      server.db.variables.where((v) => v.namespace === id) || [];
+    if (variables.length) {
+      return new Response(403, {}, 'Namespace has variables');
+    }
+
+    server.db.namespaces.remove(id);
+    return '';
   });
 
   this.get('/regions', function ({ regions }) {
@@ -670,6 +911,22 @@ export default function () {
       return new Response(500, {}, null);
     }
   });
+
+  // Metadata
+  this.post(
+    '/client/metadata',
+    function (schema, { queryParams: { node_id }, requestBody }) {
+      const attrs = JSON.parse(requestBody);
+      const node = schema.nodes.find(node_id);
+      Object.entries(attrs.Meta).forEach(([key, value]) => {
+        if (value === null) {
+          delete node.meta[key];
+          delete attrs.Meta[key];
+        }
+      });
+      return { Meta: { ...node.meta, ...attrs.Meta } };
+    }
+  );
 
   // TODO: in the future, this hack may be replaceable with dynamic host name
   // support in pretender: https://github.com/pretenderjs/pretender/issues/210
@@ -833,6 +1090,143 @@ export default function () {
       return {};
     }
   );
+
+  //#region Variables
+
+  this.get('/vars', function (schema, { queryParams: { namespace, prefix } }) {
+    if (prefix === 'nomad/job-templates') {
+      return schema.variables
+        .all()
+        .filter((v) => v.path.includes('nomad/job-templates'));
+    }
+    if (namespace && namespace !== '*') {
+      return schema.variables.all().filter((v) => v.namespace === namespace);
+    } else {
+      return schema.variables.all();
+    }
+  });
+
+  this.get('/var/:id', function ({ variables }, { params }) {
+    let variable = variables.find(params.id);
+    if (!variable) {
+      return new Response(404, {}, {});
+    }
+    return variable;
+  });
+
+  this.put('/var/:id', function (schema, request) {
+    const { Path, Namespace, Items } = JSON.parse(request.requestBody);
+    if (request.url.includes('cas=') && Path === 'Auto-conflicting Variable') {
+      return new Response(
+        409,
+        {},
+        {
+          CreateIndex: 65,
+          CreateTime: faker.date.recent(14) * 1000000, // in the past couple weeks
+          Items: { edited_by: 'your_remote_pal' },
+          ModifyIndex: 2118,
+          ModifyTime: faker.date.recent(0.01) * 1000000, // a few minutes ago
+          Namespace: Namespace,
+          Path: Path,
+        }
+      );
+    } else {
+      return server.create('variable', {
+        path: Path,
+        namespace: Namespace,
+        items: Items,
+        id: Path,
+      });
+    }
+  });
+
+  this.delete('/var/:id', function (schema, request) {
+    const { id } = request.params;
+    server.db.variables.remove(id);
+    return '';
+  });
+
+  //#endregion Variables
+
+  //#region Services
+
+  const allocationServiceChecksHandler = function (schema) {
+    let disasters = [
+      "Moon's haunted",
+      'reticulating splines',
+      'The operation completed unexpectedly',
+      'Ran out of sriracha :(',
+      '¯\\_(ツ)_/¯',
+      '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN"\n        "http://www.w3.org/TR/html4/strict.dtd">\n<html>\n    <head>\n        <meta http-equiv="Content-Type" content="text/html;charset=utf-8">\n        <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        <p>Error code: 404</p>\n        <p>Message: File not found.</p>\n        <p>Error code explanation: HTTPStatus.NOT_FOUND - Nothing matches the given URI.</p>\n    </body>\n</html>\n',
+    ];
+    let fakeChecks = [];
+    schema.serviceFragments.all().models.forEach((frag, iter) => {
+      [...Array(iter)].forEach((check, checkIter) => {
+        const checkOK = faker.random.boolean();
+        fakeChecks.push({
+          Check: `check-${checkIter}`,
+          Group: `job-name.${frag.taskGroup?.name}[1]`,
+          Output: checkOK
+            ? 'nomad: http ok'
+            : disasters[Math.floor(Math.random() * disasters.length)],
+          Service: frag.name,
+          Status: checkOK ? 'success' : 'failure',
+          StatusCode: checkOK ? 200 : 400,
+          Task: frag.task?.name,
+          Timestamp: new Date().getTime(),
+        });
+      });
+    });
+    return fakeChecks;
+  };
+
+  this.get('/job/:id/services', function (schema, { params }) {
+    const { services } = schema;
+    return this.serialize(services.where({ jobId: params.id }));
+  });
+
+  this.get('/client/allocation/:id/checks', allocationServiceChecksHandler);
+
+  //#endregion Services
+
+  //#region SSO
+  this.get('/acl/auth-methods', function (schema, request) {
+    return schema.authMethods.all();
+  });
+  this.post('/acl/oidc/auth-url', (schema, req) => {
+    const { AuthMethodName, ClientNonce, RedirectUri, Meta } = JSON.parse(
+      req.requestBody
+    );
+    return new Response(
+      200,
+      {},
+      {
+        AuthURL: `/ui/oidc-mock?auth_method=${AuthMethodName}&client_nonce=${ClientNonce}&redirect_uri=${RedirectUri}&meta=${Meta}`,
+      }
+    );
+  });
+
+  // Simulate an OIDC callback by assuming the code passed is the secret of an existing token, and return that token.
+  this.post(
+    '/acl/oidc/complete-auth',
+    function (schema, req) {
+      const code = JSON.parse(req.requestBody).Code;
+      const token = schema.tokens.findBy({
+        id: code,
+      });
+
+      return new Response(
+        200,
+        {},
+        {
+          SecretID: token.secretId,
+        }
+      );
+    },
+    { timing: 1000 }
+  );
+
+  //#endregion SSO
 }
 
 function filterKeys(object, ...keys) {
@@ -863,4 +1257,8 @@ function generateFailedTGAllocs(job, taskGroups) {
     hash[tgName] = generateTaskGroupFailures();
     return hash;
   }, {});
+}
+
+function generateWarnings() {
+  return '2 warnings:\n\n* Group "yourtask" has warnings: 1 error occurred:\n\t* Task "yourtask" has warnings: 1 error occurred:\n\t* 2 errors occurred:\n\t* Identity[vault_default] identities without an audience are insecure\n\t* Identity[vault_default] identities without an expiration are insecure\n* Task yourtask has an identity called vault_default but no vault block';
 }

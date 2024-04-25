@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -8,7 +11,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
-	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/cli"
 )
 
@@ -35,7 +37,7 @@ type evalState struct {
 // newEvalState creates and initializes a new monitorState
 func newEvalState() *evalState {
 	return &evalState{
-		status: structs.EvalStatusPending,
+		status: api.EvalStatusPending,
 		allocs: make(map[string]*allocState),
 	}
 }
@@ -136,7 +138,7 @@ func (m *monitor) update(update *evalState) {
 					formatTime(time.Now()), limit(alloc.id, m.length),
 					limit(alloc.node, m.length), alloc.group))
 
-			case alloc.desired == structs.AllocDesiredStatusRun:
+			case alloc.desired == api.AllocDesiredStatusRun:
 				// New allocation with desired status running
 				m.ui.Output(fmt.Sprintf(
 					"%s: Allocation %q created: node %q, group %q",
@@ -161,7 +163,7 @@ func (m *monitor) update(update *evalState) {
 
 	// Check if the status changed. We skip any transitions to pending status.
 	if existing.status != "" &&
-		update.status != structs.AllocClientStatusPending &&
+		update.status != api.AllocClientStatusPending &&
 		existing.status != update.status {
 		m.ui.Output(fmt.Sprintf("%s: Evaluation status changed: %q -> %q",
 			formatTime(time.Now()), existing.status, update.status))
@@ -186,6 +188,9 @@ func (m *monitor) monitor(evalID string) int {
 	// Add the initial pending state
 	m.update(newEvalState())
 
+	m.ui.Info(fmt.Sprintf("%s: Monitoring evaluation %q",
+		formatTime(time.Now()), limit(evalID, m.length)))
+
 	for {
 		// Query the evaluation
 		eval, _, err := m.client.Evaluations().Info(evalID, nil)
@@ -193,9 +198,6 @@ func (m *monitor) monitor(evalID string) int {
 			m.ui.Error(fmt.Sprintf("No evaluation with id %q found", evalID))
 			return 1
 		}
-
-		m.ui.Info(fmt.Sprintf("%s: Monitoring evaluation %q",
-			formatTime(time.Now()), limit(eval.ID, m.length)))
 
 		// Create the new eval state.
 		state := newEvalState()
@@ -232,7 +234,7 @@ func (m *monitor) monitor(evalID string) int {
 		m.update(state)
 
 		switch eval.Status {
-		case structs.EvalStatusComplete, structs.EvalStatusFailed, structs.EvalStatusCancelled:
+		case api.EvalStatusComplete, api.EvalStatusFailed, api.EvalStatusCancelled:
 			if len(eval.FailedTGAllocs) == 0 {
 				m.ui.Info(fmt.Sprintf("%s: Evaluation %q finished with status %q",
 					formatTime(time.Now()), limit(eval.ID, m.length), eval.Status))
@@ -300,9 +302,12 @@ func (m *monitor) monitor(evalID string) int {
 		meta := new(Meta)
 		meta.Ui = m.ui
 		cmd := &DeploymentStatusCommand{Meta: *meta}
-		status, err := cmd.monitor(m.client, dID, 0, verbose)
-		if err != nil || status != structs.DeploymentStatusSuccessful {
+		status, err := cmd.monitor(m.client, dID, 0, m.state.wait, verbose)
+		if err != nil || status != api.DeploymentStatusSuccessful {
 			return 1
+		}
+		if status == api.DeploymentStatusSuccessful {
+			schedFailure = false
 		}
 	}
 

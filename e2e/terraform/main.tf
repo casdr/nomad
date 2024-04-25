@@ -1,11 +1,8 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 provider "aws" {
   region = var.region
-
-  assume_role {
-    role_arn     = var.aws_assume_role_arn
-    session_name = var.aws_assume_role_session_name
-    external_id  = var.aws_assume_role_external_id
-  }
 }
 
 data "aws_caller_identity" "current" {

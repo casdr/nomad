@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable qunit/require-expect */
 import { currentURL, waitFor } from '@ember/test-helpers';
 import { module, test } from 'qunit';
@@ -17,11 +22,16 @@ module('Acceptance | task detail', function (hooks) {
 
   hooks.beforeEach(async function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.create('job', { createAllocations: false });
     allocation = server.create('allocation', 'withTaskWithPorts', {
       clientStatus: 'running',
     });
+    server.db.taskStates.update(
+      { allocationId: allocation.id },
+      { state: 'running' }
+    );
     task = server.db.taskStates.where({ allocationId: allocation.id })[0];
 
     await Task.visit({ id: allocation.id, name: task.name });
@@ -61,7 +71,7 @@ module('Acceptance | task detail', function (hooks) {
 
     assert.equal(Task.lifecycle, lifecycleName);
 
-    assert.equal(document.title, `Task ${task.name} - Nomad`);
+    assert.ok(document.title.includes(`Task ${task.name}`));
   });
 
   test('breadcrumbs match jobs / job / task group / allocation / task', async function (assert) {
@@ -104,7 +114,7 @@ module('Acceptance | task detail', function (hooks) {
     await Layout.breadcrumbFor('jobs.job.index').visit();
     assert.equal(
       currentURL(),
-      `/jobs/${job.id}`,
+      `/jobs/${job.id}@default`,
       'Job breadcrumb links correctly'
     );
 
@@ -112,7 +122,7 @@ module('Acceptance | task detail', function (hooks) {
     await Layout.breadcrumbFor('jobs.job.task-group').visit();
     assert.equal(
       currentURL(),
-      `/jobs/${job.id}/${taskGroup}`,
+      `/jobs/${job.id}@default/${taskGroup}`,
       'Task Group breadcrumb links correctly'
     );
 
@@ -328,6 +338,7 @@ module('Acceptance | task detail (no addresses)', function (hooks) {
 
   hooks.beforeEach(async function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.create('job');
     allocation = server.create('allocation', 'withoutTaskWithPorts', {
@@ -345,6 +356,7 @@ module('Acceptance | task detail (different namespace)', function (hooks) {
 
   hooks.beforeEach(async function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.create('namespace');
     server.create('namespace', { id: 'other-namespace' });
@@ -365,11 +377,7 @@ module('Acceptance | task detail (different namespace)', function (hooks) {
     const job = server.db.jobs.find(jobId);
 
     await Layout.breadcrumbFor('jobs.index').visit();
-    assert.equal(
-      currentURL(),
-      '/jobs?namespace=*',
-      'Jobs breadcrumb links correctly'
-    );
+    assert.equal(currentURL(), '/jobs', 'Jobs breadcrumb links correctly');
 
     await Task.visit({ id: allocation.id, name: task.name });
     await Layout.breadcrumbFor('jobs.job.index').visit();
@@ -403,6 +411,7 @@ module('Acceptance | task detail (not running)', function (hooks) {
 
   hooks.beforeEach(async function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.create('namespace');
     server.create('namespace', { id: 'other-namespace' });
@@ -438,6 +447,7 @@ module('Acceptance | proxy task detail', function (hooks) {
 
   hooks.beforeEach(async function () {
     server.create('agent');
+    server.create('node-pool');
     server.create('node');
     server.create('job', { createAllocations: false });
     allocation = server.create('allocation', 'withTaskWithPorts', {

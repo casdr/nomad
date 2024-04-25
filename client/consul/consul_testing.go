@@ -1,113 +1,50 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package consul
 
 import (
-	"fmt"
-	"sync"
-	"time"
+	"crypto/md5"
+	"encoding/hex"
 
-	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/nomad/command/agent/consul"
-	testing "github.com/mitchellh/go-testing-interface"
+	consulapi "github.com/hashicorp/consul/api"
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
-// MockConsulOp represents the register/deregister operations.
-type MockConsulOp struct {
-	Op         string // add, remove, or update
-	AllocID    string
-	Name       string // task or group name
-	OccurredAt time.Time
+type MockConsulClient struct {
+	tokens map[string]*consulapi.ACLToken
 }
 
-func NewMockConsulOp(op, allocID, name string) MockConsulOp {
-	switch op {
-	case "add", "remove", "update", "alloc_registrations",
-		"add_group", "remove_group", "update_group", "update_ttl":
-	default:
-		panic(fmt.Errorf("invalid consul op: %s", op))
+func NewMockConsulClient(config *config.ConsulConfig, logger hclog.Logger) (Client, error) {
+	return &MockConsulClient{}, nil
+}
+
+// DeriveTokenWithJWT returns ACLTokens with deterministic values for testing:
+// the request ID for the AccessorID and the md5 checksum of the request ID for
+// the SecretID
+func (mc *MockConsulClient) DeriveTokenWithJWT(req JWTLoginRequest) (*consulapi.ACLToken, error) {
+	if t, ok := mc.tokens[req.JWT]; ok {
+		return t, nil
 	}
-	return MockConsulOp{
-		Op:         op,
-		AllocID:    allocID,
-		Name:       name,
-		OccurredAt: time.Now(),
+
+	hash := md5.Sum([]byte(req.JWT))
+	token := &consulapi.ACLToken{
+		AccessorID: hex.EncodeToString(hash[:]),
+		SecretID:   hex.EncodeToString(hash[:]),
 	}
-}
 
-// MockConsulServiceClient implements the ConsulServiceAPI interface to record
-// and log task registration/deregistration.
-type MockConsulServiceClient struct {
-	ops []MockConsulOp
-	mu  sync.Mutex
-
-	logger log.Logger
-
-	// AllocRegistrationsFn allows injecting return values for the
-	// AllocRegistrations function.
-	AllocRegistrationsFn func(allocID string) (*consul.AllocRegistration, error)
-}
-
-func NewMockConsulServiceClient(t testing.T, logger log.Logger) *MockConsulServiceClient {
-	logger = logger.Named("mock_consul")
-	m := MockConsulServiceClient{
-		ops:    make([]MockConsulOp, 0, 20),
-		logger: logger,
+	if mc.tokens == nil {
+		mc.tokens = make(map[string]*consulapi.ACLToken)
 	}
-	return &m
+	mc.tokens[req.JWT] = token
+
+	return token, nil
 }
 
-func (m *MockConsulServiceClient) UpdateWorkload(old, newSvcs *consul.WorkloadServices) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.logger.Trace("UpdateWorkload", "alloc_id", newSvcs.AllocID, "name", newSvcs.Name(),
-		"old_services", len(old.Services), "new_services", len(newSvcs.Services),
-	)
-	m.ops = append(m.ops, NewMockConsulOp("update", newSvcs.AllocID, newSvcs.Name()))
+func (mc *MockConsulClient) RevokeTokens(tokens []*consulapi.ACLToken) error {
+	for _, token := range tokens {
+		delete(mc.tokens, token.AccessorID)
+	}
 	return nil
-}
-
-func (m *MockConsulServiceClient) RegisterWorkload(svcs *consul.WorkloadServices) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.logger.Trace("RegisterWorkload", "alloc_id", svcs.AllocID, "name", svcs.Name(),
-		"services", len(svcs.Services),
-	)
-	m.ops = append(m.ops, NewMockConsulOp("add", svcs.AllocID, svcs.Name()))
-	return nil
-}
-
-func (m *MockConsulServiceClient) RemoveWorkload(svcs *consul.WorkloadServices) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.logger.Trace("RemoveWorkload", "alloc_id", svcs.AllocID, "name", svcs.Name(),
-		"services", len(svcs.Services),
-	)
-	m.ops = append(m.ops, NewMockConsulOp("remove", svcs.AllocID, svcs.Name()))
-}
-
-func (m *MockConsulServiceClient) AllocRegistrations(allocID string) (*consul.AllocRegistration, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.logger.Trace("AllocRegistrations", "alloc_id", allocID)
-	m.ops = append(m.ops, NewMockConsulOp("alloc_registrations", allocID, ""))
-
-	if m.AllocRegistrationsFn != nil {
-		return m.AllocRegistrationsFn(allocID)
-	}
-
-	return nil, nil
-}
-
-func (m *MockConsulServiceClient) UpdateTTL(checkID, namespace, output, status string) error {
-	// TODO(tgross): this method is here so we can implement the
-	// interface but the locking we need for testing creates a lot
-	// of opportunities for deadlocks in testing that will never
-	// appear in live code.
-	m.logger.Trace("UpdateTTL", "check_id", checkID, "namespace", namespace, "status", status)
-	return nil
-}
-
-func (m *MockConsulServiceClient) GetOps() []MockConsulOp {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.ops
 }

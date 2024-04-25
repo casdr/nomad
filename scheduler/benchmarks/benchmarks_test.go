@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package benchmarks
 
 import (
@@ -16,9 +19,9 @@ import (
 // benchmark for the Nomad scheduler. The starting state for your
 // implementation will depend on the following environment variables:
 //
-//  - NOMAD_BENCHMARK_DATADIR: path to data directory
-//  - NOMAD_BENCHMARK_SNAPSHOT: path to raft snapshot
-//  - neither: empty starting state
+//   - NOMAD_BENCHMARK_DATADIR: path to data directory
+//   - NOMAD_BENCHMARK_SNAPSHOT: path to raft snapshot
+//   - neither: empty starting state
 //
 // You can run a profile for this benchmark with the usual -cpuprofile
 // -memprofile flags.
@@ -124,7 +127,7 @@ func BenchmarkServiceScheduler(b *testing.B) {
 }
 
 func upsertJob(h *scheduler.Harness, job *structs.Job) *structs.Evaluation {
-	err := h.State.UpsertJob(structs.MsgTypeTestSetup, h.NextIndex(), job)
+	err := h.State.UpsertJob(structs.MsgTypeTestSetup, h.NextIndex(), nil, job)
 	if err != nil {
 		panic(err)
 	}
@@ -170,13 +173,12 @@ func upsertNodes(h *scheduler.Harness, count, racks int) {
 		node.Datacenter = datacenters[i%2]
 		node.Meta = map[string]string{}
 		node.Meta["rack"] = fmt.Sprintf("r%d", i%racks)
-		cpuShares := 14000
 		memoryMB := 32000
 		diskMB := 100 * 1024
 
 		node.NodeResources = &structs.NodeResources{
-			Cpu: structs.NodeCpuResources{
-				CpuShares: int64(cpuShares),
+			Processors: structs.NodeProcessorResources{
+				Topology: structs.MockBasicTopology(),
 			},
 			Memory: structs.NodeMemoryResources{
 				MemoryMB: int64(memoryMB),
@@ -193,6 +195,7 @@ func upsertNodes(h *scheduler.Harness, count, racks int) {
 				},
 			},
 		}
+		node.NodeResources.Compatibility()
 
 		err := h.State.UpsertNode(structs.MsgTypeTestSetup, h.NextIndex(), node)
 		if err != nil {

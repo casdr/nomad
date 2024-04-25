@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package docker
 
 import (
@@ -5,8 +8,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 // This code is taken from github.com/docker/volume/mounts/windows_parser.go
@@ -73,7 +74,7 @@ const (
 )
 
 func errInvalidSpec(spec string) error {
-	return errors.Errorf("invalid volume specification: '%s'", spec)
+	return fmt.Errorf("invalid volume specification: '%s'", spec)
 }
 
 type fileInfoProvider interface {

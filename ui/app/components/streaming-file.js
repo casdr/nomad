@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Component from '@ember/component';
 import { scheduleOnce, once } from '@ember/runloop';
 import { task } from 'ember-concurrency';
@@ -22,6 +27,7 @@ export default class StreamingFile extends Component.extend(WindowResizable) {
   isStreaming = true;
   logger = null;
   follow = true;
+  shouldFillHeight = true;
 
   // Internal bookkeeping to avoid multiple scroll events on one frame
   requestFrame = true;
@@ -89,7 +95,9 @@ export default class StreamingFile extends Component.extend(WindowResizable) {
 
   didInsertElement() {
     super.didInsertElement(...arguments);
-    this.fillAvailableHeight();
+    if (this.shouldFillHeight) {
+      this.fillAvailableHeight();
+    }
 
     this.set('_scrollHandler', this.scrollHandler.bind(this));
     this.element.addEventListener('scroll', this._scrollHandler);
@@ -105,7 +113,9 @@ export default class StreamingFile extends Component.extend(WindowResizable) {
   }
 
   windowResizeHandler() {
-    once(this, this.fillAvailableHeight);
+    if (this.shouldFillHeight) {
+      once(this, this.fillAvailableHeight);
+    }
   }
 
   fillAvailableHeight() {

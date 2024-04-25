@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import EmberObject from '@ember/object';
 import Component from '@glimmer/component';
 
@@ -48,6 +53,7 @@ export default class ClientRow extends Component {
       runningAllocs: 0,
       startingAllocs: 0,
       lostAllocs: 0,
+      unknownAllocs: 0,
     };
 
     switch (this.args.row.model.jobStatus) {
@@ -76,6 +82,9 @@ export default class ClientRow extends Component {
               break;
             case 'starting':
               statusSummary.startingAllocs++;
+              break;
+            case 'unknown':
+              statusSummary.unknownAllocs++;
               break;
           }
         }

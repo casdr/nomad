@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package capabilities
 
 import (
@@ -132,12 +135,13 @@ func LegacySupported() *Set {
 //
 // The task will drop any capabilities specified in cap_drop, and add back
 // capabilities specified in cap_add. The task will not be allowed to add capabilities
-// not set in the the allow_caps setting (which by default is the same as the basis).
+// not set in the allow_caps setting (which by default is the same as the basis).
 //
 // cap_add takes precedence over cap_drop, enabling the common pattern of dropping
 // all capabilities, then adding back the desired smaller set. e.g.
-//   cap_drop = ["all"]
-//   cap_add = ["chown", "kill"]
+//
+//	cap_drop = ["all"]
+//	cap_add = ["chown", "kill"]
 //
 // Note that the resulting capability names are upper-cased and prefixed with
 // "CAP_", which is the expected input for the exec/java driver implementation.

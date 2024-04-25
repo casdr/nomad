@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
@@ -16,6 +19,8 @@ const (
 	TopicAllocation Topic = "Allocation"
 	TopicJob        Topic = "Job"
 	TopicNode       Topic = "Node"
+	TopicNodePool   Topic = "NodePool"
+	TopicService    Topic = "Service"
 	TopicAll        Topic = "*"
 )
 
@@ -29,6 +34,10 @@ type Events struct {
 
 // Topic is an event Topic
 type Topic string
+
+// String is a convenience function which returns the topic as a string type
+// representation.
+func (t Topic) String() string { return string(t) }
 
 // Event holds information related to an event that occurred in Nomad.
 // The Payload is a hydrated object related to the Topic
@@ -91,12 +100,34 @@ func (e *Event) Node() (*Node, error) {
 	return out.Node, nil
 }
 
+// NodePool returns a NodePool struct from a given event payload. If the Event
+// Topic is NodePool this will return a valid NodePool.
+func (e *Event) NodePool() (*NodePool, error) {
+	out, err := e.decodePayload()
+	if err != nil {
+		return nil, err
+	}
+	return out.NodePool, nil
+}
+
+// Service returns a ServiceRegistration struct from a given event payload. If
+// the Event Topic is Service this will return a valid ServiceRegistration.
+func (e *Event) Service() (*ServiceRegistration, error) {
+	out, err := e.decodePayload()
+	if err != nil {
+		return nil, err
+	}
+	return out.Service, nil
+}
+
 type eventPayload struct {
-	Allocation *Allocation `mapstructure:"Allocation"`
-	Deployment *Deployment `mapstructure:"Deployment"`
-	Evaluation *Evaluation `mapstructure:"Evaluation"`
-	Job        *Job        `mapstructure:"Job"`
-	Node       *Node       `mapstructure:"Node"`
+	Allocation *Allocation          `mapstructure:"Allocation"`
+	Deployment *Deployment          `mapstructure:"Deployment"`
+	Evaluation *Evaluation          `mapstructure:"Evaluation"`
+	Job        *Job                 `mapstructure:"Job"`
+	Node       *Node                `mapstructure:"Node"`
+	NodePool   *NodePool            `mapstructure:"NodePool"`
+	Service    *ServiceRegistration `mapstructure:"Service"`
 }
 
 func (e *Event) decodePayload() (*eventPayload, error) {
@@ -155,7 +186,7 @@ func (e *EventStream) Stream(ctx context.Context, topics map[Topic][]string, ind
 		}
 	}
 
-	_, resp, err := requireOK(e.client.doRequest(r))
+	_, resp, err := requireOK(e.client.doRequest(r)) //nolint:bodyclose
 
 	if err != nil {
 		return nil, err

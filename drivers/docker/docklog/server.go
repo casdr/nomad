@@ -1,9 +1,13 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package docklog
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
-	plugin "github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/go-plugin"
+
 	"github.com/hashicorp/nomad/drivers/docker/docklog/proto"
 )
 

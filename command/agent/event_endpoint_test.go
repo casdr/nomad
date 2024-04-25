@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
@@ -10,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/helper/uuid"
+	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/stretchr/testify/assert"
@@ -27,7 +32,7 @@ func TestEventStream(t *testing.T) {
 
 	httpTest(t, nil, func(s *TestAgent) {
 		ctx, cancel := context.WithCancel(context.Background())
-		req, err := http.NewRequestWithContext(ctx, "GET", "/v1/event/stream", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/v1/event/stream", nil)
 		require.Nil(t, err)
 		resp := httptest.NewRecorder()
 
@@ -74,7 +79,7 @@ func TestEventStream_NamespaceQuery(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		req, err := http.NewRequestWithContext(ctx, "GET", "/v1/event/stream?namespace=foo", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/v1/event/stream?namespace=foo", nil)
 		require.Nil(t, err)
 		resp := httptest.NewRecorder()
 
@@ -201,4 +206,104 @@ func TestEventStream_QueryParse(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestHTTP_Alloc_Port_Response(t *testing.T) {
+	ci.Parallel(t)
+
+	httpTest(t, nil, func(srv *TestAgent) {
+		client := srv.APIClient()
+		defer srv.Shutdown()
+		defer client.Close()
+
+		testutil.WaitForLeader(t, srv.Agent.RPC)
+		testutil.WaitForClient(t, srv.Agent.Client().RPC, srv.Agent.Client().NodeID(), srv.Agent.Client().Region())
+
+		job := MockRunnableJob()
+
+		resp, _, err := client.Jobs().Register(job, nil)
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.EvalID)
+
+		alloc := mock.Alloc()
+		alloc.Job = ApiJobToStructJob(job)
+		alloc.JobID = *job.ID
+		alloc.NodeID = srv.client.NodeID()
+
+		require.Nil(t, srv.server.State().UpsertJobSummary(101, mock.JobSummary(alloc.JobID)))
+		require.Nil(t, srv.server.State().UpsertAllocs(structs.MsgTypeTestSetup, 102, []*structs.Allocation{alloc}))
+
+		running := false
+		testutil.WaitForResult(func() (bool, error) {
+			upsertResult, stateErr := srv.server.State().AllocByID(nil, alloc.ID)
+			if stateErr != nil {
+				return false, stateErr
+			}
+			if upsertResult.ClientStatus == structs.AllocClientStatusRunning {
+				running = true
+				return true, nil
+			}
+			return false, nil
+		}, func(err error) {
+			require.NoError(t, err, "allocation query failed")
+		})
+
+		require.True(t, running)
+
+		topics := map[api.Topic][]string{
+			api.TopicAllocation: {*job.ID},
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		events := client.EventStream()
+		streamCh, err := events.Stream(ctx, topics, 1, nil)
+		require.NoError(t, err)
+
+		var allocEvents []api.Event
+		// gather job alloc events
+		go func() {
+			for {
+				select {
+				case event, ok := <-streamCh:
+					if !ok {
+						return
+					}
+					if event.IsHeartbeat() {
+						continue
+					}
+					allocEvents = append(allocEvents, event.Events...)
+				case <-time.After(10 * time.Second):
+					require.Fail(t, "failed waiting for event stream event")
+				}
+			}
+		}()
+
+		var networkResource *api.NetworkResource
+		testutil.WaitForResult(func() (bool, error) {
+			for _, e := range allocEvents {
+				if e.Type == structs.TypeAllocationUpdated {
+					eventAlloc, err := e.Allocation()
+					if err != nil {
+						return false, err
+					}
+					if len(eventAlloc.AllocatedResources.Tasks["web"].Networks) == 0 {
+						return false, nil
+					}
+					networkResource = eventAlloc.AllocatedResources.Tasks["web"].Networks[0]
+					if networkResource.ReservedPorts[0].Value == 5000 {
+						return true, nil
+					}
+				}
+			}
+			return false, nil
+		}, func(e error) {
+			require.NoError(t, err)
+		})
+
+		require.NotNil(t, networkResource)
+		require.Equal(t, 5000, networkResource.ReservedPorts[0].Value)
+		require.NotEqual(t, 0, networkResource.DynamicPorts[0].Value)
+	})
 }

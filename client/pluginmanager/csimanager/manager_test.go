@@ -1,15 +1,21 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package csimanager
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/dynamicplugins"
 	"github.com/hashicorp/nomad/client/pluginmanager"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,13 +68,8 @@ func TestManager_RegisterPlugin(t *testing.T) {
 	pm.Run()
 
 	require.Eventually(t, func() bool {
-		pmap, ok := pm.instances[plugin.Type]
-		if !ok {
-			return false
-		}
-
-		_, ok = pmap[plugin.Name]
-		return ok
+		im := instanceManagerByTypeAndName(pm, plugin.Type, plugin.Name)
+		return im != nil
 	}, 5*time.Second, 10*time.Millisecond)
 }
 
@@ -85,17 +86,52 @@ func TestManager_DeregisterPlugin(t *testing.T) {
 	pm.Run()
 
 	require.Eventually(t, func() bool {
-		_, ok := pm.instances[plugin.Type][plugin.Name]
-		return ok
+		im := instanceManagerByTypeAndName(pm, plugin.Type, plugin.Name)
+		return im != nil
 	}, 5*time.Second, 10*time.Millisecond)
 
 	err = registry.DeregisterPlugin(plugin.Type, plugin.Name, "alloc-0")
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		_, ok := pm.instances[plugin.Type][plugin.Name]
-		return !ok
+		im := instanceManagerByTypeAndName(pm, plugin.Type, plugin.Name)
+		return im == nil
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestManager_WaitForPlugin(t *testing.T) {
+	ci.Parallel(t)
+
+	registry := setupRegistry(nil)
+	t.Cleanup(registry.Shutdown)
+	pm := testManager(t, registry, 5*time.Second) // resync period can be long.
+	t.Cleanup(pm.Shutdown)
+	pm.Run()
+
+	t.Run("never happens", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		t.Cleanup(cancel)
+
+		err := pm.WaitForPlugin(ctx, "bad-type", "bad-name")
+		must.Error(t, err)
+		must.ErrorContains(t, err, "did not become ready: context deadline exceeded")
+	})
+
+	t.Run("ok after delay", func(t *testing.T) {
+		plugin := fakePlugin(0, dynamicplugins.PluginTypeCSIController)
+
+		// register the plugin in the near future
+		time.AfterFunc(100*time.Millisecond, func() {
+			err := registry.RegisterPlugin(plugin)
+			must.NoError(t, err)
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		t.Cleanup(cancel)
+
+		err := pm.WaitForPlugin(ctx, plugin.Type, plugin.Name)
+		must.NoError(t, err)
+	})
 }
 
 // TestManager_MultiplePlugins ensures that multiple plugins with the same
@@ -119,21 +155,21 @@ func TestManager_MultiplePlugins(t *testing.T) {
 	pm.Run()
 
 	require.Eventually(t, func() bool {
-		_, ok := pm.instances[controllerPlugin.Type][controllerPlugin.Name]
-		return ok
+		im := instanceManagerByTypeAndName(pm, controllerPlugin.Type, controllerPlugin.Name)
+		return im != nil
 	}, 5*time.Second, 10*time.Millisecond)
 
 	require.Eventually(t, func() bool {
-		_, ok := pm.instances[nodePlugin.Type][nodePlugin.Name]
-		return ok
+		im := instanceManagerByTypeAndName(pm, nodePlugin.Type, nodePlugin.Name)
+		return im != nil
 	}, 5*time.Second, 10*time.Millisecond)
 
 	err = registry.DeregisterPlugin(controllerPlugin.Type, controllerPlugin.Name, "alloc-0")
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		_, ok := pm.instances[controllerPlugin.Type][controllerPlugin.Name]
-		return !ok
+		im := instanceManagerByTypeAndName(pm, controllerPlugin.Type, controllerPlugin.Name)
+		return im == nil
 	}, 5*time.Second, 10*time.Millisecond)
 }
 
@@ -154,8 +190,9 @@ func TestManager_ConcurrentPlugins(t *testing.T) {
 		require.NoError(t, registry.RegisterPlugin(plugin0))
 		require.NoError(t, registry.RegisterPlugin(plugin1))
 		require.Eventuallyf(t, func() bool {
-			im, _ := pm.instances[plugin0.Type][plugin0.Name]
-			return im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-1/csi.sock" &&
+			im := instanceManagerByTypeAndName(pm, plugin0.Type, plugin0.Name)
+			return im != nil &&
+				im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-1/csi.sock" &&
 				im.allocID == "alloc-1"
 		}, 5*time.Second, 10*time.Millisecond, "alloc-1 plugin did not become active plugin")
 
@@ -172,8 +209,9 @@ func TestManager_ConcurrentPlugins(t *testing.T) {
 		pm.Run()
 
 		require.Eventuallyf(t, func() bool {
-			im, _ := pm.instances[plugin0.Type][plugin0.Name]
-			return im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-1/csi.sock" &&
+			im := instanceManagerByTypeAndName(pm, plugin0.Type, plugin0.Name)
+			return im != nil &&
+				im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-1/csi.sock" &&
 				im.allocID == "alloc-1"
 		}, 5*time.Second, 10*time.Millisecond, "alloc-1 plugin was not active after state reload")
 
@@ -183,8 +221,9 @@ func TestManager_ConcurrentPlugins(t *testing.T) {
 
 		require.NoError(t, registry.RegisterPlugin(plugin2))
 		require.Eventuallyf(t, func() bool {
-			im, _ := pm.instances[plugin0.Type][plugin0.Name]
-			return im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-2/csi.sock" &&
+			im := instanceManagerByTypeAndName(pm, plugin0.Type, plugin0.Name)
+			return im != nil &&
+				im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-2/csi.sock" &&
 				im.allocID == "alloc-2"
 		}, 5*time.Second, 10*time.Millisecond, "alloc-2 plugin was not active after replacement")
 
@@ -206,19 +245,30 @@ func TestManager_ConcurrentPlugins(t *testing.T) {
 		require.NoError(t, registry.RegisterPlugin(plugin1))
 
 		require.Eventuallyf(t, func() bool {
-			im, _ := pm.instances[plugin0.Type][plugin0.Name]
-			return im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-1/csi.sock" &&
+			im := instanceManagerByTypeAndName(pm, plugin0.Type, plugin0.Name)
+			return im != nil &&
+				im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-1/csi.sock" &&
 				im.allocID == "alloc-1"
 		}, 5*time.Second, 10*time.Millisecond, "alloc-1 plugin did not become active plugin")
 
 		registry.DeregisterPlugin(dynamicplugins.PluginTypeCSINode, "my-plugin", "alloc-0")
 
 		require.Eventuallyf(t, func() bool {
-			im, _ := pm.instances[plugin0.Type][plugin0.Name]
+			im := instanceManagerByTypeAndName(pm, plugin0.Type, plugin0.Name)
 			return im != nil &&
 				im.info.ConnectionInfo.SocketPath == "/var/data/alloc/alloc-1/csi.sock"
 		}, 5*time.Second, 10*time.Millisecond, "alloc-1 plugin should still be active plugin")
 	})
+}
+
+// instanceManagerByTypeAndName is a test helper to get the instance
+// manager for the plugin, protected by the lock that the csiManager
+// will normally do internally
+func instanceManagerByTypeAndName(mgr *csiManager, pluginType, pluginName string) *instanceManager {
+	mgr.instancesLock.RLock()
+	defer mgr.instancesLock.RUnlock()
+	im, _ := mgr.instances[pluginType][pluginName]
+	return im
 }
 
 // MemDB implements a StateDB that stores data in memory and should only be

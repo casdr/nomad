@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -5,14 +8,15 @@ import (
 	"testing"
 	"time"
 
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -944,11 +948,15 @@ func TestAllocEndpoint_GetAllocs(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
+	node := mock.Node()
+	state.UpsertNode(structs.MsgTypeTestSetup, 1001, node)
+
 	// Lookup the allocs
 	get := &structs.AllocsGetRequest{
 		AllocIDs: []string{alloc.ID, alloc2.ID},
 		QueryOptions: structs.QueryOptions{
-			Region: "global",
+			Region:    "global",
+			AuthToken: node.SecretID,
 		},
 	}
 	var resp structs.AllocsGetResponse
@@ -982,6 +990,9 @@ func TestAllocEndpoint_GetAllocs_Blocking(t *testing.T) {
 	codec := rpcClient(t, s1)
 	testutil.WaitForLeader(t, s1.RPC)
 
+	node := mock.Node()
+	state.UpsertNode(structs.MsgTypeTestSetup, 50, node)
+
 	// Create the allocs
 	alloc1 := mock.Alloc()
 	alloc2 := mock.Alloc()
@@ -1010,6 +1021,7 @@ func TestAllocEndpoint_GetAllocs_Blocking(t *testing.T) {
 		QueryOptions: structs.QueryOptions{
 			Region:        "global",
 			MinQueryIndex: 150,
+			AuthToken:     node.SecretID,
 		},
 	}
 	var resp structs.AllocsGetResponse
@@ -1047,7 +1059,7 @@ func TestAllocEndpoint_UpdateDesiredTransition(t *testing.T) {
 	require.Nil(state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, []*structs.Allocation{alloc, alloc2}))
 
 	t1 := &structs.DesiredTransition{
-		Migrate: helper.BoolToPtr(true),
+		Migrate: pointer.Of(true),
 	}
 
 	// Update the allocs desired status
@@ -1279,13 +1291,14 @@ func TestAllocEndpoint_List_AllNamespaces_ACL_OSS(t *testing.T) {
 			Namespace: "*",
 			Token:     uuid.Generate(),
 			Error:     true,
-			Message:   structs.ErrTokenNotFound.Error(),
+			Message:   structs.ErrPermissionDenied.Error(),
 		},
 		{
 			Label:     "all namespaces with insufficient token",
 			Namespace: "*",
-			Allocs:    []*structs.Allocation{},
 			Token:     ns1tokenInsufficient.SecretID,
+			Error:     true,
+			Message:   structs.ErrPermissionDenied.Error(),
 		},
 		{
 			Label:     "ns1 with ns1 token",
@@ -1310,7 +1323,7 @@ func TestAllocEndpoint_List_AllNamespaces_ACL_OSS(t *testing.T) {
 			Namespace: ns1.Name,
 			Token:     uuid.Generate(),
 			Error:     true,
-			Message:   structs.ErrTokenNotFound.Error(),
+			Message:   structs.ErrPermissionDenied.Error(),
 		},
 		{
 			Label:     "bad namespace with root token",
@@ -1359,4 +1372,505 @@ func TestAllocEndpoint_List_AllNamespaces_ACL_OSS(t *testing.T) {
 		})
 	}
 
+}
+
+func TestAlloc_GetServiceRegistrations(t *testing.T) {
+	ci.Parallel(t)
+
+	// This function is a helper function to set up an allocation and service
+	// which can be queried.
+	correctSetupFn := func(s *Server) (error, string, *structs.ServiceRegistration) {
+		// Generate an upsert an allocation.
+		alloc := mock.Alloc()
+		err := s.State().UpsertAllocs(structs.MsgTypeTestSetup, 10, []*structs.Allocation{alloc})
+		if err != nil {
+			return nil, "", nil
+		}
+
+		// Generate services. Set the allocation ID to the first, so it
+		// matches the allocation. The alloc and first service both
+		// reside in the default namespace.
+		services := mock.ServiceRegistrations()
+		services[0].AllocID = alloc.ID
+		err = s.State().UpsertServiceRegistrations(structs.MsgTypeTestSetup, 20, services)
+
+		return err, alloc.ID, services[0]
+	}
+
+	testCases := []struct {
+		serverFn func(t *testing.T) (*Server, *structs.ACLToken, func())
+		testFn   func(t *testing.T, s *Server, token *structs.ACLToken)
+		name     string
+	}{
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				server, cleanup := TestServer(t, nil)
+				return server, nil, cleanup
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				err, allocID, service := correctSetupFn(s)
+				require.NoError(t, err)
+
+				// Perform a lookup on the first service.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: allocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: service.Namespace,
+						Region:    s.Region(),
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err = msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.NoError(t, err)
+				require.EqualValues(t, uint64(20), serviceRegResp.Index)
+				require.ElementsMatch(t, serviceRegResp.Services, []*structs.ServiceRegistration{service})
+			},
+			name: "ACLs disabled alloc found with regs",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				server, cleanup := TestServer(t, nil)
+				return server, nil, cleanup
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				// Generate and upsert our services.
+				services := mock.ServiceRegistrations()
+				require.NoError(t, s.State().UpsertServiceRegistrations(structs.MsgTypeTestSetup, 20, services))
+
+				// Perform a lookup on the first service using the allocation
+				// ID. This allocation does not exist within the Nomad state
+				// meaning the service is orphaned or the caller used an
+				// incorrect allocation ID.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: services[0].AllocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: services[0].Namespace,
+						Region:    s.Region(),
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err := msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.NoError(t, err)
+				require.Nil(t, serviceRegResp.Services)
+			},
+			name: "ACLs disabled alloc not found",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				server, cleanup := TestServer(t, nil)
+				return server, nil, cleanup
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				err, allocID, _ := correctSetupFn(s)
+				require.NoError(t, err)
+
+				// Perform a lookup on the first service using the allocation
+				// ID but a random namespace. The namespace on the allocation
+				// does therefore not match the request args.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: allocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: "platform",
+						Region:    s.Region(),
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err = msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.NoError(t, err)
+				require.ElementsMatch(t, serviceRegResp.Services, []*structs.ServiceRegistration{})
+			},
+			name: "ACLs disabled alloc found in different namespace than request",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				server, cleanup := TestServer(t, nil)
+				return server, nil, cleanup
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				// Generate an upsert an allocation.
+				alloc := mock.Alloc()
+				require.NoError(t, s.State().UpsertAllocs(
+					structs.MsgTypeTestSetup, 10, []*structs.Allocation{alloc}))
+
+				// Perform a lookup using the allocation information.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: alloc.ID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: alloc.Namespace,
+						Region:    s.Region(),
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err := msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.NoError(t, err)
+				require.ElementsMatch(t, serviceRegResp.Services, []*structs.ServiceRegistration{})
+			},
+			name: "ACLs disabled alloc found without regs",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				return TestACLServer(t, nil)
+			},
+			testFn: func(t *testing.T, s *Server, token *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				err, allocID, service := correctSetupFn(s)
+				require.NoError(t, err)
+
+				// Perform a lookup using the allocation information.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: allocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: service.Namespace,
+						Region:    s.Region(),
+						AuthToken: token.SecretID,
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err = msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.NoError(t, err)
+				require.ElementsMatch(t, serviceRegResp.Services, []*structs.ServiceRegistration{service})
+			},
+			name: "ACLs enabled use management token",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				return TestACLServer(t, nil)
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				err, allocID, service := correctSetupFn(s)
+				require.NoError(t, err)
+
+				// Create and policy and grab the auth token.
+				authToken := mock.CreatePolicyAndToken(t, s.State(), 30, "test-node-get-service-reg",
+					mock.NamespacePolicy(service.Namespace, "", []string{acl.NamespaceCapabilityReadJob})).SecretID
+
+				// Perform a lookup using the allocation information.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: allocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: service.Namespace,
+						Region:    s.Region(),
+						AuthToken: authToken,
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err = msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.NoError(t, err)
+				require.ElementsMatch(t, serviceRegResp.Services, []*structs.ServiceRegistration{service})
+			},
+			name: "ACLs enabled use read-job namespace capability token",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				return TestACLServer(t, nil)
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				err, allocID, service := correctSetupFn(s)
+				require.NoError(t, err)
+
+				// Create and policy and grab the auth token.
+				authToken := mock.CreatePolicyAndToken(t, s.State(), 30, "test-node-get-service-reg",
+					mock.NamespacePolicy(service.Namespace, "read", nil)).SecretID
+
+				// Perform a lookup using the allocation information.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: allocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: service.Namespace,
+						Region:    s.Region(),
+						AuthToken: authToken,
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err = msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.NoError(t, err)
+				require.ElementsMatch(t, serviceRegResp.Services, []*structs.ServiceRegistration{service})
+			},
+			name: "ACLs enabled use read namespace policy token",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				return TestACLServer(t, nil)
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				err, allocID, service := correctSetupFn(s)
+				require.NoError(t, err)
+
+				// Create and policy and grab the auth token.
+				authToken := mock.CreatePolicyAndToken(t, s.State(), 30, "test-node-get-service-reg",
+					mock.NamespacePolicy("ohno", "read", nil)).SecretID
+
+				// Perform a lookup using the allocation information.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: allocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: service.Namespace,
+						Region:    s.Region(),
+						AuthToken: authToken,
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err = msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "Permission denied")
+				require.Empty(t, serviceRegResp.Services)
+			},
+			name: "ACLs enabled use read incorrect namespace policy token",
+		},
+		{
+			serverFn: func(t *testing.T) (*Server, *structs.ACLToken, func()) {
+				return TestACLServer(t, nil)
+			},
+			testFn: func(t *testing.T, s *Server, _ *structs.ACLToken) {
+				codec := rpcClient(t, s)
+				testutil.WaitForLeader(t, s.RPC)
+
+				err, allocID, service := correctSetupFn(s)
+				require.NoError(t, err)
+
+				// Create and policy and grab the auth token.
+				authToken := mock.CreatePolicyAndToken(t, s.State(), 30, "test-node-get-service-reg",
+					mock.NamespacePolicy(service.Namespace, "", []string{acl.NamespaceCapabilityReadScalingPolicy})).SecretID
+
+				// Perform a lookup using the allocation information.
+				serviceRegReq := &structs.AllocServiceRegistrationsRequest{
+					AllocID: allocID,
+					QueryOptions: structs.QueryOptions{
+						Namespace: service.Namespace,
+						Region:    s.Region(),
+						AuthToken: authToken,
+					},
+				}
+				var serviceRegResp structs.AllocServiceRegistrationsResponse
+				err = msgpackrpc.CallWithCodec(codec, structs.AllocServiceRegistrationsRPCMethod, serviceRegReq, &serviceRegResp)
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "Permission denied")
+				require.Empty(t, serviceRegResp.Services)
+			},
+			name: "ACLs enabled use incorrect capability",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, aclToken, cleanup := tc.serverFn(t)
+			defer cleanup()
+			tc.testFn(t, server, aclToken)
+		})
+	}
+}
+
+func TestAlloc_SignIdentities_Bad(t *testing.T) {
+	ci.Parallel(t)
+
+	// Use non-ACL server because auth should always be enforced on this endpoint
+	s1, cleanupS1 := TestServer(t, nil)
+	t.Cleanup(cleanupS1)
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	node := mock.Node()
+	must.NoError(t, s1.fsm.State().UpsertNode(structs.MsgTypeTestSetup, 100, node))
+
+	req := &structs.AllocIdentitiesRequest{
+		QueryOptions: structs.QueryOptions{
+			Region:     "global",
+			Namespace:  structs.DefaultNamespace,
+			AllowStale: true,
+			AuthToken:  node.SecretID,
+		},
+	}
+	var resp structs.AllocIdentitiesResponse
+
+	// Not including identities results in an error to catch bad client
+	// implementations
+	must.EqError(t, msgpackrpc.CallWithCodec(codec, "Alloc.SignIdentities", &req, &resp), "no identities requested")
+
+	// Making up an alloc returns a rejection.
+	req.Identities = []*structs.WorkloadIdentityRequest{{
+		AllocID: uuid.Generate(),
+		WIHandle: structs.WIHandle{
+			WorkloadIdentifier: "foo",
+			IdentityName:       "bar",
+		},
+	}}
+	must.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.SignIdentities", &req, &resp))
+	must.Len(t, 1, resp.Rejections)
+	must.Eq(t, *req.Identities[0], resp.Rejections[0].WorkloadIdentityRequest)
+	must.Eq(t, structs.WIRejectionReasonMissingAlloc, resp.Rejections[0].Reason)
+
+	// Insert an alloc with an alternate identity
+	alloc := mock.Alloc()
+	alloc.Job.TaskGroups[0].Tasks[0].Identities = []*structs.WorkloadIdentity{
+		{
+			Name:     "alt",
+			Audience: []string{"test"},
+		},
+	}
+	summary := mock.JobSummary(alloc.JobID)
+	state := s1.fsm.State()
+	must.NoError(t, state.UpsertJobSummary(100, summary))
+	must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 101, []*structs.Allocation{alloc}))
+
+	// A valid alloc and invalid TaskName is an error
+	req.Identities[0].AllocID = alloc.ID
+	req.Identities[0].WorkloadIdentifier = "invalid"
+	must.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.SignIdentities", &req, &resp))
+	must.Len(t, 1, resp.Rejections)
+	must.Eq(t, *req.Identities[0], resp.Rejections[0].WorkloadIdentityRequest)
+	must.Eq(t, structs.WIRejectionReasonMissingTask, resp.Rejections[0].Reason)
+
+	// A valid alloc+task name still errors if the identity doesn't exist
+	req.Identities[0].WorkloadIdentifier = "web"
+	req.Identities[0].IdentityName = "invalid"
+	must.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.SignIdentities", &req, &resp))
+	must.Len(t, 1, resp.Rejections)
+	must.Eq(t, *req.Identities[0], resp.Rejections[0].WorkloadIdentityRequest)
+	must.Eq(t, structs.WIRejectionReasonMissingIdentity, resp.Rejections[0].Reason)
+
+	// I know the test is named "Bad" but let's make sure it does actually work
+	req.Identities[0].IdentityName = "alt"
+	must.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.SignIdentities", &req, &resp))
+	must.Len(t, 0, resp.Rejections)
+	must.Len(t, 1, resp.SignedIdentities)
+
+	// Looking for a missing alloc should return a rejection and a signed id
+	req.Identities = append(req.Identities, &structs.WorkloadIdentityRequest{
+		AllocID: uuid.Generate(),
+		WIHandle: structs.WIHandle{
+			WorkloadIdentifier: "foo",
+			IdentityName:       "bar",
+		},
+	})
+	must.NoError(t, msgpackrpc.CallWithCodec(codec, "Alloc.SignIdentities", &req, &resp))
+	must.Len(t, 1, resp.Rejections)
+	must.Eq(t, *req.Identities[1], resp.Rejections[0].WorkloadIdentityRequest)
+	must.Eq(t, structs.WIRejectionReasonMissingAlloc, resp.Rejections[0].Reason)
+	must.Len(t, 1, resp.SignedIdentities)
+}
+
+// TestAlloc_SignIdentities_Blocking asserts that if a server is behind the
+// desired index the signing request will block until the index is reached.
+func TestAlloc_SignIdentities_Blocking(t *testing.T) {
+	ci.Parallel(t)
+
+	s1, cleanupS1 := TestServer(t, nil)
+	t.Cleanup(cleanupS1)
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+	state := s1.fsm.State()
+
+	node := mock.Node()
+	must.NoError(t, s1.fsm.State().UpsertNode(structs.MsgTypeTestSetup, 100, node))
+
+	// Create the alloc we're going to query for, but don't insert it yet. This
+	// simulates querying a slow follower or a restoring server.
+	alloc := mock.Alloc()
+	alloc.Job.TaskGroups[0].Tasks[0].Identities = []*structs.WorkloadIdentity{
+		{
+			Name:     "alt",
+			Audience: []string{"test"},
+		},
+	}
+	summary := mock.JobSummary(alloc.JobID)
+
+	// Write a different alloc so the index is known but won't match our request
+	otherAlloc := mock.Alloc()
+	otherSummary := mock.JobSummary(otherAlloc.JobID)
+	must.NoError(t, state.UpsertJobSummary(999, otherSummary))
+	must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, []*structs.Allocation{otherAlloc}))
+
+	type resultT struct {
+		Err   error
+		Reply structs.AllocIdentitiesResponse
+	}
+	resultCh := make(chan resultT, 1)
+
+	go func() {
+		req := &structs.AllocIdentitiesRequest{
+			Identities: []*structs.WorkloadIdentityRequest{
+				{
+					AllocID: alloc.ID,
+					WIHandle: structs.WIHandle{
+						WorkloadIdentifier: "web",
+						IdentityName:       "alt",
+					},
+				},
+			},
+			QueryOptions: structs.QueryOptions{
+				Region:        "global",
+				Namespace:     structs.DefaultNamespace,
+				AllowStale:    true,
+				MinQueryIndex: 1999,
+				MaxQueryTime:  10 * time.Second,
+				AuthToken:     node.SecretID,
+			},
+		}
+		var resp structs.AllocIdentitiesResponse
+
+		err := msgpackrpc.CallWithCodec(codec, "Alloc.SignIdentities", &req, &resp)
+		resultCh <- resultT{
+			Err:   err,
+			Reply: resp,
+		}
+	}()
+
+	select {
+	case result := <-resultCh:
+		t.Fatalf("1. result returned when RPC should have blocked.\n >> err=%s\n >> rejections=%v", result.Err, result.Reply.Rejections)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Add another alloc to bump the index but not to the MinQueryIndex
+	otherAlloc = mock.Alloc()
+	otherSummary = mock.JobSummary(otherAlloc.JobID)
+	must.NoError(t, state.UpsertJobSummary(1997, otherSummary))
+	must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1998, []*structs.Allocation{otherAlloc}))
+
+	select {
+	case result := <-resultCh:
+		t.Fatalf("2. result returned when RPC should have blocked.\n >> err=%s\n >> rejections=%v", result.Err, result.Reply.Rejections)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Finally add the alloc we're waiting for
+	must.NoError(t, state.UpsertJobSummary(1999, summary))
+	must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 2000, []*structs.Allocation{alloc}))
+
+	select {
+	case result := <-resultCh:
+		must.NoError(t, result.Err)
+		must.Eq(t, 2000, result.Reply.Index)
+		must.Len(t, 0, result.Reply.Rejections)
+		must.Len(t, 1, result.Reply.SignedIdentities)
+		sid := result.Reply.SignedIdentities[0]
+		must.Eq(t, alloc.ID, sid.AllocID)
+		must.Eq(t, "web", sid.WorkloadIdentifier)
+		must.Eq(t, "alt", sid.IdentityName)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("result not returned when expected")
+	}
 }

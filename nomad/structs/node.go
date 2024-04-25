@@ -1,10 +1,16 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 import (
+	"fmt"
+	"maps"
 	"reflect"
+	"strings"
 	"time"
 
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 )
 
 // CSITopology is a map of topological domains to topological segments.
@@ -12,29 +18,29 @@ import (
 // "zone", "rack", etc.
 //
 // According to CSI, there are a few requirements for the keys within this map:
-// - Valid keys have two segments: an OPTIONAL prefix and name, separated
-//   by a slash (/), for example: "com.company.example/zone".
-// - The key name segment is REQUIRED. The prefix is OPTIONAL.
-// - The key name MUST be 63 characters or less, begin and end with an
-//   alphanumeric character ([a-z0-9A-Z]), and contain only dashes (-),
-//   underscores (_), dots (.), or alphanumerics in between, for example
-//   "zone".
-// - The key prefix MUST be 63 characters or less, begin and end with a
-//   lower-case alphanumeric character ([a-z0-9]), contain only
-//   dashes (-), dots (.), or lower-case alphanumerics in between, and
-//   follow domain name notation format
-//   (https://tools.ietf.org/html/rfc1035#section-2.3.1).
-// - The key prefix SHOULD include the plugin's host company name and/or
-//   the plugin name, to minimize the possibility of collisions with keys
-//   from other plugins.
-// - If a key prefix is specified, it MUST be identical across all
-//   topology keys returned by the SP (across all RPCs).
-// - Keys MUST be case-insensitive. Meaning the keys "Zone" and "zone"
-//   MUST not both exist.
-// - Each value (topological segment) MUST contain 1 or more strings.
-// - Each string MUST be 63 characters or less and begin and end with an
-//   alphanumeric character with '-', '_', '.', or alphanumerics in
-//   between.
+//   - Valid keys have two segments: an OPTIONAL prefix and name, separated
+//     by a slash (/), for example: "com.company.example/zone".
+//   - The key name segment is REQUIRED. The prefix is OPTIONAL.
+//   - The key name MUST be 63 characters or less, begin and end with an
+//     alphanumeric character ([a-z0-9A-Z]), and contain only dashes (-),
+//     underscores (_), dots (.), or alphanumerics in between, for example
+//     "zone".
+//   - The key prefix MUST be 63 characters or less, begin and end with a
+//     lower-case alphanumeric character ([a-z0-9]), contain only
+//     dashes (-), dots (.), or lower-case alphanumerics in between, and
+//     follow domain name notation format
+//     (https://tools.ietf.org/html/rfc1035#section-2.3.1).
+//   - The key prefix SHOULD include the plugin's host company name and/or
+//     the plugin name, to minimize the possibility of collisions with keys
+//     from other plugins.
+//   - If a key prefix is specified, it MUST be identical across all
+//     topology keys returned by the SP (across all RPCs).
+//   - Keys MUST be case-insensitive. Meaning the keys "Zone" and "zone"
+//     MUST not both exist.
+//   - Each value (topological segment) MUST contain 1 or more strings.
+//   - Each string MUST be 63 characters or less and begin and end with an
+//     alphanumeric character with '-', '_', '.', or alphanumerics in
+//     between.
 //
 // However, Nomad applies lighter restrictions to these, as they are already
 // only referenced by plugin within the scheduler and as such collisions and
@@ -50,7 +56,7 @@ func (t *CSITopology) Copy() *CSITopology {
 	}
 
 	return &CSITopology{
-		Segments: helper.CopyMapStringString(t.Segments),
+		Segments: maps.Clone(t.Segments),
 	}
 }
 
@@ -58,8 +64,7 @@ func (t *CSITopology) Equal(o *CSITopology) bool {
 	if t == nil || o == nil {
 		return t == o
 	}
-
-	return helper.CompareMapStringString(t.Segments, o.Segments)
+	return maps.Equal(t.Segments, o.Segments)
 }
 
 func (t *CSITopology) MatchFound(o []*CSITopology) bool {
@@ -315,7 +320,7 @@ func (di *DriverInfo) Copy() *DriverInfo {
 
 	cdi := new(DriverInfo)
 	*cdi = *di
-	cdi.Attributes = helper.CopyMapStringString(di.Attributes)
+	cdi.Attributes = maps.Clone(di.Attributes)
 	return cdi
 }
 
@@ -351,4 +356,51 @@ func (di *DriverInfo) HealthCheckEquals(other *DriverInfo) bool {
 	}
 
 	return true
+}
+
+// NodeMetaApplyRequest is used to update Node metadata on Client agents.
+type NodeMetaApplyRequest struct {
+	QueryOptions // Client RPCs must use QueryOptions to set AllowStale=true
+
+	// NodeID is the node being targeted by this request (or the node
+	// receiving this request if NodeID is empty).
+	NodeID string
+
+	// Meta is the new Node metadata being applied and differs slightly
+	// from Node.Meta as nil values are used to unset Node.Meta keys.
+	Meta map[string]*string
+}
+
+func (n *NodeMetaApplyRequest) Validate() error {
+	if len(n.Meta) == 0 {
+		return fmt.Errorf("missing required Meta object")
+	}
+	for k := range n.Meta {
+		if k == "" {
+			return fmt.Errorf("metadata keys must not be empty")
+		}
+
+		// Validate keys are dotted identifiers since their primary use case is in
+		// constraints as interpolated hcl variables.
+		// https://github.com/hashicorp/hcl/blob/v2.16.0/hclsyntax/spec.md#identifiers
+		for _, part := range strings.Split(k, ".") {
+			if !hclsyntax.ValidIdentifier(part) {
+				return fmt.Errorf("%q is invalid; metadata keys must be valid dotted hcl identifiers", k)
+			}
+		}
+	}
+
+	return nil
+}
+
+// NodeMetaResponse is used to read Node metadata directly from Client agents.
+type NodeMetaResponse struct {
+	// Meta is the merged static + dynamic Node metadata
+	Meta map[string]string
+
+	// Dynamic is the dynamic Node metadata (set via API)
+	Dynamic map[string]*string
+
+	// Static is the static Node metadata (set via agent configuration)
+	Static map[string]string
 }

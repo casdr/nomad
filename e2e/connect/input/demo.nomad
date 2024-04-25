@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "countdash" {
   datacenters = ["dc1"]
 
@@ -33,7 +36,7 @@ job "countdash" {
       driver = "docker"
 
       config {
-        image = "hashicorpnomad/counter-api:v3"
+        image = "hashicorpdev/counter-api:v3"
       }
     }
   }
@@ -72,7 +75,7 @@ job "countdash" {
       }
 
       config {
-        image = "hashicorpnomad/counter-dashboard:v3"
+        image = "hashicorpdev/counter-dashboard:v3"
       }
     }
   }

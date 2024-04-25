@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -5,19 +8,16 @@ import (
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/hashicorp/nomad/helper/pointer"
+	"github.com/shoenig/test/must"
 )
 
 func TestDeviceQualifiedID(t *testing.T) {
 	ci.Parallel(t)
 
-	require := require.New(t)
-
-	require.Equal("vendor/type/name[id]", deviceQualifiedID("vendor", "type", "name", "id"))
-	require.Equal("vendor/type[id]", deviceQualifiedID("vendor", "type", "", "id"))
-	require.Equal("vendor[id]", deviceQualifiedID("vendor", "", "", "id"))
+	must.Eq(t, "vendor/type/name[id]", deviceQualifiedID("vendor", "type", "name", "id"))
+	must.Eq(t, "vendor/type[id]", deviceQualifiedID("vendor", "type", "", "id"))
+	must.Eq(t, "vendor[id]", deviceQualifiedID("vendor", "", "", "id"))
 }
 
 func TestBuildDeviceStatsSummaryMap(t *testing.T) {
@@ -31,12 +31,12 @@ func TestBuildDeviceStatsSummaryMap(t *testing.T) {
 			InstanceStats: map[string]*api.DeviceStats{
 				"id1": {
 					Summary: &api.StatValue{
-						StringVal: helper.StringToPtr("stat1"),
+						StringVal: pointer.Of("stat1"),
 					},
 				},
 				"id2": {
 					Summary: &api.StatValue{
-						IntNumeratorVal: helper.Int64ToPtr(2),
+						IntNumeratorVal: pointer.Of(int64(2)),
 					},
 				},
 			},
@@ -47,12 +47,12 @@ func TestBuildDeviceStatsSummaryMap(t *testing.T) {
 			InstanceStats: map[string]*api.DeviceStats{
 				"id1": {
 					Summary: &api.StatValue{
-						StringVal: helper.StringToPtr("stat3"),
+						StringVal: pointer.Of("stat3"),
 					},
 				},
 				"id2": {
 					Summary: &api.StatValue{
-						IntNumeratorVal: helper.Int64ToPtr(4),
+						IntNumeratorVal: pointer.Of(int64(4)),
 					},
 				},
 			},
@@ -61,20 +61,22 @@ func TestBuildDeviceStatsSummaryMap(t *testing.T) {
 
 	expected := map[string]*api.StatValue{
 		"vendor1/type1/name1[id1]": {
-			StringVal: helper.StringToPtr("stat1"),
+			StringVal: pointer.Of("stat1"),
 		},
 		"vendor1/type1/name1[id2]": {
-			IntNumeratorVal: helper.Int64ToPtr(2),
+			IntNumeratorVal: pointer.Of(int64(2)),
 		},
 		"vendor2/type2[id1]": {
-			StringVal: helper.StringToPtr("stat3"),
+			StringVal: pointer.Of("stat3"),
 		},
 		"vendor2/type2[id2]": {
-			IntNumeratorVal: helper.Int64ToPtr(4),
+			IntNumeratorVal: pointer.Of(int64(4)),
 		},
 	}
 
-	require.EqualValues(t, expected, buildDeviceStatsSummaryMap(hostDeviceStats))
+	must.Eq(t, expected, buildDeviceStatsSummaryMap(hostDeviceStats))
+	// TODO(shoenig) figure out why the below does not compile
+	// must.MapContainsValues[map[string]*api.StatValue](t, expected, buildDeviceStatsSummaryMap(hostDeviceStats))
 }
 
 func TestFormatDeviceStats(t *testing.T) {
@@ -82,7 +84,7 @@ func TestFormatDeviceStats(t *testing.T) {
 
 	statValue := func(v string) *api.StatValue {
 		return &api.StatValue{
-			StringVal: helper.StringToPtr(v),
+			StringVal: pointer.Of(v),
 		}
 	}
 
@@ -117,7 +119,7 @@ func TestFormatDeviceStats(t *testing.T) {
 	result := formatDeviceStats("TestDeviceID", stat)
 
 	// check that device id always appears first
-	require.Equal(t, "Device|TestDeviceID", result[0])
+	must.Eq(t, "Device|TestDeviceID", result[0])
 
 	// check rest of values
 	expected := []string{
@@ -131,7 +133,7 @@ func TestFormatDeviceStats(t *testing.T) {
 		"nested2.k2|v2",
 	}
 
-	require.Equal(t, expected, result)
+	must.Eq(t, expected, result)
 }
 
 func TestNodeStatusCommand_GetDeviceResourcesForNode(t *testing.T) {
@@ -145,12 +147,12 @@ func TestNodeStatusCommand_GetDeviceResourcesForNode(t *testing.T) {
 			InstanceStats: map[string]*api.DeviceStats{
 				"id1": {
 					Summary: &api.StatValue{
-						StringVal: helper.StringToPtr("stat1"),
+						StringVal: pointer.Of("stat1"),
 					},
 				},
 				"id2": {
 					Summary: &api.StatValue{
-						IntNumeratorVal: helper.Int64ToPtr(2),
+						IntNumeratorVal: pointer.Of(int64(2)),
 					},
 				},
 			},
@@ -161,12 +163,12 @@ func TestNodeStatusCommand_GetDeviceResourcesForNode(t *testing.T) {
 			InstanceStats: map[string]*api.DeviceStats{
 				"id1": {
 					Summary: &api.StatValue{
-						StringVal: helper.StringToPtr("stat3"),
+						StringVal: pointer.Of("stat3"),
 					},
 				},
 				"id2": {
 					Summary: &api.StatValue{
-						IntNumeratorVal: helper.Int64ToPtr(4),
+						IntNumeratorVal: pointer.Of(int64(4)),
 					},
 				},
 			},
@@ -205,7 +207,7 @@ func TestNodeStatusCommand_GetDeviceResourcesForNode(t *testing.T) {
 		"vendor2/type2[id2]|4",
 	}
 
-	assert.Equal(t, expected, formattedDevices)
+	must.Eq(t, expected, formattedDevices)
 }
 
 func TestNodeStatusCommand_GetDeviceResources(t *testing.T) {
@@ -219,12 +221,12 @@ func TestNodeStatusCommand_GetDeviceResources(t *testing.T) {
 			InstanceStats: map[string]*api.DeviceStats{
 				"id1": {
 					Summary: &api.StatValue{
-						StringVal: helper.StringToPtr("stat1"),
+						StringVal: pointer.Of("stat1"),
 					},
 				},
 				"id2": {
 					Summary: &api.StatValue{
-						IntNumeratorVal: helper.Int64ToPtr(2),
+						IntNumeratorVal: pointer.Of(int64(2)),
 					},
 				},
 			},
@@ -235,12 +237,12 @@ func TestNodeStatusCommand_GetDeviceResources(t *testing.T) {
 			InstanceStats: map[string]*api.DeviceStats{
 				"id1": {
 					Summary: &api.StatValue{
-						StringVal: helper.StringToPtr("stat3"),
+						StringVal: pointer.Of("stat3"),
 					},
 				},
 				"id2": {
 					Summary: &api.StatValue{
-						IntNumeratorVal: helper.Int64ToPtr(4),
+						IntNumeratorVal: pointer.Of(int64(4)),
 					},
 				},
 			},
@@ -255,7 +257,7 @@ func TestNodeStatusCommand_GetDeviceResources(t *testing.T) {
 		"vendor2/type2[id2]|4",
 	}
 
-	assert.Equal(t, expected, formattedDevices)
+	must.Eq(t, expected, formattedDevices)
 }
 func TestGetDeviceAttributes(t *testing.T) {
 	ci.Parallel(t)
@@ -267,11 +269,11 @@ func TestGetDeviceAttributes(t *testing.T) {
 
 		Attributes: map[string]*api.Attribute{
 			"utilization": {
-				FloatVal: helper.Float64ToPtr(0.78),
+				FloatVal: pointer.Of(float64(0.78)),
 				Unit:     "%",
 			},
 			"filesystem": {
-				StringVal: helper.StringToPtr("ext4"),
+				StringVal: pointer.Of("ext4"),
 			},
 		},
 	}
@@ -283,5 +285,5 @@ func TestGetDeviceAttributes(t *testing.T) {
 		"utilization|0.78 %",
 	}
 
-	assert.Equal(t, expected, formattedDevices)
+	must.Eq(t, expected, formattedDevices)
 }

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 import (
@@ -12,6 +15,8 @@ const (
 	errNotReadyForConsistentReads = "Not ready to serve consistent reads"
 	errNoRegionPath               = "No path to region"
 	errTokenNotFound              = "ACL token not found"
+	errTokenExpired               = "ACL token expired"
+	errTokenInvalid               = "ACL token is invalid" // not a UUID
 	errPermissionDenied           = "Permission denied"
 	errJobRegistrationDisabled    = "Job registration, dispatch, and scale are disabled by the scheduler configuration"
 	errNoNodeConn                 = "No path to node"
@@ -20,6 +25,7 @@ const (
 	errNodeLacksRpc               = "Node does not support RPC; requires 0.8 or later"
 	errMissingAllocID             = "Missing allocation ID"
 	errIncompatibleFiltering      = "Filter expression cannot be used with other filter parameters"
+	errMalformedChooseParameter   = "Parameter for choose must be in form '<number>|<key>'"
 
 	// Prefix based errors that are used to check if the error is of a given
 	// type. These errors should be created with the associated constructor.
@@ -47,6 +53,8 @@ var (
 	ErrNotReadyForConsistentReads = errors.New(errNotReadyForConsistentReads)
 	ErrNoRegionPath               = errors.New(errNoRegionPath)
 	ErrTokenNotFound              = errors.New(errTokenNotFound)
+	ErrTokenExpired               = errors.New(errTokenExpired)
+	ErrTokenInvalid               = errors.New(errTokenInvalid)
 	ErrPermissionDenied           = errors.New(errPermissionDenied)
 	ErrJobRegistrationDisabled    = errors.New(errJobRegistrationDisabled)
 	ErrNoNodeConn                 = errors.New(errNoNodeConn)
@@ -55,6 +63,7 @@ var (
 	ErrNodeLacksRpc               = errors.New(errNodeLacksRpc)
 	ErrMissingAllocID             = errors.New(errMissingAllocID)
 	ErrIncompatibleFiltering      = errors.New(errIncompatibleFiltering)
+	ErrMalformedChooseParameter   = errors.New(errMalformedChooseParameter)
 
 	ErrUnknownNode = errors.New(ErrUnknownNodePrefix)
 

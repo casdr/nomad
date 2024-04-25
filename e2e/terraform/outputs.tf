@@ -1,9 +1,12 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 output "servers" {
   value = aws_instance.server.*.public_ip
 }
 
 output "linux_clients" {
-  value = aws_instance.client_ubuntu_bionic_amd64.*.public_ip
+  value = aws_instance.client_ubuntu_jammy_amd64.*.public_ip
 }
 
 output "windows_clients" {
@@ -28,7 +31,7 @@ ssh into servers with:
 
 ssh into clients with:
 
-%{for ip in aws_instance.client_ubuntu_bionic_amd64.*.public_ip~}
+%{for ip in aws_instance.client_ubuntu_jammy_amd64.*.public_ip~}
     ssh -i keys/${local.random_name}.pem ubuntu@${ip}
 %{endfor~}
 %{for ip in aws_instance.client_windows_2016_amd64.*.public_ip~}
@@ -38,34 +41,22 @@ ssh into clients with:
 EOM
 }
 
+# Note: Consul and Vault environment needs to be set in test
+# environment before the Terraform run, so we don't have that output
+# here
 output "environment" {
   description = "get connection config by running: $(terraform output environment)"
+  sensitive   = true
   value       = <<EOM
-%{if var.tls}
 export NOMAD_ADDR=https://${aws_instance.server[0].public_ip}:4646
-export CONSUL_HTTP_ADDR=https://${aws_instance.server[0].public_ip}:8501
-export VAULT_ADDR=https://${aws_instance.server[0].public_ip}:8200
-
 export NOMAD_CACERT=${abspath(path.root)}/keys/tls_ca.crt
-export CONSUL_CACERT=${abspath(path.root)}/keys/tls_ca.crt
-export VAULT_CACERT=${abspath(path.root)}/keys/tls_ca.crt
-
 export NOMAD_CLIENT_CERT=${abspath(path.root)}/keys/tls_api_client.crt
-export CONSUL_CLIENT_CERT=${abspath(path.root)}/keys/tls_api_client.crt
-export VAULT_CLIENT_CERT=${abspath(path.root)}/keys/tls_api_client.crt
-
 export NOMAD_CLIENT_KEY=${abspath(path.root)}/keys/tls_api_client.key
-export CONSUL_CLIENT_KEY=${abspath(path.root)}/keys/tls_api_client.key
-export VAULT_CLIENT_KEY=${abspath(path.root)}/keys/tls_api_client.key
-%{else}
-export NOMAD_ADDR=http://${aws_instance.server[0].public_ip}:4646
-export CONSUL_HTTP_ADDR=http://${aws_instance.server[0].public_ip}:8500
-export VAULT_ADDR=http://${aws_instance.server[0].public_ip}:8200
-%{endif}
-
+export NOMAD_TOKEN=${data.local_sensitive_file.nomad_token.content}
 export NOMAD_E2E=1
-export NOMAD_TOKEN=${data.local_file.nomad_token.content}
-export VAULT_TOKEN=${data.local_file.vault_token.content}
+export CONSUL_HTTP_ADDR=https://${aws_instance.consul_server.public_ip}:8501
+export CONSUL_HTTP_TOKEN=${local_sensitive_file.consul_initial_management_token.content}
+export CONSUL_CACERT=${abspath(path.root)}/keys/tls_ca.crt
 
 EOM
 }

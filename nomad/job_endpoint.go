@@ -1,24 +1,26 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
-	log "github.com/hashicorp/go-hclog"
-	memdb "github.com/hashicorp/go-memdb"
-	multierror "github.com/hashicorp/go-multierror"
-
+	"github.com/armon/go-metrics"
 	"github.com/golang/snappy"
-	"github.com/hashicorp/consul/lib"
-	"github.com/pkg/errors"
-
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-set/v2"
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/state/paginator"
@@ -44,14 +46,15 @@ var (
 	// allocations to be force rescheduled. We create a one off
 	// variable to avoid creating a new object for every request.
 	allowForceRescheduleTransition = &structs.DesiredTransition{
-		ForceReschedule: helper.BoolToPtr(true),
+		ForceReschedule: pointer.Of(true),
 	}
 )
 
 // Job endpoint is used for job interactions
 type Job struct {
 	srv    *Server
-	logger log.Logger
+	ctx    *RPCContext
+	logger hclog.Logger
 
 	// builtin admission controllers
 	mutators   []jobMutator
@@ -59,32 +62,56 @@ type Job struct {
 }
 
 // NewJobEndpoints creates a new job endpoint with builtin admission controllers
-func NewJobEndpoints(s *Server) *Job {
+func NewJobEndpoints(s *Server, ctx *RPCContext) *Job {
 	return &Job{
 		srv:    s,
+		ctx:    ctx,
 		logger: s.logger.Named("job"),
 		mutators: []jobMutator{
-			jobCanonicalizer{},
+			&jobCanonicalizer{srv: s},
+			jobVaultHook{srv: s},
+			jobConsulHook{srv: s},
 			jobConnectHook{},
 			jobExposeCheckHook{},
 			jobImpliedConstraints{},
+			jobNodePoolMutatingHook{srv: s},
+			jobImplicitIdentitiesHook{srv: s},
+			jobNumaHook{},
 		},
 		validators: []jobValidator{
 			jobConnectHook{},
 			jobExposeCheckHook{},
+			jobVaultHook{srv: s},
+			jobConsulHook{srv: s},
 			jobNamespaceConstraintCheckHook{srv: s},
-			jobValidate{},
+			jobNodePoolValidatingHook{srv: s},
+			&jobValidate{srv: s},
 			&memoryOversubscriptionValidate{srv: s},
+			jobNumaHook{},
 		},
 	}
 }
 
 // Register is used to upsert a job for scheduling
 func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegisterResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Register", args, args, reply); done {
 		return err
 	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "register"}, time.Now())
+
+	aclObj, err := j.srv.ResolveACL(args)
+	if err != nil {
+		return err
+	}
+	if ok, err := registrationsAreAllowed(aclObj, j.srv.State()); !ok || err != nil {
+		j.logger.Warn("job registration is currently disabled for non-management ACL")
+		return structs.ErrJobRegistrationDisabled
+	}
 
 	// Validate the arguments
 	if args.Job == nil {
@@ -103,68 +130,66 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 	}
 	args.Job = job
 
-	// Attach the Nomad token's accessor ID so that deploymentwatcher
-	// can reference the token later
-	tokenID, err := j.srv.ResolveSecretToken(args.AuthToken)
-	if err != nil {
-		return err
-	}
-	if tokenID != nil {
-		args.Job.NomadTokenID = tokenID.AccessorID
+	// Run the submission controller
+	warnings = append(warnings, j.submissionController(args))
+
+	// Attach the user token's accessor ID so that deploymentwatcher can
+	// reference the token later in multiregion deployments. We can't auth once
+	// and then use the leader ACL because the leader ACLs aren't shared across
+	// regions. Note this implies WIs can't be used to register multi-region
+	// jobs b/c their identities are only valid in a single region.
+	if args.GetIdentity().ACLToken != nil &&
+		args.GetIdentity().ACLToken.AccessorID != "acls-disabled" {
+		args.Job.NomadTokenID = args.GetIdentity().ACLToken.AccessorID
 	}
 
 	// Set the warning message
-	reply.Warnings = structs.MergeMultierrorWarnings(warnings...)
+	reply.Warnings = helper.MergeMultierrorWarnings(warnings...)
 
 	// Check job submission permissions
-	aclObj, err := j.srv.ResolveToken(args.AuthToken)
-	if err != nil {
-		return err
-	} else if aclObj != nil {
-		if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
-			return structs.ErrPermissionDenied
-		}
+	if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
+		return structs.ErrPermissionDenied
+	}
 
-		// Validate Volume Permissions
-		for _, tg := range args.Job.TaskGroups {
-			for _, vol := range tg.Volumes {
-				switch vol.Type {
-				case structs.VolumeTypeCSI:
-					if !allowCSIMount(aclObj, args.RequestNamespace()) {
+	// Validate Volume Permissions
+	for _, tg := range args.Job.TaskGroups {
+		for _, vol := range tg.Volumes {
+			switch vol.Type {
+			case structs.VolumeTypeCSI:
+				if !allowCSIMount(aclObj, args.RequestNamespace()) {
+					return structs.ErrPermissionDenied
+				}
+			case structs.VolumeTypeHost:
+				// If a volume is readonly, then we allow access if the user has
+				// ReadOnly or ReadWrite access to the volume. Otherwise we only
+				// allow access if they have ReadWrite access.
+				if vol.ReadOnly {
+					if !aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadOnly) &&
+						!aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadWrite) {
 						return structs.ErrPermissionDenied
 					}
-				case structs.VolumeTypeHost:
-					// If a volume is readonly, then we allow access if the user has ReadOnly
-					// or ReadWrite access to the volume. Otherwise we only allow access if
-					// they have ReadWrite access.
-					if vol.ReadOnly {
-						if !aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadOnly) &&
-							!aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadWrite) {
-							return structs.ErrPermissionDenied
-						}
-					} else {
-						if !aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadWrite) {
-							return structs.ErrPermissionDenied
-						}
+				} else {
+					if !aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadWrite) {
+						return structs.ErrPermissionDenied
 					}
-				default:
+				}
+			default:
+				return structs.ErrPermissionDenied
+			}
+		}
+
+		for _, t := range tg.Tasks {
+			for _, vm := range t.VolumeMounts {
+				vol := tg.Volumes[vm.Volume]
+				if vm.PropagationMode == structs.VolumeMountPropagationBidirectional &&
+					!aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadWrite) {
 					return structs.ErrPermissionDenied
 				}
 			}
 
-			for _, t := range tg.Tasks {
-				for _, vm := range t.VolumeMounts {
-					vol := tg.Volumes[vm.Volume]
-					if vm.PropagationMode == structs.VolumeMountPropagationBidirectional &&
-						!aclObj.AllowHostVolumeOperation(vol.Source, acl.HostVolumeCapabilityMountReadWrite) {
-						return structs.ErrPermissionDenied
-					}
-				}
-
-				if t.CSIPluginConfig != nil {
-					if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityCSIRegisterPlugin) {
-						return structs.ErrPermissionDenied
-					}
+			if t.CSIPluginConfig != nil {
+				if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityCSIRegisterPlugin) {
+					return structs.ErrPermissionDenied
 				}
 			}
 		}
@@ -177,11 +202,6 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 			}
 			j.logger.Warn("policy override set for job", "job", args.Job.ID)
 		}
-	}
-
-	if ok, err := registrationsAreAllowed(aclObj, j.srv.State()); !ok || err != nil {
-		j.logger.Warn("job registration is currently disabled for non-management ACL")
-		return structs.ErrJobRegistrationDisabled
 	}
 
 	// Lookup the job
@@ -220,56 +240,13 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 		return err
 	}
 
-	// Ensure that the job has permissions for the requested Vault tokens
-	policies := args.Job.VaultPolicies()
-	if len(policies) != 0 {
-		vconf := j.srv.config.VaultConfig
-		if !vconf.IsEnabled() {
-			return fmt.Errorf("Vault not enabled and Vault policies requested")
-		}
-
-		// Have to check if the user has permissions
-		if !vconf.AllowsUnauthenticated() {
-			if args.Job.VaultToken == "" {
-				return fmt.Errorf("Vault policies requested but missing Vault Token")
-			}
-
-			vault := j.srv.vault
-			s, err := vault.LookupToken(context.Background(), args.Job.VaultToken)
-			if err != nil {
-				return err
-			}
-
-			allowedPolicies, err := PoliciesFrom(s)
-			if err != nil {
-				return err
-			}
-
-			// Check Namespaces
-			namespaceErr := j.multiVaultNamespaceValidation(policies, s)
-			if namespaceErr != nil {
-				return namespaceErr
-			}
-
-			// If we are given a root token it can access all policies
-			if !lib.StrContains(allowedPolicies, "root") {
-				flatPolicies := structs.VaultPoliciesSet(policies)
-				subset, offending := helper.SliceStringIsSubset(allowedPolicies, flatPolicies)
-				if !subset {
-					return fmt.Errorf("Passed Vault Token doesn't allow access to the following policies: %s",
-						strings.Join(offending, ", "))
-				}
-			}
-		}
-	}
-
 	// helper function that checks if the Consul token supplied with the job has
 	// sufficient ACL permissions for:
 	//   - registering services into namespace of each group
 	//   - reading kv store of each group
 	//   - establishing consul connect services
 	checkConsulToken := func(usages map[string]*structs.ConsulUsage) error {
-		if j.srv.config.ConsulConfig.AllowsUnauthenticated() {
+		if j.srv.config.GetDefaultConsul().AllowsUnauthenticated() {
 			// if consul.allow_unauthenticated is enabled (which is the default)
 			// just let the job through without checking anything
 			return nil
@@ -278,7 +255,7 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 		ctx := context.Background()
 		for namespace, usage := range usages {
 			if err := j.srv.consulACLs.CheckPermissions(ctx, namespace, usage, args.Job.ConsulToken); err != nil {
-				return errors.Wrap(err, "job-submitter consul token denied")
+				return fmt.Errorf("job-submitter consul token denied: %w", err)
 			}
 		}
 
@@ -304,12 +281,12 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 
 	for ns, entries := range args.Job.ConfigEntries() {
 		for service, entry := range entries.Ingress {
-			if errCE := j.srv.consulConfigEntries.SetIngressCE(ctx, ns, service, entry); errCE != nil {
+			if errCE := j.srv.consulConfigEntries.SetIngressCE(ctx, ns, service, entries.Cluster, entry); errCE != nil {
 				return errCE
 			}
 		}
 		for service, entry := range entries.Terminating {
-			if errCE := j.srv.consulConfigEntries.SetTerminatingCE(ctx, ns, service, entry); errCE != nil {
+			if errCE := j.srv.consulConfigEntries.SetTerminatingCE(ctx, ns, service, entries.Cluster, entry); errCE != nil {
 				return errCE
 			}
 		}
@@ -317,13 +294,19 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 
 	// Enforce Sentinel policies. Pass a copy of the job to prevent
 	// sentinel from altering it.
-	policyWarnings, err := j.enforceSubmitJob(args.PolicyOverride, args.Job.Copy())
+	ns, err := snap.NamespaceByName(nil, args.RequestNamespace())
+	if err != nil {
+		return err
+	}
+
+	policyWarnings, err := j.enforceSubmitJob(args.PolicyOverride, args.Job.Copy(),
+		existingJob, args.GetIdentity().GetACLToken(), ns)
 	if err != nil {
 		return err
 	}
 	if policyWarnings != nil {
 		warnings = append(warnings, policyWarnings)
-		reply.Warnings = structs.MergeMultierrorWarnings(warnings...)
+		reply.Warnings = helper.MergeMultierrorWarnings(warnings...)
 	}
 
 	// Clear the Vault token
@@ -389,23 +372,25 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 	}
 
 	// Check if the job has changed at all
-	if existingJob == nil || existingJob.SpecChanged(args.Job) {
+	specChanged, err := j.multiregionSpecChanged(existingJob, args)
+	if err != nil {
+		return err
+	}
 
-		// COMPAT(1.1.0): Remove the ServerMeetMinimumVersion check to always set args.Eval
-		// 0.12.1 introduced atomic eval job registration
-		if eval != nil && ServersMeetMinimumVersion(j.srv.Members(), minJobRegisterAtomicEvalVersion, false) {
+	if existingJob == nil || specChanged {
+
+		if eval != nil {
 			args.Eval = eval
 			submittedEval = true
 		}
 
+		// Pre-register a deployment if necessary.
+		args.Deployment = j.multiregionCreateDeployment(job, eval)
+
 		// Commit this update via Raft
-		fsmErr, index, err := j.srv.raftApply(structs.JobRegisterRequestType, args)
-		if err, ok := fsmErr.(error); ok && err != nil {
-			j.logger.Error("registering job failed", "error", err, "fsm", true)
-			return err
-		}
+		_, index, err := j.srv.raftApply(structs.JobRegisterRequestType, args)
 		if err != nil {
-			j.logger.Error("registering job failed", "error", err, "raft", true)
+			j.logger.Error("registering job failed", "error", err)
 			return err
 		}
 
@@ -509,19 +494,22 @@ func getSignalConstraint(signals []string) *structs.Constraint {
 	}
 }
 
-// Summary retrieves the summary of a job
-func (j *Job) Summary(args *structs.JobSummaryRequest,
-	reply *structs.JobSummaryResponse) error {
-
+// Summary retrieves the summary of a job.
+func (j *Job) Summary(args *structs.JobSummaryRequest, reply *structs.JobSummaryResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Summary", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricRead, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job_summary", "get_job_summary"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -556,8 +544,19 @@ func (j *Job) Summary(args *structs.JobSummaryRequest,
 	return j.srv.blockingRPC(&opts)
 }
 
-// Validate validates a job
+// Validate validates a job.
+//
+// Must forward to the leader, because only the leader will have a live Vault
+// client with which to validate vault tokens.
 func (j *Job) Validate(args *structs.JobValidateRequest, reply *structs.JobValidateResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
+	if done, err := j.srv.forward("Job.Validate", args, args, reply); done {
+		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "validate"}, time.Now())
 
 	// defensive check; http layer and RPC requester should ensure namespaces are set consistently
@@ -572,9 +571,9 @@ func (j *Job) Validate(args *structs.JobValidateRequest, reply *structs.JobValid
 	args.Job = job
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -595,22 +594,27 @@ func (j *Job) Validate(args *structs.JobValidateRequest, reply *structs.JobValid
 	validateWarnings = append(validateWarnings, mutateWarnings...)
 
 	// Set the warning message
-	reply.Warnings = structs.MergeMultierrorWarnings(validateWarnings...)
+	reply.Warnings = helper.MergeMultierrorWarnings(validateWarnings...)
 	reply.DriverConfigValidated = true
 	return nil
 }
 
 // Revert is used to revert the job to a prior version
 func (j *Job) Revert(args *structs.JobRevertRequest, reply *structs.JobRegisterResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Revert", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "revert"}, time.Now())
 
 	// Check for submit-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -647,8 +651,8 @@ func (j *Job) Revert(args *structs.JobRevertRequest, reply *structs.JobRegisterR
 
 	// Build the register request
 	revJob := jobV.Copy()
-	// Use Vault Token from revert request to perform registration of reverted job.
-	revJob.VaultToken = args.VaultToken
+	revJob.VaultToken = args.VaultToken   // use vault token from revert to perform (re)registration
+	revJob.ConsulToken = args.ConsulToken // use consul token from revert to perform (re)registration
 	reg := &structs.JobRegisterRequest{
 		Job:          revJob,
 		WriteRequest: args.WriteRequest,
@@ -670,15 +674,20 @@ func (j *Job) Revert(args *structs.JobRevertRequest, reply *structs.JobRegisterR
 
 // Stable is used to mark the job version as stable
 func (j *Job) Stable(args *structs.JobStabilityRequest, reply *structs.JobStabilityResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Stable", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "stable"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -716,15 +725,20 @@ func (j *Job) Stable(args *structs.JobStabilityRequest, reply *structs.JobStabil
 
 // Evaluate is used to force a job for re-evaluation
 func (j *Job) Evaluate(args *structs.JobEvaluateRequest, reply *structs.JobRegisterResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Evaluate", args, args, reply); done {
 		return err
 	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "evaluate"}, time.Now())
 
-	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	// Check for submit-job permissions
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -812,15 +826,20 @@ func (j *Job) Evaluate(args *structs.JobEvaluateRequest, reply *structs.JobRegis
 
 // Deregister is used to remove a job the cluster.
 func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobDeregisterResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Deregister", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "deregister"}, time.Now())
 
 	// Check for submit-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -839,6 +858,9 @@ func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobD
 	if err != nil {
 		return err
 	}
+	if job == nil {
+		return nil
+	}
 
 	var eval *structs.Evaluation
 
@@ -847,7 +869,7 @@ func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobD
 	now := time.Now().UnixNano()
 
 	// If the job is periodic or parameterized, we don't create an eval.
-	if job == nil || !(job.IsPeriodic() || job.IsParameterized()) {
+	if !(job.IsPeriodic() || job.IsParameterized()) {
 
 		// The evaluation priority is determined by several factors. It
 		// defaults to the job default priority and is overridden by the
@@ -856,7 +878,7 @@ func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobD
 		// If the user supplied an eval priority override, we subsequently
 		// use this.
 		priority := structs.JobDefaultPriority
-		if job != nil {
+		if job.Priority > 0 {
 			priority = job.Priority
 		}
 		if args.EvalPriority > 0 {
@@ -877,10 +899,8 @@ func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobD
 		reply.EvalID = eval.ID
 	}
 
-	// COMPAT(1.1.0): remove conditional and always set args.Eval
-	if ServersMeetMinimumVersion(j.srv.Members(), minJobRegisterAtomicEvalVersion, false) {
-		args.Eval = eval
-	}
+	args.SubmitTime = now
+	args.Eval = eval
 
 	// Commit the job update via Raft
 	_, index, err := j.srv.raftApply(structs.JobDeregisterRequestType, args)
@@ -894,27 +914,6 @@ func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobD
 	reply.EvalCreateIndex = index
 	reply.Index = index
 
-	// COMPAT(1.1.0) - Remove entire conditional block
-	// 0.12.1 introduced atomic job deregistration eval
-	if eval != nil && args.Eval == nil {
-		// Create a new evaluation
-		eval.JobModifyIndex = index
-		update := &structs.EvalUpdateRequest{
-			Evals:        []*structs.Evaluation{eval},
-			WriteRequest: structs.WriteRequest{Region: args.Region},
-		}
-
-		// Commit this evaluation via Raft
-		_, evalIndex, err := j.srv.raftApply(structs.EvalUpdateRequestType, update)
-		if err != nil {
-			j.logger.Error("eval create failed", "error", err, "method", "deregister")
-			return err
-		}
-
-		reply.EvalCreateIndex = evalIndex
-		reply.Index = evalIndex
-	}
-
 	err = j.multiregionStop(job, args, reply)
 	if err != nil {
 		return err
@@ -925,13 +924,17 @@ func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobD
 
 // BatchDeregister is used to remove a set of jobs from the cluster.
 func (j *Job) BatchDeregister(args *structs.JobBatchDeregisterRequest, reply *structs.JobBatchDeregisterResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.BatchDeregister", args, args, reply); done {
 		return err
 	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "batch_deregister"}, time.Now())
 
-	// Resolve the ACL token
-	aclObj, err := j.srv.ResolveToken(args.AuthToken)
+	aclObj, err := j.srv.ResolveACL(args)
 	if err != nil {
 		return err
 	}
@@ -947,7 +950,7 @@ func (j *Job) BatchDeregister(args *structs.JobBatchDeregisterRequest, reply *st
 	// Loop through checking for permissions
 	for jobNS := range args.Jobs {
 		// Check for submit-job permissions
-		if aclObj != nil && !aclObj.AllowNsOp(jobNS.Namespace, acl.NamespaceCapabilitySubmitJob) {
+		if !aclObj.AllowNsOp(jobNS.Namespace, acl.NamespaceCapabilitySubmitJob) {
 			return structs.ErrPermissionDenied
 		}
 	}
@@ -974,7 +977,7 @@ func (j *Job) BatchDeregister(args *structs.JobBatchDeregisterRequest, reply *st
 			continue
 		}
 
-		priority := structs.JobDefaultPriority
+		priority := j.srv.config.JobDefaultPriority
 		jtype := structs.JobTypeService
 		if job != nil {
 			priority = job.Priority
@@ -997,6 +1000,8 @@ func (j *Job) BatchDeregister(args *structs.JobBatchDeregisterRequest, reply *st
 		args.Evals = append(args.Evals, eval)
 	}
 
+	args.SubmitTime = time.Now().UnixNano()
+
 	// Commit this update via Raft
 	_, index, err := j.srv.raftApply(structs.JobBatchDeregisterRequestType, args)
 	if err != nil {
@@ -1010,25 +1015,27 @@ func (j *Job) BatchDeregister(args *structs.JobBatchDeregisterRequest, reply *st
 
 // Scale is used to modify one of the scaling targets in the job
 func (j *Job) Scale(args *structs.JobScaleRequest, reply *structs.JobRegisterResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Scale", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "scale"}, time.Now())
 
 	namespace := args.RequestNamespace()
 
-	// Authorize request
-	aclObj, err := j.srv.ResolveToken(args.AuthToken)
+	aclObj, err := j.srv.ResolveACL(args)
 	if err != nil {
 		return err
 	}
 
-	if aclObj != nil {
-		hasScaleJob := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityScaleJob)
-		hasSubmitJob := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilitySubmitJob)
-		if !(hasScaleJob || hasSubmitJob) {
-			return structs.ErrPermissionDenied
-		}
+	hasScaleJob := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityScaleJob)
+	hasSubmitJob := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilitySubmitJob)
+	if !(hasScaleJob || hasSubmitJob) {
+		return structs.ErrPermissionDenied
 	}
 
 	if ok, err := registrationsAreAllowed(aclObj, j.srv.State()); !ok || err != nil {
@@ -1055,9 +1062,19 @@ func (j *Job) Scale(args *structs.JobScaleRequest, reply *structs.JobRegisterRes
 		return err
 	}
 
+	// Perform validation on the job to ensure we have something that can
+	// actually be scaled. This logic can only exist here, as we need access
+	// to the job object.
 	if job == nil {
 		return structs.NewErrRPCCoded(404, fmt.Sprintf("job %q not found", args.JobID))
 	}
+	if job.Type == structs.JobTypeSystem {
+		return structs.NewErrRPCCoded(http.StatusBadRequest, `cannot scale jobs of type "system"`)
+	}
+
+	// Since job is going to be mutated we must copy it since state store methods
+	// return a shared pointer.
+	job = job.Copy()
 
 	// Find target group in job TaskGroups
 	groupName := args.Target[structs.ScalingTargetGroup]
@@ -1108,6 +1125,7 @@ func (j *Job) Scale(args *structs.JobScaleRequest, reply *structs.JobRegisterRes
 
 		// Update group count
 		group.Count = int(*args.Count)
+		job.SubmitTime = now
 
 		// Block scaling event if there's an active deployment
 		deployment, err := snap.LatestDeploymentByJobID(ws, namespace, args.JobID)
@@ -1143,7 +1161,7 @@ func (j *Job) Scale(args *structs.JobScaleRequest, reply *structs.JobRegisterRes
 				ID:             uuid.Generate(),
 				Namespace:      namespace,
 				Priority:       job.Priority, // Safe as nil check performed above.
-				Type:           structs.JobTypeService,
+				Type:           job.Type,
 				TriggeredBy:    structs.EvalTriggerScaling,
 				JobID:          args.JobID,
 				JobModifyIndex: reply.JobModifyIndex,
@@ -1185,18 +1203,69 @@ func (j *Job) Scale(args *structs.JobScaleRequest, reply *structs.JobRegisterRes
 	return nil
 }
 
+func (j *Job) GetJobSubmission(args *structs.JobSubmissionRequest, reply *structs.JobSubmissionResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
+	if done, err := j.srv.forward("Job.GetJobSubmission", args, args, reply); done {
+		return err
+	}
+	j.srv.MeasureRPCRate("job_submission", structs.RateMetricRead, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
+	defer metrics.MeasureSince([]string{"nomad", "job", "get_job_submission"}, time.Now())
+
+	// Check for read-job permissions
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
+		return err
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+		return structs.ErrPermissionDenied
+	}
+
+	// Setup the blocking query
+	opts := blockingOptions{
+		queryOpts: &args.QueryOptions,
+		queryMeta: &reply.QueryMeta,
+		run: func(ws memdb.WatchSet, state *state.StateStore) error {
+			// Look for the submission
+			out, err := state.JobSubmission(ws, args.RequestNamespace(), args.JobID, args.Version)
+			if err != nil {
+				return err
+			}
+
+			// Setup the output
+			reply.Submission = out
+			if out != nil {
+				// associate with the index of the job this submission originates from
+				reply.Index = out.JobModifyIndex
+			} else {
+				// if there is no submission context, associate with no index
+				reply.Index = 0
+			}
+
+			// Set the query response
+			j.srv.setQueryMeta(&reply.QueryMeta)
+			return nil
+		}}
+	return j.srv.blockingRPC(&opts)
+}
+
 // GetJob is used to request information about a specific job
 func (j *Job) GetJob(args *structs.JobSpecificRequest,
 	reply *structs.SingleJobResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.GetJob", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricRead, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "get_job"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -1234,15 +1303,20 @@ func (j *Job) GetJob(args *structs.JobSpecificRequest,
 // GetJobVersions is used to retrieve all tracked versions of a job.
 func (j *Job) GetJobVersions(args *structs.JobVersionsRequest,
 	reply *structs.JobVersionsResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.GetJobVersions", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricRead, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "get_job_versions"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -1293,7 +1367,7 @@ func (j *Job) GetJobVersions(args *structs.JobVersionsRequest,
 // Returns `nil` set if the token has access to all namespaces
 // and ErrPermissionDenied if the token has no capabilities on any namespace.
 func allowedNSes(aclObj *acl.ACL, state *state.StateStore, allow func(ns string) bool) (map[string]bool, error) {
-	if aclObj == nil || aclObj.IsManagement() {
+	if aclObj.IsManagement() {
 		return nil, nil
 	}
 
@@ -1328,7 +1402,7 @@ func registrationsAreAllowed(aclObj *acl.ACL, state *state.StateStore) (bool, er
 	if cfg != nil && !cfg.RejectJobRegistration {
 		return true, nil
 	}
-	if aclObj != nil && aclObj.IsManagement() {
+	if aclObj.IsManagement() {
 		return true, nil
 	}
 	return false, nil
@@ -1336,35 +1410,29 @@ func registrationsAreAllowed(aclObj *acl.ACL, state *state.StateStore) (bool, er
 
 // List is used to list the jobs registered in the system
 func (j *Job) List(args *structs.JobListRequest, reply *structs.JobListResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.List", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricList, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "list"}, time.Now())
 
 	namespace := args.RequestNamespace()
-	var allow func(string) bool
 
 	// Check for list-job permissions
-	aclObj, err := j.srv.ResolveToken(args.AuthToken)
-
-	switch {
-	case err != nil:
+	aclObj, err := j.srv.ResolveACL(args)
+	if err != nil {
 		return err
-	case aclObj == nil:
-		allow = func(string) bool {
-			return true
-		}
-	case namespace == structs.AllNamespacesSentinel:
-		allow = func(ns string) bool {
-			return aclObj.AllowNsOp(ns, acl.NamespaceCapabilityListJobs)
-		}
-	case !aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityListJobs):
-		return structs.ErrPermissionDenied
-	default:
-		allow = func(string) bool {
-			return true
-		}
 	}
+	if !aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityListJobs) {
+		return structs.ErrPermissionDenied
+	}
+	allow := aclObj.AllowNsOpFunc(acl.NamespaceCapabilityListJobs)
+
+	sort := state.QueryOptionSort(args.QueryOptions)
 
 	// Setup the blocking query
 	opts := blockingOptions{
@@ -1375,7 +1443,7 @@ func (j *Job) List(args *structs.JobListRequest, reply *structs.JobListResponse)
 			var err error
 			var iter memdb.ResultIterator
 
-			// check if user has permission to all namespaces
+			// Get the namespaces the user is allowed to access.
 			allowableNamespaces, err := allowedNSes(aclObj, state, allow)
 			if err == structs.ErrPermissionDenied {
 				// return empty jobs if token isn't authorized for any
@@ -1385,11 +1453,11 @@ func (j *Job) List(args *structs.JobListRequest, reply *structs.JobListResponse)
 				return err
 			} else {
 				if prefix := args.QueryOptions.Prefix; prefix != "" {
-					iter, err = state.JobsByIDPrefix(ws, namespace, prefix)
+					iter, err = state.JobsByIDPrefix(ws, namespace, prefix, sort)
 				} else if namespace != structs.AllNamespacesSentinel {
-					iter, err = state.JobsByNamespace(ws, namespace)
+					iter, err = state.JobsByNamespace(ws, namespace, sort)
 				} else {
-					iter, err = state.Jobs(ws)
+					iter, err = state.Jobs(ws, sort)
 				}
 				if err != nil {
 					return err
@@ -1416,7 +1484,7 @@ func (j *Job) List(args *structs.JobListRequest, reply *structs.JobListResponse)
 						if err != nil || summary == nil {
 							return fmt.Errorf("unable to look up summary for job: %v", job.ID)
 						}
-						jobs = append(jobs, job.Stub(summary))
+						jobs = append(jobs, job.Stub(summary, args.Fields))
 						return nil
 					})
 				if err != nil {
@@ -1443,7 +1511,7 @@ func (j *Job) List(args *structs.JobListRequest, reply *structs.JobListResponse)
 			if err != nil {
 				return err
 			}
-			reply.Index = helper.Uint64Max(jindex, sindex)
+			reply.Index = max(jindex, sindex)
 
 			// Set the query response
 			j.srv.setQueryMeta(&reply.QueryMeta)
@@ -1455,15 +1523,20 @@ func (j *Job) List(args *structs.JobListRequest, reply *structs.JobListResponse)
 // Allocations is used to list the allocations for a job
 func (j *Job) Allocations(args *structs.JobSpecificRequest,
 	reply *structs.JobAllocationsResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Allocations", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricList, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "allocations"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -1510,15 +1583,20 @@ func (j *Job) Allocations(args *structs.JobSpecificRequest,
 // Evaluations is used to list the evaluations for a job
 func (j *Job) Evaluations(args *structs.JobSpecificRequest,
 	reply *structs.JobEvaluationsResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Evaluations", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricList, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "evaluations"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -1552,15 +1630,20 @@ func (j *Job) Evaluations(args *structs.JobSpecificRequest,
 // Deployments is used to list the deployments for a job
 func (j *Job) Deployments(args *structs.JobSpecificRequest,
 	reply *structs.DeploymentListResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Deployments", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricList, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "deployments"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -1594,15 +1677,20 @@ func (j *Job) Deployments(args *structs.JobSpecificRequest,
 // LatestDeployment is used to retrieve the latest deployment for a job
 func (j *Job) LatestDeployment(args *structs.JobSpecificRequest,
 	reply *structs.SingleDeploymentResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.LatestDeployment", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricRead, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "latest_deployment"}, time.Now())
 
 	// Check for read-job permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -1638,11 +1726,74 @@ func (j *Job) LatestDeployment(args *structs.JobSpecificRequest,
 	return j.srv.blockingRPC(&opts)
 }
 
+// GetActions is used to iterate through a job's taskgroups' tasks and
+// aggregate their actions, flattened.
+func (j *Job) GetActions(args *structs.JobActionListRequest, reply *structs.JobActionListResponse) error {
+	// authenticate, measure, and forward
+	authErr := j.srv.Authenticate(j.ctx, args)
+	if done, err := j.srv.forward(structs.JobGetActionsRPCMethod, args, args, reply); done {
+		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricRead, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
+	defer metrics.MeasureSince([]string{"nomad", "job", "get_actions"}, time.Now())
+
+	// Check for read-job permissions
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
+		return err
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+		return structs.ErrPermissionDenied
+	}
+
+	// Validate the arguments
+	if args.JobID == "" {
+		return fmt.Errorf("JobID required for actions")
+	}
+
+	// Grab the job
+	job, err := j.srv.fsm.State().JobByID(nil, args.RequestNamespace(), args.JobID)
+	if err != nil {
+		return err
+	}
+	if job == nil {
+		return structs.NewErrUnknownJob(args.JobID)
+	}
+
+	// Get its task groups' tasks' actions
+	jobActions := make([]*structs.JobAction, 0)
+	for _, tg := range job.TaskGroups {
+		for _, task := range tg.Tasks {
+			for _, action := range task.Actions {
+				jobAction := &structs.JobAction{
+					Action:        *action,
+					TaskName:      task.Name,
+					TaskGroupName: tg.Name,
+				}
+				jobActions = append(jobActions, jobAction)
+			}
+		}
+	}
+
+	reply.Actions = jobActions
+	reply.Index = job.ModifyIndex
+
+	j.srv.setQueryMeta(&reply.QueryMeta)
+
+	return nil
+}
+
 // Plan is used to cause a dry-run evaluation of the Job and return the results
 // with a potential diff containing annotations.
 func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Plan", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "plan"}, time.Now())
 
@@ -1659,12 +1810,12 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 	args.Job = job
 
 	// Set the warning message
-	reply.Warnings = structs.MergeMultierrorWarnings(warnings...)
+	reply.Warnings = helper.MergeMultierrorWarnings(warnings...)
 
 	// Check job submission permissions, which we assume is the same for plan
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil {
+	} else {
 		if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilitySubmitJob) {
 			return structs.ErrPermissionDenied
 		}
@@ -1676,20 +1827,36 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 		}
 	}
 
+	// Acquire a snapshot of the state
+	snap, err := j.srv.fsm.State().Snapshot()
+	if err != nil {
+		return err
+	}
+
 	// Enforce Sentinel policies
-	policyWarnings, err := j.enforceSubmitJob(args.PolicyOverride, args.Job)
+	nomadACLToken, err := snap.ACLTokenBySecretID(nil, args.AuthToken)
+	if err != nil && !strings.Contains(err.Error(), "missing secret id") {
+		return err
+	}
+	ns, err := snap.NamespaceByName(nil, args.RequestNamespace())
+	if err != nil {
+		return err
+	}
+
+	// Get the original job
+	ws := memdb.NewWatchSet()
+	existingJob, err := snap.JobByID(ws, args.RequestNamespace(), args.Job.ID)
+	if err != nil {
+		return err
+	}
+
+	policyWarnings, err := j.enforceSubmitJob(args.PolicyOverride, args.Job, existingJob, nomadACLToken, ns)
 	if err != nil {
 		return err
 	}
 	if policyWarnings != nil {
 		warnings = append(warnings, policyWarnings)
-		reply.Warnings = structs.MergeMultierrorWarnings(warnings...)
-	}
-
-	// Acquire a snapshot of the state
-	snap, err := j.srv.fsm.State().Snapshot()
-	if err != nil {
-		return err
+		reply.Warnings = helper.MergeMultierrorWarnings(warnings...)
 	}
 
 	// Interpolate the job for this region
@@ -1698,36 +1865,29 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 		return err
 	}
 
-	// Get the original job
-	ws := memdb.NewWatchSet()
-	oldJob, err := snap.JobByID(ws, args.RequestNamespace(), args.Job.ID)
-	if err != nil {
-		return err
-	}
-
 	// Ensure that all scaling policies have an appropriate ID
-	if err := propagateScalingPolicyIDs(oldJob, args.Job); err != nil {
+	if err := propagateScalingPolicyIDs(existingJob, args.Job); err != nil {
 		return err
 	}
 
 	var index uint64
 	var updatedIndex uint64
 
-	if oldJob != nil {
-		index = oldJob.JobModifyIndex
+	if existingJob != nil {
+		index = existingJob.JobModifyIndex
 
 		// We want to reuse deployments where possible, so only insert the job if
 		// it has changed or the job didn't exist
-		if oldJob.SpecChanged(args.Job) {
+		if existingJob.SpecChanged(args.Job) {
 			// Insert the updated Job into the snapshot
-			updatedIndex = oldJob.JobModifyIndex + 1
-			if err := snap.UpsertJob(structs.IgnoreUnknownTypeFlag, updatedIndex, args.Job); err != nil {
+			updatedIndex = existingJob.JobModifyIndex + 1
+			if err := snap.UpsertJob(structs.IgnoreUnknownTypeFlag, updatedIndex, nil, args.Job); err != nil {
 				return err
 			}
 		}
-	} else if oldJob == nil {
+	} else if existingJob == nil {
 		// Insert the updated Job into the snapshot
-		err := snap.UpsertJob(structs.IgnoreUnknownTypeFlag, 100, args.Job)
+		err := snap.UpsertJob(structs.IgnoreUnknownTypeFlag, 100, nil, args.Job)
 		if err != nil {
 			return err
 		}
@@ -1775,7 +1935,7 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 	}
 	annotations := planner.Plans[0].Annotations
 	if args.Diff {
-		jobDiff, err := oldJob.Diff(args.Job, true)
+		jobDiff, err := existingJob.Diff(args.Job, true)
 		if err != nil {
 			return fmt.Errorf("failed to create job diff: %v", err)
 		}
@@ -1848,16 +2008,21 @@ func validateJobUpdate(old, new *structs.Job) error {
 
 // Dispatch a parameterized job.
 func (j *Job) Dispatch(args *structs.JobDispatchRequest, reply *structs.JobDispatchResponse) error {
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.Dispatch", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "dispatch"}, time.Now())
 
 	// Check for submit-job permissions
-	aclObj, err := j.srv.ResolveToken(args.AuthToken)
+	aclObj, err := j.srv.ResolveACL(args)
 	if err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityDispatchJob) {
+	} else if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityDispatchJob) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -1900,7 +2065,7 @@ func (j *Job) Dispatch(args *structs.JobDispatchRequest, reply *structs.JobDispa
 	// Avoid creating new dispatched jobs for retry requests, by using the idempotency token
 	if args.IdempotencyToken != "" {
 		// Fetch all jobs that match the parameterized job ID prefix
-		iter, err := snap.JobsByIDPrefix(ws, parameterizedJob.Namespace, parameterizedJob.ID)
+		iter, err := snap.JobsByIDPrefix(ws, parameterizedJob.Namespace, parameterizedJob.ID, state.SortDefault)
 		if err != nil {
 			errMsg := "failed to retrieve jobs for idempotency check"
 			j.logger.Error(errMsg, "error", err)
@@ -1936,7 +2101,7 @@ func (j *Job) Dispatch(args *structs.JobDispatchRequest, reply *structs.JobDispa
 
 	// Derive the child job and commit it via Raft - with initial status
 	dispatchJob := parameterizedJob.Copy()
-	dispatchJob.ID = structs.DispatchedID(parameterizedJob.ID, time.Now())
+	dispatchJob.ID = structs.DispatchedID(parameterizedJob.ID, args.IdPrefixTemplate, time.Now())
 	dispatchJob.ParentID = parameterizedJob.ID
 	dispatchJob.Name = dispatchJob.ID
 	dispatchJob.SetSubmitTime()
@@ -1962,13 +2127,9 @@ func (j *Job) Dispatch(args *structs.JobDispatchRequest, reply *structs.JobDispa
 	}
 
 	// Commit this update via Raft
-	fsmErr, jobCreateIndex, err := j.srv.raftApply(structs.JobRegisterRequestType, regReq)
-	if err, ok := fsmErr.(error); ok && err != nil {
-		j.logger.Error("dispatched job register failed", "error", err, "fsm", true)
-		return err
-	}
+	_, jobCreateIndex, err := j.srv.raftApply(structs.JobRegisterRequestType, regReq)
 	if err != nil {
-		j.logger.Error("dispatched job register failed", "error", err, "raft", true)
+		j.logger.Error("dispatched job register failed", "error")
 		return err
 	}
 
@@ -2038,14 +2199,14 @@ func validateDispatchRequest(req *structs.JobDispatchRequest, job *structs.Job) 
 		keys[k] = struct{}{}
 	}
 
-	required := helper.SliceStringToSet(job.ParameterizedJob.MetaRequired)
-	optional := helper.SliceStringToSet(job.ParameterizedJob.MetaOptional)
+	required := set.From(job.ParameterizedJob.MetaRequired)
+	optional := set.From(job.ParameterizedJob.MetaOptional)
 
 	// Check the metadata key constraints are met
 	unpermitted := make(map[string]struct{})
 	for k := range req.Meta {
-		_, req := required[k]
-		_, opt := optional[k]
+		req := required.Contains(k)
+		opt := optional.Contains(k)
 		if !req && !opt {
 			unpermitted[k] = struct{}{}
 		}
@@ -2083,15 +2244,20 @@ func validateDispatchRequest(req *structs.JobDispatchRequest, job *structs.Job) 
 func (j *Job) ScaleStatus(args *structs.JobScaleStatusRequest,
 	reply *structs.JobScaleStatusResponse) error {
 
+	authErr := j.srv.Authenticate(j.ctx, args)
 	if done, err := j.srv.forward("Job.ScaleStatus", args, args, reply); done {
 		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricRead, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "scale_status"}, time.Now())
 
 	// Check for autoscaler permissions
-	if aclObj, err := j.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := j.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil {
+	} else {
 		hasReadJob := aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob)
 		hasReadJobScaling := aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJobScaling)
 		if !(hasReadJob || hasReadJobScaling) {
@@ -2111,8 +2277,13 @@ func (j *Job) ScaleStatus(args *structs.JobScaleStatusRequest,
 				return err
 			}
 			if job == nil {
+				// HTTPServer.jobScaleStatus() will 404 if this is nil
 				reply.JobScaleStatus = nil
-				return nil
+
+				// reply with latest index, since if the job does get created,
+				// it must necessarily be later than current latest.
+				reply.Index, err = state.LatestIndex()
+				return err
 			}
 
 			events, eventsIndex, err := state.ScalingEventsByJob(ws, args.RequestNamespace(), args.JobID)
@@ -2190,4 +2361,69 @@ func (j *Job) ScaleStatus(args *structs.JobScaleStatusRequest,
 			return nil
 		}}
 	return j.srv.blockingRPC(&opts)
+}
+
+// GetServiceRegistrations returns a list of service registrations which belong
+// to the passed job ID.
+func (j *Job) GetServiceRegistrations(
+	args *structs.JobServiceRegistrationsRequest,
+	reply *structs.JobServiceRegistrationsResponse) error {
+
+	authErr := j.srv.Authenticate(j.ctx, args)
+	if done, err := j.srv.forward(structs.JobServiceRegistrationsRPCMethod, args, args, reply); done {
+		return err
+	}
+	j.srv.MeasureRPCRate("job", structs.RateMetricList, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
+	defer metrics.MeasureSince([]string{"nomad", "job", "get_service_registrations"}, time.Now())
+
+	// Check for read-job namespace capability.
+	aclObj, err := j.srv.ResolveACL(args)
+	if err != nil {
+		return err
+	}
+	if !aclObj.AllowNsOp(args.RequestNamespace(), acl.NamespaceCapabilityReadJob) {
+		return structs.ErrPermissionDenied
+	}
+
+	// Set up the blocking query.
+	return j.srv.blockingRPC(&blockingOptions{
+		queryOpts: &args.QueryOptions,
+		queryMeta: &reply.QueryMeta,
+		run: func(ws memdb.WatchSet, stateStore *state.StateStore) error {
+
+			job, err := stateStore.JobByID(ws, args.RequestNamespace(), args.JobID)
+			if err != nil {
+				return err
+			}
+
+			// Guard against the job not-existing. Do not create an empty list
+			// to allow the API to determine whether the job was found or not.
+			if job == nil {
+				return nil
+			}
+
+			// Perform the state query to get an iterator.
+			iter, err := stateStore.GetServiceRegistrationsByJobID(ws, args.RequestNamespace(), args.JobID)
+			if err != nil {
+				return err
+			}
+
+			// Set up our output after we have checked the error.
+			services := make([]*structs.ServiceRegistration, 0)
+
+			// Iterate the iterator, appending all service registrations
+			// returned to the reply.
+			for raw := iter.Next(); raw != nil; raw = iter.Next() {
+				services = append(services, raw.(*structs.ServiceRegistration))
+			}
+			reply.Services = services
+
+			// Use the index table to populate the query meta as we have no way
+			// of tracking the max index on deletes.
+			return j.srv.setReplyQueryMeta(stateStore, state.TableServiceRegistrations, &reply.QueryMeta)
+		},
+	})
 }

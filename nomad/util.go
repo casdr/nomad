@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -6,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 
 	memdb "github.com/hashicorp/go-memdb"
@@ -13,6 +17,14 @@ import (
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/serf/serf"
+)
+
+const (
+	// Deprecated: Through Nomad v1.2 these values were configurable but
+	// functionally unused. We still need to advertise them in Serf for
+	// compatibility with v1.2 and earlier.
+	deprecatedAPIMajorVersion    = 1
+	deprecatedAPIMajorVersionStr = "1"
 )
 
 // MinVersionPlanNormalization is the minimum version to support the
@@ -43,6 +55,10 @@ type serverParts struct {
 	RPCAddr     net.Addr
 	Status      serf.MemberStatus
 	NonVoter    bool
+
+	// Deprecated: Functionally unused but needs to always be set by 1 for
+	// compatibility with v1.2.x and earlier.
+	MajorVersion int
 }
 
 func (s *serverParts) String() string {
@@ -113,57 +129,41 @@ func isNomadServer(m serf.Member) (bool, *serverParts) {
 	addr := &net.TCPAddr{IP: m.Addr, Port: port}
 	rpcAddr := &net.TCPAddr{IP: rpcIP, Port: port}
 	parts := &serverParts{
-		Name:        m.Name,
-		ID:          id,
-		Region:      region,
-		Datacenter:  datacenter,
-		Port:        port,
-		Bootstrap:   bootstrap,
-		Expect:      expect,
-		Addr:        addr,
-		RPCAddr:     rpcAddr,
-		Build:       *buildVersion,
-		RaftVersion: raftVsn,
-		Status:      m.Status,
-		NonVoter:    nonVoter,
+		Name:         m.Name,
+		ID:           id,
+		Region:       region,
+		Datacenter:   datacenter,
+		Port:         port,
+		Bootstrap:    bootstrap,
+		Expect:       expect,
+		Addr:         addr,
+		RPCAddr:      rpcAddr,
+		Build:        *buildVersion,
+		RaftVersion:  raftVsn,
+		Status:       m.Status,
+		NonVoter:     nonVoter,
+		MajorVersion: deprecatedAPIMajorVersion,
 	}
 	return true, parts
 }
 
+const AllRegions = ""
+
 // ServersMeetMinimumVersion returns whether the Nomad servers are at least on the
 // given Nomad version. The checkFailedServers parameter specifies whether version
 // for the failed servers should be verified.
-func ServersMeetMinimumVersion(members []serf.Member, minVersion *version.Version, checkFailedServers bool) bool {
+func ServersMeetMinimumVersion(members []serf.Member, region string, minVersion *version.Version, checkFailedServers bool) bool {
 	for _, member := range members {
-		if valid, parts := isNomadServer(member); valid && (parts.Status == serf.StatusAlive || (checkFailedServers && parts.Status == serf.StatusFailed)) {
+		valid, parts := isNomadServer(member)
+		if valid &&
+			(parts.Region == region || region == AllRegions) &&
+			(parts.Status == serf.StatusAlive || (checkFailedServers && parts.Status == serf.StatusFailed)) {
 			// Check if the versions match - version.LessThan will return true for
 			// 0.8.0-rc1 < 0.8.0, so we want to ignore the metadata
-			versionsMatch := slicesMatch(minVersion.Segments(), parts.Build.Segments())
+			versionsMatch := slices.Equal(minVersion.Segments(), parts.Build.Segments())
 			if parts.Build.LessThan(minVersion) && !versionsMatch {
 				return false
 			}
-		}
-	}
-
-	return true
-}
-
-func slicesMatch(a, b []int) bool {
-	if a == nil && b == nil {
-		return true
-	}
-
-	if a == nil || b == nil {
-		return false
-	}
-
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
 		}
 	}
 
@@ -281,66 +281,4 @@ func getAlloc(state AllocGetter, allocID string) (*structs.Allocation, error) {
 	}
 
 	return alloc, nil
-}
-
-// tlsCertificateLevel represents a role level for mTLS certificates.
-type tlsCertificateLevel int8
-
-const (
-	tlsCertificateLevelServer tlsCertificateLevel = iota
-	tlsCertificateLevelClient
-)
-
-// validateTLSCertificateLevel checks if the provided RPC connection was
-// initiated with a certificate that matches the given TLS role level.
-//
-// - tlsCertificateLevelServer requires a server certificate.
-// - tlsCertificateLevelServer requires a client or server certificate.
-func validateTLSCertificateLevel(srv *Server, ctx *RPCContext, lvl tlsCertificateLevel) error {
-	switch lvl {
-	case tlsCertificateLevelClient:
-		err := validateLocalClientTLSCertificate(srv, ctx)
-		if err != nil {
-			return validateLocalServerTLSCertificate(srv, ctx)
-		}
-		return nil
-	case tlsCertificateLevelServer:
-		return validateLocalServerTLSCertificate(srv, ctx)
-	}
-
-	return fmt.Errorf("invalid TLS certificate level %v", lvl)
-}
-
-// validateLocalClientTLSCertificate checks if the provided RPC connection was
-// initiated by a client in the same region as the target server.
-func validateLocalClientTLSCertificate(srv *Server, ctx *RPCContext) error {
-	expected := fmt.Sprintf("client.%s.nomad", srv.Region())
-
-	err := validateTLSCertificate(srv, ctx, expected)
-	if err != nil {
-		return fmt.Errorf("invalid client connection in region %s: %v", srv.Region(), err)
-	}
-	return nil
-}
-
-// validateLocalServerTLSCertificate checks if the provided RPC connection was
-// initiated by a server in the same region as the target server.
-func validateLocalServerTLSCertificate(srv *Server, ctx *RPCContext) error {
-	expected := fmt.Sprintf("server.%s.nomad", srv.Region())
-
-	err := validateTLSCertificate(srv, ctx, expected)
-	if err != nil {
-		return fmt.Errorf("invalid server connection in region %s: %v", srv.Region(), err)
-	}
-	return nil
-}
-
-// validateTLSCertificate checks if the RPC connection mTLS certificates are
-// valid for the given name.
-func validateTLSCertificate(srv *Server, ctx *RPCContext, name string) error {
-	if srv.config.TLSConfig == nil || !srv.config.TLSConfig.VerifyServerHostname {
-		return nil
-	}
-
-	return ctx.ValidateCertificateForName(name)
 }

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -5,25 +8,38 @@ import (
 	"fmt"
 	"strconv"
 
-	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-hclog"
 
-	"github.com/hashicorp/consul/agent/consul/autopilot"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
 // Status endpoint is used to check on server status
 type Status struct {
 	srv    *Server
-	logger log.Logger
+	ctx    *RPCContext
+	logger hclog.Logger
+}
+
+func NewStatusEndpoint(srv *Server, ctx *RPCContext) *Status {
+	return &Status{srv: srv, ctx: ctx, logger: srv.logger.Named("status")}
 }
 
 // Ping is used to just check for connectivity
-func (s *Status) Ping(args struct{}, reply *struct{}) error {
+func (s *Status) Ping(args structs.GenericRequest, reply *struct{}) error {
+	// note: we're intentionally throwing away any auth error here and only
+	// authenticate so that we can measure rate metrics
+	s.srv.Authenticate(s.ctx, &args)
+	s.srv.MeasureRPCRate("status", structs.RateMetricRead, &args)
 	return nil
 }
 
 // Leader is used to get the address of the leader
 func (s *Status) Leader(args *structs.GenericRequest, reply *string) error {
+	// note: we're intentionally throwing away any auth error here and only
+	// authenticate so that we can measure rate metrics
+	s.srv.Authenticate(s.ctx, args)
+	s.srv.MeasureRPCRate("status", structs.RateMetricRead, args)
+
 	if args.Region == "" {
 		args.Region = s.srv.config.Region
 	}
@@ -31,9 +47,9 @@ func (s *Status) Leader(args *structs.GenericRequest, reply *string) error {
 		return err
 	}
 
-	leader := string(s.srv.raft.Leader())
+	leader, _ := s.srv.raft.LeaderWithID()
 	if leader != "" {
-		*reply = leader
+		*reply = string(leader)
 	} else {
 		*reply = ""
 	}
@@ -42,6 +58,11 @@ func (s *Status) Leader(args *structs.GenericRequest, reply *string) error {
 
 // Peers is used to get all the Raft peers
 func (s *Status) Peers(args *structs.GenericRequest, reply *[]string) error {
+	// note: we're intentionally throwing away any auth error here and only
+	// authenticate so that we can measure rate metrics
+	s.srv.Authenticate(s.ctx, args)
+	s.srv.MeasureRPCRate("status", structs.RateMetricList, args)
+
 	if args.Region == "" {
 		args.Region = s.srv.config.Region
 	}
@@ -63,10 +84,15 @@ func (s *Status) Peers(args *structs.GenericRequest, reply *[]string) error {
 // Members return the list of servers in a cluster that a particular server is
 // aware of
 func (s *Status) Members(args *structs.GenericRequest, reply *structs.ServerMembersResponse) error {
+	authErr := s.srv.Authenticate(s.ctx, args)
+	s.srv.MeasureRPCRate("status", structs.RateMetricList, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
 	// Check node read permissions
-	if aclObj, err := s.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := s.srv.ResolveACL(args); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNodeRead() {
+	} else if !aclObj.AllowNodeRead() {
 		return structs.ErrPermissionDenied
 	}
 
@@ -97,7 +123,12 @@ func (s *Status) Members(args *structs.GenericRequest, reply *structs.ServerMemb
 }
 
 // RaftStats is used by Autopilot to query the raft stats of the local server.
-func (s *Status) RaftStats(args struct{}, reply *autopilot.ServerStats) error {
+func (s *Status) RaftStats(args *structs.GenericRequest, reply *structs.RaftStats) error {
+	// note: we're intentionally throwing away any auth error here and only
+	// authenticate so that we can measure rate metrics
+	s.srv.Authenticate(s.ctx, args)
+	s.srv.MeasureRPCRate("status", structs.RateMetricRead, args)
+
 	stats := s.srv.raft.Stats()
 
 	var err error
@@ -117,6 +148,11 @@ func (s *Status) RaftStats(args struct{}, reply *autopilot.ServerStats) error {
 // HasNodeConn returns whether the server has a connection to the requested
 // Node.
 func (s *Status) HasNodeConn(args *structs.NodeSpecificRequest, reply *structs.NodeConnQueryResponse) error {
+	// note: we're intentionally throwing away any auth error here and only
+	// authenticate so that we can measure rate metrics
+	s.srv.Authenticate(s.ctx, args)
+	s.srv.MeasureRPCRate("status", structs.RateMetricRead, args)
+
 	// Validate the args
 	if args.NodeID == "" {
 		return errors.New("Must provide the NodeID")

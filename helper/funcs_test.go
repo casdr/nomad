@@ -1,50 +1,49 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package helper
 
 import (
 	"fmt"
-	"path/filepath"
+	"maps"
 	"reflect"
 	"sort"
 	"testing"
-	"time"
 
+	"github.com/hashicorp/go-set/v2"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
-func TestSliceStringIsSubset(t *testing.T) {
+func TestIsSubset(t *testing.T) {
 	l := []string{"a", "b", "c"}
 	s := []string{"d"}
 
-	sub, offending := SliceStringIsSubset(l, l[:1])
-	if !sub || len(offending) != 0 {
-		t.Fatalf("bad %v %v", sub, offending)
-	}
+	sub, offending := IsSubset(l, l[:1])
+	must.True(t, sub)
+	must.SliceEmpty(t, offending)
 
-	sub, offending = SliceStringIsSubset(l, s)
-	if sub || len(offending) == 0 || offending[0] != "d" {
-		t.Fatalf("bad %v %v", sub, offending)
-	}
+	sub, offending = IsSubset(l, s)
+	must.False(t, sub)
+	must.Eq(t, []string{"d"}, offending)
 }
 
-func TestSliceStringContains(t *testing.T) {
-	list := []string{"a", "b", "c"}
-	require.True(t, SliceStringContains(list, "a"))
-	require.True(t, SliceStringContains(list, "b"))
-	require.True(t, SliceStringContains(list, "c"))
-	require.False(t, SliceStringContains(list, "d"))
-}
+func TestIsDisjoint(t *testing.T) {
+	t.Run("yes", func(t *testing.T) {
+		a := []string{"a", "b", "c"}
+		b := []string{"d", "f"}
+		dis, offending := IsDisjoint(a, b)
+		must.True(t, dis)
+		must.SliceEmpty(t, offending)
+	})
 
-func TestSliceStringHasPrefix(t *testing.T) {
-	list := []string{"alpha", "bravo", "charlie", "definitely", "most definitely"}
-	// At least one string in the slice above starts with the following test prefix strings
-	require.True(t, SliceStringHasPrefix(list, "a"))
-	require.True(t, SliceStringHasPrefix(list, "b"))
-	require.True(t, SliceStringHasPrefix(list, "c"))
-	require.True(t, SliceStringHasPrefix(list, "d"))
-	require.True(t, SliceStringHasPrefix(list, "mos"))
-	require.True(t, SliceStringHasPrefix(list, "def"))
-	require.False(t, SliceStringHasPrefix(list, "delta"))
-
+	t.Run("no", func(t *testing.T) {
+		a := []string{"a", "b", "c", "d", "e"}
+		b := []string{"b", "c", "f", "g"}
+		dis, offending := IsDisjoint(a, b)
+		must.False(t, dis)
+		must.True(t, set.From(offending).EqualSlice(offending))
+	})
 }
 
 func TestStringHasPrefixInSlice(t *testing.T) {
@@ -60,25 +59,6 @@ func TestStringHasPrefixInSlice(t *testing.T) {
 	require.False(t, StringHasPrefixInSlice("def", prefixes))
 	require.False(t, StringHasPrefixInSlice("delta", prefixes))
 
-}
-
-func TestCompareTimePtrs(t *testing.T) {
-	t.Run("nil", func(t *testing.T) {
-		a := (*time.Duration)(nil)
-		b := (*time.Duration)(nil)
-		require.True(t, CompareTimePtrs(a, b))
-		c := TimeToPtr(3 * time.Second)
-		require.False(t, CompareTimePtrs(a, c))
-		require.False(t, CompareTimePtrs(c, a))
-	})
-
-	t.Run("not nil", func(t *testing.T) {
-		a := TimeToPtr(1 * time.Second)
-		b := TimeToPtr(1 * time.Second)
-		c := TimeToPtr(2 * time.Second)
-		require.True(t, CompareTimePtrs(a, b))
-		require.False(t, CompareTimePtrs(a, c))
-	})
 }
 
 func TestCompareSliceSetString(t *testing.T) {
@@ -132,7 +112,7 @@ func TestCompareSliceSetString(t *testing.T) {
 	for i, tc := range cases {
 		tc := tc
 		t.Run(fmt.Sprintf("case-%da", i), func(t *testing.T) {
-			if res := CompareSliceSetString(tc.A, tc.B); res != tc.Result {
+			if res := SliceSetEq(tc.A, tc.B); res != tc.Result {
 				t.Fatalf("expected %t but CompareSliceSetString(%v, %v) -> %t",
 					tc.Result, tc.A, tc.B, res,
 				)
@@ -141,7 +121,7 @@ func TestCompareSliceSetString(t *testing.T) {
 
 		// Function is commutative so compare B and A
 		t.Run(fmt.Sprintf("case-%db", i), func(t *testing.T) {
-			if res := CompareSliceSetString(tc.B, tc.A); res != tc.Result {
+			if res := SliceSetEq(tc.B, tc.A); res != tc.Result {
 				t.Fatalf("expected %t but CompareSliceSetString(%v, %v) -> %t",
 					tc.Result, tc.B, tc.A, res,
 				)
@@ -150,19 +130,17 @@ func TestCompareSliceSetString(t *testing.T) {
 	}
 }
 
-func TestMapStringStringSliceValueSet(t *testing.T) {
+func TestUniqueMapSliceValues(t *testing.T) {
 	m := map[string][]string{
 		"foo": {"1", "2"},
 		"bar": {"3"},
 		"baz": nil,
 	}
 
-	act := MapStringStringSliceValueSet(m)
+	act := UniqueMapSliceValues(m)
 	exp := []string{"1", "2", "3"}
 	sort.Strings(act)
-	if !reflect.DeepEqual(act, exp) {
-		t.Fatalf("Bad; got %v; want %v", act, exp)
-	}
+	must.Eq(t, exp, act)
 }
 
 func TestCopyMapStringSliceString(t *testing.T) {
@@ -172,7 +150,7 @@ func TestCopyMapStringSliceString(t *testing.T) {
 		"z": nil,
 	}
 
-	c := CopyMapStringSliceString(m)
+	c := CopyMapOfSlice(m)
 	if !reflect.DeepEqual(c, m) {
 		t.Fatalf("%#v != %#v", m, c)
 	}
@@ -183,17 +161,25 @@ func TestCopyMapStringSliceString(t *testing.T) {
 	}
 }
 
-func TestCopyMapSliceInterface(t *testing.T) {
-	m := map[string]interface{}{
-		"foo": "bar",
-		"baz": 2,
+func TestMergeMapStringString(t *testing.T) {
+	type testCase struct {
+		map1     map[string]string
+		map2     map[string]string
+		expected map[string]string
 	}
 
-	c := CopyMapStringInterface(m)
-	require.True(t, reflect.DeepEqual(m, c))
+	cases := []testCase{
+		{map[string]string{"foo": "bar"}, map[string]string{"baz": "qux"}, map[string]string{"foo": "bar", "baz": "qux"}},
+		{map[string]string{"foo": "bar"}, nil, map[string]string{"foo": "bar"}},
+		{nil, map[string]string{"baz": "qux"}, map[string]string{"baz": "qux"}},
+		{nil, nil, map[string]string{}},
+	}
 
-	m["foo"] = "zzz"
-	require.False(t, reflect.DeepEqual(m, c))
+	for _, c := range cases {
+		if output := MergeMapStringString(c.map1, c.map2); !maps.Equal(output, c.expected) {
+			t.Errorf("MergeMapStringString(%q, %q) -> %q != %q", c.map1, c.map2, output, c.expected)
+		}
+	}
 }
 
 func TestCleanEnvVar(t *testing.T) {
@@ -347,92 +333,7 @@ func TestCheckNamespaceScope(t *testing.T) {
 	}
 }
 
-func TestPathEscapesSandbox(t *testing.T) {
-	cases := []struct {
-		name     string
-		path     string
-		dir      string
-		expected bool
-	}{
-		{
-			// this is the ${NOMAD_SECRETS_DIR} case
-			name:     "ok joined absolute path inside sandbox",
-			path:     filepath.Join("/alloc", "/secrets"),
-			dir:      "/alloc",
-			expected: false,
-		},
-		{
-			name:     "fail unjoined absolute path outside sandbox",
-			path:     "/secrets",
-			dir:      "/alloc",
-			expected: true,
-		},
-		{
-			name:     "ok joined relative path inside sandbox",
-			path:     filepath.Join("/alloc", "./safe"),
-			dir:      "/alloc",
-			expected: false,
-		},
-		{
-			name:     "fail unjoined relative path outside sandbox",
-			path:     "./safe",
-			dir:      "/alloc",
-			expected: true,
-		},
-		{
-			name:     "ok relative path traversal constrained to sandbox",
-			path:     filepath.Join("/alloc", "../../alloc/safe"),
-			dir:      "/alloc",
-			expected: false,
-		},
-		{
-			name:     "ok unjoined absolute path traversal constrained to sandbox",
-			path:     filepath.Join("/alloc", "/../alloc/safe"),
-			dir:      "/alloc",
-			expected: false,
-		},
-		{
-			name:     "ok unjoined absolute path traversal constrained to sandbox",
-			path:     "/../alloc/safe",
-			dir:      "/alloc",
-			expected: false,
-		},
-		{
-			name:     "fail joined relative path traverses outside sandbox",
-			path:     filepath.Join("/alloc", "../../../unsafe"),
-			dir:      "/alloc",
-			expected: true,
-		},
-		{
-			name:     "fail unjoined relative path traverses outside sandbox",
-			path:     "../../../unsafe",
-			dir:      "/alloc",
-			expected: true,
-		},
-		{
-			name:     "fail joined absolute path tries to transverse outside sandbox",
-			path:     filepath.Join("/alloc", "/alloc/../../unsafe"),
-			dir:      "/alloc",
-			expected: true,
-		},
-		{
-			name:     "fail unjoined absolute path tries to transverse outside sandbox",
-			path:     "/alloc/../../unsafe",
-			dir:      "/alloc",
-			expected: true,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			caseMsg := fmt.Sprintf("path: %v\ndir: %v", tc.path, tc.dir)
-			escapes := PathEscapesSandbox(tc.dir, tc.path)
-			require.Equal(t, tc.expected, escapes, caseMsg)
-		})
-	}
-}
-
-func Test_NewSafeTimer(t *testing.T) {
+func TestTimer_NewSafeTimer(t *testing.T) {
 	t.Run("zero", func(t *testing.T) {
 		timer, stop := NewSafeTimer(0)
 		defer stop()
@@ -443,5 +344,142 @@ func Test_NewSafeTimer(t *testing.T) {
 		timer, stop := NewSafeTimer(1)
 		defer stop()
 		<-timer.C
+	})
+}
+
+func TestTimer_NewStoppedTimer(t *testing.T) {
+	timer, stop := NewStoppedTimer()
+	defer stop()
+
+	select {
+	case <-timer.C:
+		must.Unreachable(t)
+	default:
+	}
+}
+
+func Test_ConvertSlice(t *testing.T) {
+	t.Run("string wrapper", func(t *testing.T) {
+
+		type wrapper struct{ id string }
+		input := []string{"foo", "bar", "bad", "had"}
+		cFn := func(id string) *wrapper { return &wrapper{id: id} }
+
+		expectedOutput := []*wrapper{{id: "foo"}, {id: "bar"}, {id: "bad"}, {id: "had"}}
+		actualOutput := ConvertSlice(input, cFn)
+		require.ElementsMatch(t, expectedOutput, actualOutput)
+	})
+
+	t.Run("int wrapper", func(t *testing.T) {
+
+		type wrapper struct{ id int }
+		input := []int{10, 13, 1987, 2020}
+		cFn := func(id int) *wrapper { return &wrapper{id: id} }
+
+		expectedOutput := []*wrapper{{id: 10}, {id: 13}, {id: 1987}, {id: 2020}}
+		actualOutput := ConvertSlice(input, cFn)
+		require.ElementsMatch(t, expectedOutput, actualOutput)
+
+	})
+}
+
+func Test_IsMethodHTTP(t *testing.T) {
+	t.Run("is method", func(t *testing.T) {
+		cases := []string{
+			"GET", "Get", "get",
+			"HEAD", "Head", "head",
+			"POST", "Post", "post",
+			"PUT", "Put", "put",
+			"PATCH", "Patch", "patch",
+			"DELETE", "Delete", "delete",
+			"CONNECT", "Connect", "connect",
+			"OPTIONS", "Options", "options",
+			"TRACE", "Trace", "trace",
+		}
+		for _, tc := range cases {
+			result := IsMethodHTTP(tc)
+			must.True(t, result)
+		}
+	})
+
+	t.Run("is not method", func(t *testing.T) {
+		not := []string{"GETTER", "!GET", ""}
+		for _, tc := range not {
+			result := IsMethodHTTP(tc)
+			must.False(t, result)
+		}
+	})
+}
+
+type employee struct {
+	id   int
+	name string
+}
+
+func (e *employee) Equal(o *employee) bool {
+	return e.id == o.id // name can be different
+}
+
+func Test_ElementsEquals(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		a := []*employee(nil)
+		var b []*employee
+		must.True(t, ElementsEqual(a, b))
+		must.True(t, ElementsEqual(b, a))
+	})
+
+	t.Run("different sizes", func(t *testing.T) {
+		a := []*employee{{1, "mitchell"}, {2, "armon"}, {3, "jack"}}
+		b := []*employee{{1, "mitchell"}, {2, "armon"}}
+		must.False(t, ElementsEqual(a, b))
+		must.False(t, ElementsEqual(b, a))
+	})
+
+	t.Run("equal", func(t *testing.T) {
+		a := []*employee{{1, "mitchell"}, {2, "armon"}, {3, "jack"}}
+		b := []*employee{{1, "M.H."}, {2, "A.D."}, {3, "J.P."}}
+		must.True(t, ElementsEqual(a, b))
+		must.True(t, ElementsEqual(b, a))
+	})
+
+	t.Run("different", func(t *testing.T) {
+		a := []*employee{{1, "mitchell"}, {2, "armon"}, {3, "jack"}}
+		b := []*employee{{0, "mitchell."}, {2, "armon"}, {3, "jack"}}
+		must.False(t, ElementsEqual(a, b))
+		must.False(t, ElementsEqual(b, a))
+	})
+}
+
+func Test_SliceSetEq(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		a := make([]int, 0)
+		b := make([]int, 0)
+		must.True(t, SliceSetEq(a, b))
+	})
+
+	t.Run("subset small", func(t *testing.T) {
+		a := []int{1, 2, 3, 4, 5}
+		b := []int{1, 2, 3}
+		must.False(t, SliceSetEq(a, b))
+		must.False(t, SliceSetEq(b, a))
+	})
+
+	t.Run("subset large", func(t *testing.T) {
+		a := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+		b := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+		must.False(t, SliceSetEq(a, b))
+		must.False(t, SliceSetEq(b, a))
+	})
+
+	t.Run("same small", func(t *testing.T) {
+		a := []int{1, 2, 3, 4, 5}
+		b := []int{1, 2, 3, 4, 5}
+		must.True(t, SliceSetEq(a, b))
+	})
+
+	t.Run("same large", func(t *testing.T) {
+		a := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+		b := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+		must.True(t, SliceSetEq(a, b))
 	})
 }

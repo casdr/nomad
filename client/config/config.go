@@ -1,23 +1,31 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
+	"maps"
+	"net"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/consul-template/config"
-	"github.com/hashicorp/nomad/client/lib/cgutil"
-	"github.com/hashicorp/nomad/command/agent/host"
-
 	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
+	"github.com/hashicorp/nomad/client/lib/numalib"
+	"github.com/hashicorp/nomad/client/lib/numalib/hw"
 	"github.com/hashicorp/nomad/client/state"
+	"github.com/hashicorp/nomad/command/agent/host"
 	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/bufconndialer"
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/nomad/structs"
 	structsc "github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/nomad/plugins/base"
@@ -45,7 +53,7 @@ var (
 		"java",
 	}, ",")
 
-	// A mapping of directories on the host OS to attempt to embed inside each
+	// DefaultChrootEnv is a mapping of directories on the host OS to attempt to embed inside each
 	// task's chroot.
 	DefaultChrootEnv = map[string]string{
 		"/bin":            "/bin",
@@ -63,7 +71,9 @@ var (
 		"/run/systemd/resolve": "/run/systemd/resolve",
 	}
 
-	DefaultTemplateMaxStale = 5 * time.Second
+	DefaultTemplateMaxStale = 87600 * time.Hour
+
+	DefaultTemplateFunctionDenylist = []string{"plugin", "writeToFile"}
 )
 
 // RPCHandler can be provided to the Client if there is a local server
@@ -87,10 +97,15 @@ type Config struct {
 	StateDir string
 
 	// AllocDir is where we store data for allocations
+	//
+	// In a production environment this should be owned by root with file
+	// mode 0o700.
 	AllocDir string
 
-	// LogOutput is the destination for logs
-	LogOutput io.Writer
+	// AllocMountsDir is where we bind mount paths from AllocDir for tasks making
+	// use of the unveil file isolation mode. In a production environment this
+	// should be owned  by root with file mode 0o755.
+	AllocMountsDir string
 
 	// Logger provides a logger to the client
 	Logger log.InterceptLogger
@@ -112,6 +127,14 @@ type Config struct {
 	// MemoryMB is the default node total memory in megabytes if it cannot be
 	// determined dynamically.
 	MemoryMB int
+
+	// DiskTotalMB is the default node total disk space in megabytes if it cannot be
+	// determined dynamically.
+	DiskTotalMB int
+
+	// DiskFreeMB is the default node free disk space in megabytes if it cannot be
+	// determined dynamically.
+	DiskFreeMB int
 
 	// MaxKillTimeout allows capping the user-specifiable KillTimeout. If the
 	// task's KillTimeout is greater than the MaxKillTimeout, MaxKillTimeout is
@@ -155,11 +178,15 @@ type Config struct {
 	// Version is the version of the Nomad client
 	Version *version.VersionInfo
 
-	// ConsulConfig is this Agent's Consul configuration
-	ConsulConfig *structsc.ConsulConfig
+	// ConsulConfigs is a map of Consul configurations, here to support features
+	// in Nomad Enterprise. The default Consul config pointer above will be
+	// found in this map under the name "default"
+	ConsulConfigs map[string]*structsc.ConsulConfig
 
-	// VaultConfig is this Agent's Vault configuration
-	VaultConfig *structsc.VaultConfig
+	// VaultConfigs is a map of Vault configurations, here to support features
+	// in Nomad Enterprise. The default Vault config pointer above will be found
+	// in this map under the name "default"
+	VaultConfigs map[string]*structsc.VaultConfig
 
 	// StatsCollectionInterval is the interval at which the Nomad client
 	// collects resource usage stats
@@ -196,9 +223,6 @@ type Config struct {
 	// before garbage collection is triggered.
 	GCMaxAllocs int
 
-	// LogLevel is the level of the logs to putout
-	LogLevel string
-
 	// NoHostUUID disables using the host's UUID and will force generation of a
 	// random UUID.
 	NoHostUUID bool
@@ -211,6 +235,10 @@ type Config struct {
 
 	// ACLPolicyTTL is how long we cache policy values for
 	ACLPolicyTTL time.Duration
+
+	// ACLRoleTTL is how long we cache ACL role value for within each Nomad
+	// client.
+	ACLRoleTTL time.Duration
 
 	// DisableRemoteExec disables remote exec targeting tasks on this client
 	DisableRemoteExec bool
@@ -235,6 +263,8 @@ type Config struct {
 	// StateDBFactory is used to override stateDB implementations,
 	StateDBFactory state.NewStateDBFunc
 
+	AllocRunnerFactory AllocRunnerFactory
+
 	// CNIPath is the path used to search for CNI plugins. Multiple paths can
 	// be specified with colon delimited
 	CNIPath string
@@ -251,6 +281,10 @@ type Config struct {
 	// BridgeNetworkName is the name to use for the bridge created in bridge
 	// networking mode. This defaults to 'nomad' if not set
 	BridgeNetworkName string
+
+	// BridgeNetworkHairpinMode is whether or not to enable hairpin mode on the
+	// internal bridge network
+	BridgeNetworkHairpinMode bool
 
 	// BridgeNetworkAllocSubnet is the IP subnet to use for address allocation
 	// for allocations in bridge networking mode. Subnet must be in CIDR
@@ -278,7 +312,44 @@ type Config struct {
 	CgroupParent string
 
 	// ReservableCores if set overrides the set of reservable cores reported in fingerprinting.
-	ReservableCores []uint16
+	ReservableCores []hw.CoreID
+
+	// NomadServiceDiscovery determines whether the Nomad native service
+	// discovery client functionality is enabled.
+	NomadServiceDiscovery bool
+
+	// TemplateDialer is our custom HTTP dialer for consul-template. This is
+	// used for template functions which require access to the Nomad API.
+	TemplateDialer *bufconndialer.BufConnWrapper
+
+	// APIListenerRegistrar allows the client to register listeners created at
+	// runtime (eg the Task API) with the agent's HTTP server. Since the agent
+	// creates the HTTP *after* the client starts, we have to use this shim to
+	// pass listeners back to the agent.
+	// This is the same design as the bufconndialer but for the
+	// http.Serve(listener) API instead of the net.Dial API.
+	APIListenerRegistrar APIListenerRegistrar
+
+	// Artifact configuration from the agent's config file.
+	Artifact *ArtifactConfig
+
+	// Drain configuration from the agent's config file.
+	Drain *DrainConfig
+
+	// Uesrs configuration from the agent's config file.
+	Users *UsersConfig
+
+	// ExtraAllocHooks are run with other allocation hooks, mainly for testing.
+	ExtraAllocHooks []interfaces.RunnerHook
+}
+
+type APIListenerRegistrar interface {
+	// Serve the HTTP API on the provided listener.
+	//
+	// The context is because Serve may be called before the HTTP server has been
+	// initialized. If the context is canceled before the HTTP server is
+	// initialized, the context's error will be returned.
+	Serve(context.Context, net.Listener) error
 }
 
 // ClientTemplateConfig is configuration on the client specific to template
@@ -344,6 +415,35 @@ type ClientTemplateConfig struct {
 	// to wait for the cluster to become available, as is customary in distributed
 	// systems.
 	VaultRetry *RetryConfig `hcl:"vault_retry,optional"`
+
+	// This controls the retry behavior when an error is returned from Nomad.
+	// Consul Template is highly fault tolerant, meaning it does not exit in the
+	// face of failure. Instead, it uses exponential back-off and retry functions
+	// to wait for the cluster to become available, as is customary in distributed
+	// systems.
+	NomadRetry *RetryConfig `hcl:"nomad_retry,optional"`
+}
+
+func DefaultTemplateConfig() *ClientTemplateConfig {
+	return &ClientTemplateConfig{
+		FunctionDenylist:   DefaultTemplateFunctionDenylist,
+		DisableSandbox:     false,
+		BlockQueryWaitTime: pointer.Of(5 * time.Minute),         // match Consul default
+		MaxStale:           pointer.Of(DefaultTemplateMaxStale), // match Consul default
+		Wait: &WaitConfig{
+			Min: pointer.Of(5 * time.Second),
+			Max: pointer.Of(4 * time.Minute),
+		},
+		ConsulRetry: &RetryConfig{
+			Attempts: pointer.Of(0), // unlimited
+		},
+		VaultRetry: &RetryConfig{
+			Attempts: pointer.Of(0), // unlimited
+		},
+		NomadRetry: &RetryConfig{
+			Attempts: pointer.Of(0), // unlimited
+		},
+	}
 }
 
 // Copy returns a deep copy of a ClientTemplateConfig
@@ -354,7 +454,13 @@ func (c *ClientTemplateConfig) Copy() *ClientTemplateConfig {
 
 	nc := new(ClientTemplateConfig)
 	*nc = *c
-	nc.FunctionDenylist = helper.CopySliceString(nc.FunctionDenylist)
+
+	if len(c.FunctionDenylist) > 0 {
+		nc.FunctionDenylist = slices.Clone(nc.FunctionDenylist)
+	} else if c.FunctionDenylist != nil {
+		// Explicitly no functions denied (which is different than nil)
+		nc.FunctionDenylist = []string{}
+	}
 
 	if c.BlockQueryWaitTime != nil {
 		nc.BlockQueryWaitTime = &*c.BlockQueryWaitTime
@@ -376,73 +482,11 @@ func (c *ClientTemplateConfig) Copy() *ClientTemplateConfig {
 		nc.VaultRetry = c.VaultRetry.Copy()
 	}
 
+	if c.NomadRetry != nil {
+		nc.NomadRetry = c.NomadRetry.Copy()
+	}
+
 	return nc
-}
-
-// Merge merges the values of two ClientTemplateConfigs. If first copies the receiver
-// instance, and then overrides those values with the instance to merge with.
-func (c *ClientTemplateConfig) Merge(b *ClientTemplateConfig) *ClientTemplateConfig {
-	if c == nil {
-		return b
-	}
-
-	result := *c
-
-	if b == nil {
-		return &result
-	}
-
-	if b.BlockQueryWaitTime != nil {
-		result.BlockQueryWaitTime = b.BlockQueryWaitTime
-	}
-	if b.BlockQueryWaitTimeHCL != "" {
-		result.BlockQueryWaitTimeHCL = b.BlockQueryWaitTimeHCL
-	}
-
-	if b.ConsulRetry != nil {
-		result.ConsulRetry = result.ConsulRetry.Merge(b.ConsulRetry)
-	}
-
-	result.DisableSandbox = b.DisableSandbox
-
-	// Maintain backward compatibility for older clients
-	if len(b.FunctionBlacklist) > 0 {
-		for _, fn := range b.FunctionBlacklist {
-			if !helper.SliceStringContains(result.FunctionBlacklist, fn) {
-				result.FunctionBlacklist = append(result.FunctionBlacklist, fn)
-			}
-		}
-	}
-
-	if len(b.FunctionDenylist) > 0 {
-		for _, fn := range b.FunctionDenylist {
-			if !helper.SliceStringContains(result.FunctionDenylist, fn) {
-				result.FunctionDenylist = append(result.FunctionDenylist, fn)
-			}
-		}
-	}
-
-	if b.MaxStale != nil {
-		result.MaxStale = b.MaxStale
-	}
-
-	if b.MaxStaleHCL != "" {
-		result.MaxStaleHCL = b.MaxStaleHCL
-	}
-
-	if b.Wait != nil {
-		result.Wait = result.Wait.Merge(b.Wait)
-	}
-
-	if b.WaitBounds != nil {
-		result.WaitBounds = result.WaitBounds.Merge(b.WaitBounds)
-	}
-
-	if b.VaultRetry != nil {
-		result.VaultRetry = result.VaultRetry.Merge(b.VaultRetry)
-	}
-
-	return &result
 }
 
 func (c *ClientTemplateConfig) IsEmpty() bool {
@@ -451,15 +495,60 @@ func (c *ClientTemplateConfig) IsEmpty() bool {
 	}
 
 	return !c.DisableSandbox &&
-		len(c.FunctionDenylist) == 0 &&
-		len(c.FunctionBlacklist) == 0 &&
+		c.FunctionDenylist == nil &&
+		c.FunctionBlacklist == nil &&
 		c.BlockQueryWaitTime == nil &&
 		c.BlockQueryWaitTimeHCL == "" &&
 		c.MaxStale == nil &&
 		c.MaxStaleHCL == "" &&
 		c.Wait.IsEmpty() &&
 		c.ConsulRetry.IsEmpty() &&
-		c.VaultRetry.IsEmpty()
+		c.VaultRetry.IsEmpty() &&
+		c.NomadRetry.IsEmpty()
+}
+
+func (c *ClientTemplateConfig) Merge(o *ClientTemplateConfig) *ClientTemplateConfig {
+	if c == nil {
+		return o
+	}
+
+	result := *c
+	if o == nil {
+		return &result
+	}
+
+	if o.FunctionDenylist != nil {
+		result.FunctionDenylist = slices.Clone(o.FunctionDenylist)
+	}
+	if o.FunctionBlacklist != nil {
+		result.FunctionBlacklist = slices.Clone(o.FunctionBlacklist)
+	}
+
+	if o.DisableSandbox {
+		result.DisableSandbox = true
+	}
+
+	result.MaxStale = pointer.Merge(result.MaxStale, o.MaxStale)
+	result.BlockQueryWaitTime = pointer.Merge(result.BlockQueryWaitTime, o.BlockQueryWaitTime)
+
+	if o.Wait != nil {
+		result.Wait = c.Wait.Merge(o.Wait)
+	}
+	if o.WaitBounds != nil {
+		result.WaitBounds = c.WaitBounds.Merge(o.WaitBounds)
+	}
+
+	if o.ConsulRetry != nil {
+		result.ConsulRetry = c.ConsulRetry.Merge(o.ConsulRetry)
+	}
+	if o.VaultRetry != nil {
+		result.VaultRetry = c.VaultRetry.Merge(o.VaultRetry)
+	}
+	if o.NomadRetry != nil {
+		result.NomadRetry = c.NomadRetry.Merge(o.NomadRetry)
+	}
+
+	return &result
 }
 
 // WaitConfig is mirrored from templateconfig.WaitConfig because we need to handle
@@ -493,8 +582,8 @@ func (wc *WaitConfig) Copy() *WaitConfig {
 	return wc
 }
 
-// Equals returns the result of reflect.DeepEqual
-func (wc *WaitConfig) Equals(other *WaitConfig) bool {
+// Equal returns the result of reflect.DeepEqual
+func (wc *WaitConfig) Equal(other *WaitConfig) bool {
 	return reflect.DeepEqual(wc, other)
 }
 
@@ -503,7 +592,7 @@ func (wc *WaitConfig) IsEmpty() bool {
 	if wc == nil {
 		return true
 	}
-	return wc.Equals(&WaitConfig{})
+	return wc.Equal(&WaitConfig{})
 }
 
 // Validate returns an error  if the receiver is nil or empty or if Min is greater
@@ -570,7 +659,7 @@ func (wc *WaitConfig) ToConsulTemplate() (*config.WaitConfig, error) {
 		return nil, err
 	}
 
-	result := &config.WaitConfig{Enabled: helper.BoolToPtr(true)}
+	result := &config.WaitConfig{Enabled: pointer.Of(true)}
 
 	if wc.Min != nil {
 		result.Min = wc.Min
@@ -628,8 +717,8 @@ func (rc *RetryConfig) Copy() *RetryConfig {
 	return nrc
 }
 
-// Equals returns the result of reflect.DeepEqual
-func (rc *RetryConfig) Equals(other *RetryConfig) bool {
+// Equal returns the result of reflect.DeepEqual
+func (rc *RetryConfig) Equal(other *RetryConfig) bool {
 	return reflect.DeepEqual(rc, other)
 }
 
@@ -639,7 +728,7 @@ func (rc *RetryConfig) IsEmpty() bool {
 		return true
 	}
 
-	return rc.Equals(&RetryConfig{})
+	return rc.Equal(&RetryConfig{})
 }
 
 // Validate returns an error if the receiver is nil or empty, or if Backoff
@@ -713,7 +802,7 @@ func (rc *RetryConfig) ToConsulTemplate() (*config.RetryConfig, error) {
 		return nil, err
 	}
 
-	result := &config.RetryConfig{Enabled: helper.BoolToPtr(true)}
+	result := &config.RetryConfig{Enabled: pointer.Of(true)}
 
 	if rc.Attempts != nil {
 		result.Attempts = rc.Attempts
@@ -731,33 +820,35 @@ func (rc *RetryConfig) ToConsulTemplate() (*config.RetryConfig, error) {
 }
 
 func (c *Config) Copy() *Config {
-	nc := new(Config)
-	*nc = *c
-	nc.Node = nc.Node.Copy()
-	nc.Servers = helper.CopySliceString(nc.Servers)
-	nc.Options = helper.CopyMapStringString(nc.Options)
-	nc.HostVolumes = structs.CopyMapStringClientHostVolumeConfig(nc.HostVolumes)
-	nc.ConsulConfig = c.ConsulConfig.Copy()
-	nc.VaultConfig = c.VaultConfig.Copy()
-	nc.TemplateConfig = c.TemplateConfig.Copy()
-	if c.ReservableCores != nil {
-		nc.ReservableCores = make([]uint16, len(c.ReservableCores))
-		copy(nc.ReservableCores, c.ReservableCores)
+	if c == nil {
+		return nil
 	}
-	return nc
+
+	nc := *c
+	nc.Node = nc.Node.Copy()
+	nc.Servers = slices.Clone(nc.Servers)
+	nc.Options = maps.Clone(nc.Options)
+	nc.HostVolumes = structs.CopyMapStringClientHostVolumeConfig(nc.HostVolumes)
+	nc.ConsulConfigs = helper.DeepCopyMap(c.ConsulConfigs)
+	nc.VaultConfigs = helper.DeepCopyMap(c.VaultConfigs)
+	nc.TemplateConfig = c.TemplateConfig.Copy()
+	nc.ReservableCores = slices.Clone(c.ReservableCores)
+	nc.Artifact = c.Artifact.Copy()
+	nc.Users = c.Users.Copy()
+	return &nc
 }
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
-	return &Config{
-		Version:                 version.GetVersion(),
-		VaultConfig:             structsc.DefaultVaultConfig(),
-		ConsulConfig:            structsc.DefaultConsulConfig(),
-		LogOutput:               os.Stderr,
+	cfg := &Config{
+		Version: version.GetVersion(),
+		VaultConfigs: map[string]*structsc.VaultConfig{
+			structs.VaultDefaultCluster: structsc.DefaultVaultConfig()},
+		ConsulConfigs: map[string]*structsc.ConsulConfig{
+			structs.ConsulDefaultCluster: structsc.DefaultConsulConfig()},
 		Region:                  "global",
 		StatsCollectionInterval: 1 * time.Second,
 		TLSConfig:               &structsc.TLSConfig{},
-		LogLevel:                "DEBUG",
 		GCInterval:              1 * time.Minute,
 		GCParallelDestroys:      2,
 		GCDiskUsageThreshold:    80,
@@ -765,19 +856,22 @@ func DefaultConfig() *Config {
 		GCMaxAllocs:             50,
 		NoHostUUID:              true,
 		DisableRemoteExec:       false,
-		TemplateConfig: &ClientTemplateConfig{
-			FunctionDenylist: []string{"plugin"},
-			DisableSandbox:   false,
+		TemplateConfig:          DefaultTemplateConfig(),
+		RPCHoldTimeout:          5 * time.Second,
+		CNIPath:                 "/opt/cni/bin",
+		CNIConfigDir:            "/opt/cni/config",
+		CNIInterfacePrefix:      "eth",
+		HostNetworks:            map[string]*structs.ClientHostNetworkConfig{},
+		CgroupParent:            "nomad.slice", // SETH todo
+		MaxDynamicPort:          structs.DefaultMinDynamicPort,
+		MinDynamicPort:          structs.DefaultMaxDynamicPort,
+		Users: &UsersConfig{
+			MinDynamicUser: 80_000,
+			MaxDynamicUser: 89_999,
 		},
-		RPCHoldTimeout:     5 * time.Second,
-		CNIPath:            "/opt/cni/bin",
-		CNIConfigDir:       "/opt/cni/config",
-		CNIInterfacePrefix: "eth",
-		HostNetworks:       map[string]*structs.ClientHostNetworkConfig{},
-		CgroupParent:       cgutil.DefaultCgroupParent,
-		MaxDynamicPort:     structs.DefaultMinDynamicPort,
-		MinDynamicPort:     structs.DefaultMaxDynamicPort,
 	}
+
+	return cfg
 }
 
 // Read returns the specified configuration value or "".
@@ -908,11 +1002,20 @@ func splitValue(val string) map[string]struct{} {
 }
 
 // NomadPluginConfig produces the NomadConfig struct which is sent to Nomad plugins
-func (c *Config) NomadPluginConfig() *base.AgentConfig {
+func (c *Config) NomadPluginConfig(topology *numalib.Topology) *base.AgentConfig {
 	return &base.AgentConfig{
 		Driver: &base.ClientDriverConfig{
 			ClientMinPort: c.ClientMinPort,
 			ClientMaxPort: c.ClientMaxPort,
+			Topology:      topology,
 		},
 	}
+}
+
+func (c *Config) GetDefaultConsul() *structsc.ConsulConfig {
+	return c.ConsulConfigs[structs.ConsulDefaultCluster]
+}
+
+func (c *Config) GetDefaultVault() *structsc.VaultConfig {
+	return c.VaultConfigs[structs.VaultDefaultCluster]
 }

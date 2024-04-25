@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package paginator
 
 import (
@@ -9,7 +12,7 @@ import (
 // tokens to the Paginator.
 type Tokenizer interface {
 	// GetToken returns the pagination token for the given element.
-	GetToken(interface{}) string
+	GetToken(interface{}) any
 }
 
 // IDGetter is the interface that must be implemented by structs that need to
@@ -30,11 +33,49 @@ type CreateIndexGetter interface {
 	GetCreateIndex() uint64
 }
 
+// ModifyIndexGetter is the interface that must be implemented by structs that
+// need to have their ModifyIndex as part of the pagination token.
+type ModifyIndexGetter interface {
+	GetModifyIndex() uint64
+}
+
 // StructsTokenizerOptions is the configuration provided to a StructsTokenizer.
+//
+// These are some of the common use cases:
+//
+// Structs that can be uniquely identified with only its own ID:
+//
+//	StructsTokenizerOptions {
+//	    WithID: true,
+//	}
+//
+// Structs that are only unique within their namespace:
+//
+//	StructsTokenizerOptions {
+//	    WithID:        true,
+//	    WithNamespace: true,
+//	}
+//
+// Structs that can be sorted by their create index should also set
+// `WithCreateIndex` to `true` along with the other options:
+//
+//	StructsTokenizerOptions {
+//	    WithID:          true,
+//	    WithNamespace:   true,
+//	    WithCreateIndex: true,
+//	}
+//
+// For structs that can be sorted by the order they were modified, set
+// `OnlyModifyIndex` to `true` and exclude all other options:
+//
+//	StructsTokenizerOptions {
+//	    OnlyModifyIndex: true,
+//	}
 type StructsTokenizerOptions struct {
 	WithCreateIndex bool
 	WithNamespace   bool
 	WithID          bool
+	OnlyModifyIndex bool
 }
 
 // StructsTokenizer is an pagination token generator that can create different
@@ -45,15 +86,19 @@ type StructsTokenizer struct {
 }
 
 // NewStructsTokenizer returns a new StructsTokenizer.
-func NewStructsTokenizer(it Iterator, opts StructsTokenizerOptions) StructsTokenizer {
+func NewStructsTokenizer(_ Iterator, opts StructsTokenizerOptions) StructsTokenizer {
 	return StructsTokenizer{
 		opts: opts,
 	}
 }
 
-func (it StructsTokenizer) GetToken(raw interface{}) string {
+func (it StructsTokenizer) GetToken(raw interface{}) any {
 	if raw == nil {
 		return ""
+	}
+
+	if it.opts.OnlyModifyIndex {
+		return raw.(ModifyIndexGetter).GetModifyIndex()
 	}
 
 	parts := []string{}

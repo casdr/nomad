@@ -1,9 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
 	"fmt"
 
-	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -11,20 +14,31 @@ import (
 // System endpoint is used to call invoke system tasks.
 type System struct {
 	srv    *Server
-	logger log.Logger
+	ctx    *RPCContext
+	logger hclog.Logger
+}
+
+func NewSystemEndpoint(srv *Server, ctx *RPCContext) *System {
+	return &System{srv: srv, ctx: ctx, logger: srv.logger.Named("system")}
 }
 
 // GarbageCollect is used to trigger the system to immediately garbage collect nodes, evals
 // and jobs.
 func (s *System) GarbageCollect(args *structs.GenericRequest, reply *structs.GenericResponse) error {
+
+	authErr := s.srv.Authenticate(s.ctx, args)
 	if done, err := s.srv.forward("System.GarbageCollect", args, args, reply); done {
 		return err
 	}
+	s.srv.MeasureRPCRate("system", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
 
 	// Check management level permissions
-	if acl, err := s.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := s.srv.ResolveACL(args); err != nil {
 		return err
-	} else if acl != nil && !acl.IsManagement() {
+	} else if !aclObj.IsManagement() {
 		return structs.ErrPermissionDenied
 	}
 
@@ -41,14 +55,20 @@ func (s *System) GarbageCollect(args *structs.GenericRequest, reply *structs.Gen
 // ReconcileJobSummaries reconciles the summaries of all the jobs in the state
 // store
 func (s *System) ReconcileJobSummaries(args *structs.GenericRequest, reply *structs.GenericResponse) error {
+
+	authErr := s.srv.Authenticate(s.ctx, args)
 	if done, err := s.srv.forward("System.ReconcileJobSummaries", args, args, reply); done {
 		return err
 	}
+	s.srv.MeasureRPCRate("system", structs.RateMetricWrite, args)
+	if authErr != nil {
+		return structs.ErrPermissionDenied
+	}
 
 	// Check management level permissions
-	if acl, err := s.srv.ResolveToken(args.AuthToken); err != nil {
+	if aclObj, err := s.srv.ResolveACL(args); err != nil {
 		return err
-	} else if acl != nil && !acl.IsManagement() {
+	} else if !aclObj.IsManagement() {
 		return structs.ErrPermissionDenied
 	}
 

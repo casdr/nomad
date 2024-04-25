@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package escapingio
 
 import (
@@ -16,10 +19,10 @@ type Handler func(c byte) bool
 // For illustrative purposes, we use `~` in documentation as a shorthand for escaping character.
 //
 // If following a new line, reader sees:
-//  * `~~`, only one is emitted
-//  * `~.` (or any character), the handler is invoked with the character.
+//   - `~~`, only one is emitted
+//   - `~.` (or any character), the handler is invoked with the character.
 //     If handler returns true, `~.` will be skipped; otherwise, it's propagated.
-//  * `~` and it's the last character in stream, it's propagated
+//   - `~` and it's the last character in stream, it's propagated
 //
 // Appearances of `~` when not preceded by a new line are propagated unmodified.
 func NewReader(r io.Reader, c byte, h Handler) io.Reader {

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package config
 
 import (
@@ -5,15 +8,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 
 	consulapi "github.com/hashicorp/consul/api"
 	sockaddr "github.com/hashicorp/go-sockaddr"
-	"github.com/hashicorp/nomad/ci"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/helper/pointer"
 )
 
 func TestMain(m *testing.M) {
@@ -55,6 +59,7 @@ func TestConsulConfig_Merge(t *testing.T) {
 		Auth:                 "1",
 		EnableSSL:            &no,
 		VerifySSL:            &no,
+		GRPCCAFile:           "1",
 		CAFile:               "1",
 		CertFile:             "1",
 		KeyFile:              "1",
@@ -82,12 +87,20 @@ func TestConsulConfig_Merge(t *testing.T) {
 		Auth:                 "2",
 		EnableSSL:            &yes,
 		VerifySSL:            &yes,
+		GRPCCAFile:           "2",
 		CAFile:               "2",
 		CertFile:             "2",
 		KeyFile:              "2",
 		ServerAutoJoin:       &yes,
 		ClientAutoJoin:       &yes,
-		ExtraKeysHCL:         []string{"b", "2"},
+		ServiceIdentity: &WorkloadIdentityConfig{
+			Name:     "test",
+			Audience: []string{"consul.io", "nomad.dev"},
+			Env:      pointer.Of(false),
+			File:     pointer.Of(true),
+			TTL:      pointer.Of(2 * time.Hour),
+		},
+		ExtraKeysHCL: []string{"b", "2"},
 	}
 
 	exp := &ConsulConfig{
@@ -109,12 +122,20 @@ func TestConsulConfig_Merge(t *testing.T) {
 		Auth:                 "2",
 		EnableSSL:            &yes,
 		VerifySSL:            &yes,
+		GRPCCAFile:           "2",
 		CAFile:               "2",
 		CertFile:             "2",
 		KeyFile:              "2",
 		ServerAutoJoin:       &yes,
 		ClientAutoJoin:       &yes,
-		ExtraKeysHCL:         []string{"a", "1"}, // not merged
+		ServiceIdentity: &WorkloadIdentityConfig{
+			Name:     "test",
+			Audience: []string{"consul.io", "nomad.dev"},
+			Env:      pointer.Of(false),
+			File:     pointer.Of(true),
+			TTL:      pointer.Of(2 * time.Hour),
+		},
+		ExtraKeysHCL: []string{"a", "1"}, // not merged
 	}
 
 	result := c1.Merge(c2)
@@ -176,9 +197,8 @@ func TestConsulConfig_Exec(t *testing.T) {
 func TestConsulConfig_IpTemplateParse(t *testing.T) {
 	ci.Parallel(t)
 
-	privateIps, err := sockaddr.GetPrivateIP()
+	privateIp, err := sockaddr.GetPrivateIP()
 	require.NoError(t, err)
-	privateIp := strings.Split(privateIps, " ")[0]
 
 	testCases := []struct {
 		name        string
@@ -188,7 +208,7 @@ func TestConsulConfig_IpTemplateParse(t *testing.T) {
 	}{
 		{name: "string address keeps working", tmpl: "10.0.1.0:8500", expectedOut: "10.0.1.0:8500", expectErr: false},
 		{name: "single ip sock-addr template", tmpl: "{{ GetPrivateIP }}:8500", expectedOut: privateIp + ":8500", expectErr: false},
-		{name: "multi ip sock-addr template", tmpl: "{{ GetPrivateIPs }}:8500", expectedOut: "", expectErr: true},
+		{name: "multi ip sock-addr template", tmpl: "10.0.1.0 10.0.1.1:8500", expectedOut: "", expectErr: true},
 	}
 
 	for _, tc := range testCases {

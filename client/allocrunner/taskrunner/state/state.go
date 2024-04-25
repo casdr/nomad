@@ -1,7 +1,11 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state
 
 import (
-	"github.com/hashicorp/nomad/helper"
+	"maps"
+
 	"github.com/hashicorp/nomad/plugins/drivers"
 )
 
@@ -16,6 +20,11 @@ type LocalState struct {
 
 	// TaskHandle is the handle used to reattach to the task during recovery
 	TaskHandle *drivers.TaskHandle
+
+	// RunComplete is set to true when the TaskRunner.Run() method finishes.
+	// It is used to distinguish between a dead task that could be restarted
+	// and one that will never run again.
+	RunComplete bool
 }
 
 func NewLocalState() *LocalState {
@@ -52,6 +61,7 @@ func (s *LocalState) Copy() *LocalState {
 		Hooks:         make(map[string]*HookState, len(s.Hooks)),
 		DriverNetwork: s.DriverNetwork.Copy(),
 		TaskHandle:    s.TaskHandle.Copy(),
+		RunComplete:   s.RunComplete,
 	}
 
 	// Copy the hook state
@@ -83,8 +93,8 @@ func (h *HookState) Copy() *HookState {
 
 	c := new(HookState)
 	*c = *h
-	c.Data = helper.CopyMapStringString(h.Data)
-	c.Env = helper.CopyMapStringString(h.Env)
+	c.Data = maps.Clone(h.Data)
+	c.Env = maps.Clone(h.Env)
 	return c
 }
 
@@ -97,9 +107,9 @@ func (h *HookState) Equal(o *HookState) bool {
 		return false
 	}
 
-	if !helper.CompareMapStringString(h.Data, o.Data) {
+	if !maps.Equal(h.Data, o.Data) {
 		return false
 	}
 
-	return helper.CompareMapStringString(h.Env, o.Env)
+	return maps.Equal(h.Env, o.Env)
 }

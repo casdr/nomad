@@ -1,7 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net/url"
 	"sort"
 	"strconv"
@@ -19,6 +26,13 @@ const (
 
 	// JobTypeSystem indicates a system process that should run on all clients
 	JobTypeSystem = "system"
+
+	// JobTypeSysbatch indicates a short-lived system process that should run
+	// on all clients.
+	JobTypeSysbatch = "sysbatch"
+
+	// JobDefaultPriority is the default priority if not specified.
+	JobDefaultPriority = 50
 
 	// PeriodicSpecCron is used for a cron spec.
 	PeriodicSpecCron = "cron"
@@ -40,6 +54,16 @@ const (
 	RegisterEnforceIndexErrPrefix = "Enforcing job modify index"
 )
 
+const (
+	// JobPeriodicLaunchSuffix is the string appended to the periodic jobs ID
+	// when launching derived instances of it.
+	JobPeriodicLaunchSuffix = "/periodic-"
+
+	// JobDispatchLaunchSuffix is the string appended to the parameterized job's ID
+	// when dispatching instances of it.
+	JobDispatchLaunchSuffix = "/dispatch-"
+)
+
 // Jobs is used to access the job-specific endpoints.
 type Jobs struct {
 	client *Client
@@ -53,6 +77,11 @@ type JobsParseRequest struct {
 	// HCLv1 indicates whether the JobHCL should be parsed with the hcl v1 parser
 	HCLv1 bool `json:"hclv1,omitempty"`
 
+	// Variables are HCL2 variables associated with the job. Only works with hcl2.
+	//
+	// Interpreted as if it were the content of a variables file.
+	Variables string
+
 	// Canonicalize is a flag as to if the server should return default values
 	// for unset fields
 	Canonicalize bool
@@ -63,15 +92,22 @@ func (c *Client) Jobs() *Jobs {
 	return &Jobs{client: c}
 }
 
-// ParseHCL is used to convert the HCL repesentation of a Job to JSON server side.
+// ParseHCL is used to convert the HCL representation of a Job to JSON server side.
 // To parse the HCL client side see package github.com/hashicorp/nomad/jobspec
+// Use ParseHCLOpts if you need to customize JobsParseRequest.
 func (j *Jobs) ParseHCL(jobHCL string, canonicalize bool) (*Job, error) {
-	var job Job
 	req := &JobsParseRequest{
 		JobHCL:       jobHCL,
 		Canonicalize: canonicalize,
 	}
-	_, err := j.client.write("/v1/jobs/parse", req, &job, nil)
+	return j.ParseHCLOpts(req)
+}
+
+// ParseHCLOpts is used to request the server convert the HCL representation of a
+// Job to JSON on our behalf. Accepts HCL1 or HCL2 jobs as input.
+func (j *Jobs) ParseHCLOpts(req *JobsParseRequest) (*Job, error) {
+	var job Job
+	_, err := j.client.put("/v1/jobs/parse", req, &job, nil)
 	return &job, err
 }
 
@@ -81,7 +117,7 @@ func (j *Jobs) Validate(job *Job, q *WriteOptions) (*JobValidateResponse, *Write
 	if q != nil {
 		req.WriteRequest = WriteRequest{Region: q.Region}
 	}
-	wm, err := j.client.write("/v1/validate/job", req, &resp, q)
+	wm, err := j.client.put("/v1/validate/job", req, &resp, q)
 	return &resp, wm, err
 }
 
@@ -92,6 +128,7 @@ type RegisterOptions struct {
 	PolicyOverride bool
 	PreserveCounts bool
 	EvalPriority   int
+	Submission     *JobSubmission
 }
 
 // Register is used to register a new job. It returns the ID
@@ -110,9 +147,7 @@ func (j *Jobs) EnforceRegister(job *Job, modifyIndex uint64, q *WriteOptions) (*
 // returns the ID of the evaluation, along with any errors encountered.
 func (j *Jobs) RegisterOpts(job *Job, opts *RegisterOptions, q *WriteOptions) (*JobRegisterResponse, *WriteMeta, error) {
 	// Format the request
-	req := &JobRegisterRequest{
-		Job: job,
-	}
+	req := &JobRegisterRequest{Job: job}
 	if opts != nil {
 		if opts.EnforceIndex {
 			req.EnforceIndex = true
@@ -121,20 +156,42 @@ func (j *Jobs) RegisterOpts(job *Job, opts *RegisterOptions, q *WriteOptions) (*
 		req.PolicyOverride = opts.PolicyOverride
 		req.PreserveCounts = opts.PreserveCounts
 		req.EvalPriority = opts.EvalPriority
+		req.Submission = opts.Submission
 	}
 
 	var resp JobRegisterResponse
-	wm, err := j.client.write("/v1/jobs", req, &resp, q)
+	wm, err := j.client.put("/v1/jobs", req, &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
 	return &resp, wm, nil
 }
 
+type JobListFields struct {
+	Meta bool
+}
+type JobListOptions struct {
+	Fields *JobListFields
+}
+
 // List is used to list all of the existing jobs.
 func (j *Jobs) List(q *QueryOptions) ([]*JobListStub, *QueryMeta, error) {
+	return j.ListOptions(nil, q)
+}
+
+// List is used to list all of the existing jobs.
+func (j *Jobs) ListOptions(opts *JobListOptions, q *QueryOptions) ([]*JobListStub, *QueryMeta, error) {
 	var resp []*JobListStub
-	qm, err := j.client.query("/v1/jobs", &resp, q)
+
+	destinationURL := "/v1/jobs"
+
+	if opts != nil && opts.Fields != nil {
+		qp := url.Values{}
+		qp.Add("meta", fmt.Sprint(opts.Fields.Meta))
+		destinationURL = destinationURL + "?" + qp.Encode()
+	}
+
+	qm, err := j.client.query(destinationURL, &resp, q)
 	if err != nil {
 		return nil, qm, err
 	}
@@ -165,7 +222,7 @@ func (j *Jobs) Scale(jobID, group string, count *int, message string, error bool
 
 	var count64 *int64
 	if count != nil {
-		count64 = int64ToPtr(int64(*count))
+		count64 = pointerOf(int64(*count))
 	}
 	req := &ScalingRequest{
 		Count: count64,
@@ -178,7 +235,7 @@ func (j *Jobs) Scale(jobID, group string, count *int, message string, error bool
 		Meta:    meta,
 	}
 	var resp JobRegisterResponse
-	qm, err := j.client.write(fmt.Sprintf("/v1/job/%s/scale", url.PathEscape(jobID)), req, &resp, q)
+	qm, err := j.client.put(fmt.Sprintf("/v1/job/%s/scale", url.PathEscape(jobID)), req, &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -205,6 +262,19 @@ func (j *Jobs) Versions(jobID string, diffs bool, q *QueryOptions) ([]*Job, []*J
 		return nil, nil, nil, err
 	}
 	return resp.Versions, resp.Diffs, qm, nil
+}
+
+// Submission is used to retrieve the original submitted source of a job given its
+// namespace, jobID, and version number. The original source might not be available,
+// which case nil is returned with no error.
+func (j *Jobs) Submission(jobID string, version int, q *QueryOptions) (*JobSubmission, *QueryMeta, error) {
+	var sub JobSubmission
+	s := fmt.Sprintf("/v1/job/%s/submission?version=%d", url.PathEscape(jobID), version)
+	qm, err := j.client.query(s, &sub, q)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &sub, qm, nil
 }
 
 // Allocations is used to return the allocs for a given job ID.
@@ -275,7 +345,7 @@ func (j *Jobs) Evaluations(jobID string, q *QueryOptions) ([]*Evaluation, *Query
 // eventually GC'ed from the system. Most callers should not specify purge.
 func (j *Jobs) Deregister(jobID string, purge bool, q *WriteOptions) (string, *WriteMeta, error) {
 	var resp JobDeregisterResponse
-	wm, err := j.client.delete(fmt.Sprintf("/v1/job/%v?purge=%t", url.PathEscape(jobID), purge), &resp, q)
+	wm, err := j.client.delete(fmt.Sprintf("/v1/job/%v?purge=%t", url.PathEscape(jobID), purge), nil, &resp, q)
 	if err != nil {
 		return "", nil, err
 	}
@@ -321,7 +391,7 @@ func (j *Jobs) DeregisterOpts(jobID string, opts *DeregisterOptions, q *WriteOpt
 			opts.Purge, opts.Global, opts.EvalPriority, opts.NoShutdownDelay)
 	}
 
-	wm, err := j.client.delete(endpoint, &resp, q)
+	wm, err := j.client.delete(endpoint, nil, &resp, q)
 	if err != nil {
 		return "", nil, err
 	}
@@ -331,7 +401,7 @@ func (j *Jobs) DeregisterOpts(jobID string, opts *DeregisterOptions, q *WriteOpt
 // ForceEvaluate is used to force-evaluate an existing job.
 func (j *Jobs) ForceEvaluate(jobID string, q *WriteOptions) (string, *WriteMeta, error) {
 	var resp JobRegisterResponse
-	wm, err := j.client.write("/v1/job/"+url.PathEscape(jobID)+"/evaluate", nil, &resp, q)
+	wm, err := j.client.put("/v1/job/"+url.PathEscape(jobID)+"/evaluate", nil, &resp, q)
 	if err != nil {
 		return "", nil, err
 	}
@@ -347,7 +417,7 @@ func (j *Jobs) EvaluateWithOpts(jobID string, opts EvalOptions, q *WriteOptions)
 	}
 
 	var resp JobRegisterResponse
-	wm, err := j.client.write("/v1/job/"+url.PathEscape(jobID)+"/evaluate", req, &resp, q)
+	wm, err := j.client.put("/v1/job/"+url.PathEscape(jobID)+"/evaluate", req, &resp, q)
 	if err != nil {
 		return "", nil, err
 	}
@@ -357,7 +427,7 @@ func (j *Jobs) EvaluateWithOpts(jobID string, opts EvalOptions, q *WriteOptions)
 // PeriodicForce spawns a new instance of the periodic job and returns the eval ID
 func (j *Jobs) PeriodicForce(jobID string, q *WriteOptions) (string, *WriteMeta, error) {
 	var resp periodicForceResponse
-	wm, err := j.client.write("/v1/job/"+url.PathEscape(jobID)+"/periodic/force", nil, &resp, q)
+	wm, err := j.client.put("/v1/job/"+url.PathEscape(jobID)+"/periodic/force", nil, &resp, q)
 	if err != nil {
 		return "", nil, err
 	}
@@ -377,7 +447,10 @@ func (j *Jobs) Plan(job *Job, diff bool, q *WriteOptions) (*JobPlanResponse, *Wr
 
 func (j *Jobs) PlanOpts(job *Job, opts *PlanOptions, q *WriteOptions) (*JobPlanResponse, *WriteMeta, error) {
 	if job == nil {
-		return nil, nil, fmt.Errorf("must pass non-nil job")
+		return nil, nil, errors.New("must pass non-nil job")
+	}
+	if job.ID == nil {
+		return nil, nil, errors.New("job is missing ID")
 	}
 
 	// Setup the request
@@ -390,7 +463,7 @@ func (j *Jobs) PlanOpts(job *Job, opts *PlanOptions, q *WriteOptions) (*JobPlanR
 	}
 
 	var resp JobPlanResponse
-	wm, err := j.client.write("/v1/job/"+url.PathEscape(*job.ID)+"/plan", req, &resp, q)
+	wm, err := j.client.put("/v1/job/"+url.PathEscape(*job.ID)+"/plan", req, &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -407,14 +480,15 @@ func (j *Jobs) Summary(jobID string, q *QueryOptions) (*JobSummary, *QueryMeta, 
 }
 
 func (j *Jobs) Dispatch(jobID string, meta map[string]string,
-	payload []byte, q *WriteOptions) (*JobDispatchResponse, *WriteMeta, error) {
+	payload []byte, idPrefixTemplate string, q *WriteOptions) (*JobDispatchResponse, *WriteMeta, error) {
 	var resp JobDispatchResponse
 	req := &JobDispatchRequest{
-		JobID:   jobID,
-		Meta:    meta,
-		Payload: payload,
+		JobID:            jobID,
+		Meta:             meta,
+		Payload:          payload,
+		IdPrefixTemplate: idPrefixTemplate,
 	}
-	wm, err := j.client.write("/v1/job/"+url.PathEscape(jobID)+"/dispatch", req, &resp, q)
+	wm, err := j.client.put("/v1/job/"+url.PathEscape(jobID)+"/dispatch", req, &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -432,10 +506,10 @@ func (j *Jobs) Revert(jobID string, version uint64, enforcePriorVersion *uint64,
 		JobID:               jobID,
 		JobVersion:          version,
 		EnforcePriorVersion: enforcePriorVersion,
-		// ConsulToken:         consulToken, // TODO(shoenig) enable!
-		VaultToken: vaultToken,
+		ConsulToken:         consulToken,
+		VaultToken:          vaultToken,
 	}
-	wm, err := j.client.write("/v1/job/"+url.PathEscape(jobID)+"/revert", req, &resp, q)
+	wm, err := j.client.put("/v1/job/"+url.PathEscape(jobID)+"/revert", req, &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -452,11 +526,19 @@ func (j *Jobs) Stable(jobID string, version uint64, stable bool,
 		JobVersion: version,
 		Stable:     stable,
 	}
-	wm, err := j.client.write("/v1/job/"+url.PathEscape(jobID)+"/stable", req, &resp, q)
+	wm, err := j.client.put("/v1/job/"+url.PathEscape(jobID)+"/stable", req, &resp, q)
 	if err != nil {
 		return nil, nil, err
 	}
 	return &resp, wm, nil
+}
+
+// Services is used to return a list of service registrations associated to the
+// specified jobID.
+func (j *Jobs) Services(jobID string, q *QueryOptions) ([]*ServiceRegistration, *QueryMeta, error) {
+	var resp []*ServiceRegistration
+	qm, err := j.client.query("/v1/job/"+jobID+"/services", &resp, q)
+	return resp, qm, err
 }
 
 // periodicForceResponse is used to deserialize a force response
@@ -481,15 +563,15 @@ type UpdateStrategy struct {
 // jobs with the old policy or for populating field defaults.
 func DefaultUpdateStrategy() *UpdateStrategy {
 	return &UpdateStrategy{
-		Stagger:          timeToPtr(30 * time.Second),
-		MaxParallel:      intToPtr(1),
-		HealthCheck:      stringToPtr("checks"),
-		MinHealthyTime:   timeToPtr(10 * time.Second),
-		HealthyDeadline:  timeToPtr(5 * time.Minute),
-		ProgressDeadline: timeToPtr(10 * time.Minute),
-		AutoRevert:       boolToPtr(false),
-		Canary:           intToPtr(0),
-		AutoPromote:      boolToPtr(false),
+		Stagger:          pointerOf(30 * time.Second),
+		MaxParallel:      pointerOf(1),
+		HealthCheck:      pointerOf("checks"),
+		MinHealthyTime:   pointerOf(10 * time.Second),
+		HealthyDeadline:  pointerOf(5 * time.Minute),
+		ProgressDeadline: pointerOf(10 * time.Minute),
+		AutoRevert:       pointerOf(false),
+		Canary:           pointerOf(0),
+		AutoPromote:      pointerOf(false),
 	}
 }
 
@@ -501,39 +583,39 @@ func (u *UpdateStrategy) Copy() *UpdateStrategy {
 	copy := new(UpdateStrategy)
 
 	if u.Stagger != nil {
-		copy.Stagger = timeToPtr(*u.Stagger)
+		copy.Stagger = pointerOf(*u.Stagger)
 	}
 
 	if u.MaxParallel != nil {
-		copy.MaxParallel = intToPtr(*u.MaxParallel)
+		copy.MaxParallel = pointerOf(*u.MaxParallel)
 	}
 
 	if u.HealthCheck != nil {
-		copy.HealthCheck = stringToPtr(*u.HealthCheck)
+		copy.HealthCheck = pointerOf(*u.HealthCheck)
 	}
 
 	if u.MinHealthyTime != nil {
-		copy.MinHealthyTime = timeToPtr(*u.MinHealthyTime)
+		copy.MinHealthyTime = pointerOf(*u.MinHealthyTime)
 	}
 
 	if u.HealthyDeadline != nil {
-		copy.HealthyDeadline = timeToPtr(*u.HealthyDeadline)
+		copy.HealthyDeadline = pointerOf(*u.HealthyDeadline)
 	}
 
 	if u.ProgressDeadline != nil {
-		copy.ProgressDeadline = timeToPtr(*u.ProgressDeadline)
+		copy.ProgressDeadline = pointerOf(*u.ProgressDeadline)
 	}
 
 	if u.AutoRevert != nil {
-		copy.AutoRevert = boolToPtr(*u.AutoRevert)
+		copy.AutoRevert = pointerOf(*u.AutoRevert)
 	}
 
 	if u.Canary != nil {
-		copy.Canary = intToPtr(*u.Canary)
+		copy.Canary = pointerOf(*u.Canary)
 	}
 
 	if u.AutoPromote != nil {
-		copy.AutoPromote = boolToPtr(*u.AutoPromote)
+		copy.AutoPromote = pointerOf(*u.AutoPromote)
 	}
 
 	return copy
@@ -545,39 +627,39 @@ func (u *UpdateStrategy) Merge(o *UpdateStrategy) {
 	}
 
 	if o.Stagger != nil {
-		u.Stagger = timeToPtr(*o.Stagger)
+		u.Stagger = pointerOf(*o.Stagger)
 	}
 
 	if o.MaxParallel != nil {
-		u.MaxParallel = intToPtr(*o.MaxParallel)
+		u.MaxParallel = pointerOf(*o.MaxParallel)
 	}
 
 	if o.HealthCheck != nil {
-		u.HealthCheck = stringToPtr(*o.HealthCheck)
+		u.HealthCheck = pointerOf(*o.HealthCheck)
 	}
 
 	if o.MinHealthyTime != nil {
-		u.MinHealthyTime = timeToPtr(*o.MinHealthyTime)
+		u.MinHealthyTime = pointerOf(*o.MinHealthyTime)
 	}
 
 	if o.HealthyDeadline != nil {
-		u.HealthyDeadline = timeToPtr(*o.HealthyDeadline)
+		u.HealthyDeadline = pointerOf(*o.HealthyDeadline)
 	}
 
 	if o.ProgressDeadline != nil {
-		u.ProgressDeadline = timeToPtr(*o.ProgressDeadline)
+		u.ProgressDeadline = pointerOf(*o.ProgressDeadline)
 	}
 
 	if o.AutoRevert != nil {
-		u.AutoRevert = boolToPtr(*o.AutoRevert)
+		u.AutoRevert = pointerOf(*o.AutoRevert)
 	}
 
 	if o.Canary != nil {
-		u.Canary = intToPtr(*o.Canary)
+		u.Canary = pointerOf(*o.Canary)
 	}
 
 	if o.AutoPromote != nil {
-		u.AutoPromote = boolToPtr(*o.AutoPromote)
+		u.AutoPromote = pointerOf(*o.AutoPromote)
 	}
 }
 
@@ -674,15 +756,15 @@ type Multiregion struct {
 func (m *Multiregion) Canonicalize() {
 	if m.Strategy == nil {
 		m.Strategy = &MultiregionStrategy{
-			MaxParallel: intToPtr(0),
-			OnFailure:   stringToPtr(""),
+			MaxParallel: pointerOf(0),
+			OnFailure:   pointerOf(""),
 		}
 	} else {
 		if m.Strategy.MaxParallel == nil {
-			m.Strategy.MaxParallel = intToPtr(0)
+			m.Strategy.MaxParallel = pointerOf(0)
 		}
 		if m.Strategy.OnFailure == nil {
-			m.Strategy.OnFailure = stringToPtr("")
+			m.Strategy.OnFailure = pointerOf("")
 		}
 	}
 	if m.Regions == nil {
@@ -690,7 +772,7 @@ func (m *Multiregion) Canonicalize() {
 	}
 	for _, region := range m.Regions {
 		if region.Count == nil {
-			region.Count = intToPtr(1)
+			region.Count = pointerOf(1)
 		}
 		if region.Datacenters == nil {
 			region.Datacenters = []string{}
@@ -708,17 +790,19 @@ func (m *Multiregion) Copy() *Multiregion {
 	copy := new(Multiregion)
 	if m.Strategy != nil {
 		copy.Strategy = new(MultiregionStrategy)
-		copy.Strategy.MaxParallel = intToPtr(*m.Strategy.MaxParallel)
-		copy.Strategy.OnFailure = stringToPtr(*m.Strategy.OnFailure)
+		copy.Strategy.MaxParallel = pointerOf(*m.Strategy.MaxParallel)
+		copy.Strategy.OnFailure = pointerOf(*m.Strategy.OnFailure)
 	}
 	for _, region := range m.Regions {
 		copyRegion := new(MultiregionRegion)
 		copyRegion.Name = region.Name
-		copyRegion.Count = intToPtr(*region.Count)
+		copyRegion.Count = pointerOf(*region.Count)
 		copyRegion.Datacenters = append(copyRegion.Datacenters, region.Datacenters...)
+		copyRegion.NodePool = region.NodePool
 		for k, v := range region.Meta {
 			copyRegion.Meta[k] = v
 		}
+
 		copy.Regions = append(copy.Regions, copyRegion)
 	}
 	return copy
@@ -733,13 +817,15 @@ type MultiregionRegion struct {
 	Name        string            `hcl:",label"`
 	Count       *int              `hcl:"count,optional"`
 	Datacenters []string          `hcl:"datacenters,optional"`
+	NodePool    string            `hcl:"node_pool,optional"`
 	Meta        map[string]string `hcl:"meta,block"`
 }
 
 // PeriodicConfig is for serializing periodic config for a job.
 type PeriodicConfig struct {
-	Enabled         *bool   `hcl:"enabled,optional"`
-	Spec            *string `hcl:"cron,optional"`
+	Enabled         *bool    `hcl:"enabled,optional"`
+	Spec            *string  `hcl:"cron,optional"`
+	Specs           []string `hcl:"crons,optional"`
 	SpecType        *string
 	ProhibitOverlap *bool   `mapstructure:"prohibit_overlap" hcl:"prohibit_overlap,optional"`
 	TimeZone        *string `mapstructure:"time_zone" hcl:"time_zone,optional"`
@@ -747,19 +833,22 @@ type PeriodicConfig struct {
 
 func (p *PeriodicConfig) Canonicalize() {
 	if p.Enabled == nil {
-		p.Enabled = boolToPtr(true)
+		p.Enabled = pointerOf(true)
 	}
 	if p.Spec == nil {
-		p.Spec = stringToPtr("")
+		p.Spec = pointerOf("")
+	}
+	if p.Specs == nil {
+		p.Specs = []string{}
 	}
 	if p.SpecType == nil {
-		p.SpecType = stringToPtr(PeriodicSpecCron)
+		p.SpecType = pointerOf(PeriodicSpecCron)
 	}
 	if p.ProhibitOverlap == nil {
-		p.ProhibitOverlap = boolToPtr(false)
+		p.ProhibitOverlap = pointerOf(false)
 	}
 	if p.TimeZone == nil || *p.TimeZone == "" {
-		p.TimeZone = stringToPtr("UTC")
+		p.TimeZone = pointerOf("UTC")
 	}
 }
 
@@ -768,30 +857,43 @@ func (p *PeriodicConfig) Canonicalize() {
 // returned. The `time.Location` of the returned value matches that of the
 // passed time.
 func (p *PeriodicConfig) Next(fromTime time.Time) (time.Time, error) {
-	if *p.SpecType == PeriodicSpecCron {
-		e, err := cronexpr.Parse(*p.Spec)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("failed parsing cron expression %q: %v", *p.Spec, err)
+	// Single spec parsing
+	if p != nil && *p.SpecType == PeriodicSpecCron {
+		if p.Spec != nil && *p.Spec != "" {
+			return cronParseNext(fromTime, *p.Spec)
 		}
-		return cronParseNext(e, fromTime, *p.Spec)
 	}
 
-	return time.Time{}, nil
+	// multiple specs parsing
+	var nextTime time.Time
+	for _, spec := range p.Specs {
+		t, err := cronParseNext(fromTime, spec)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed parsing cron expression %s: %v", spec, err)
+		}
+		if nextTime.IsZero() || t.Before(nextTime) {
+			nextTime = t
+		}
+	}
+	return nextTime, nil
 }
 
 // cronParseNext is a helper that parses the next time for the given expression
 // but captures any panic that may occur in the underlying library.
 // ---  THIS FUNCTION IS REPLICATED IN nomad/structs/structs.go
 // and should be kept in sync.
-func cronParseNext(e *cronexpr.Expression, fromTime time.Time, spec string) (t time.Time, err error) {
+func cronParseNext(fromTime time.Time, spec string) (t time.Time, err error) {
 	defer func() {
 		if recover() != nil {
 			t = time.Time{}
 			err = fmt.Errorf("failed parsing cron expression: %q", spec)
 		}
 	}()
-
-	return e.Next(fromTime), nil
+	exp, err := cronexpr.Parse(spec)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed parsing cron expression: %s: %v", spec, err)
+	}
+	return exp.Next(fromTime), nil
 }
 
 func (p *PeriodicConfig) GetLocation() (*time.Location, error) {
@@ -809,6 +911,51 @@ type ParameterizedJobConfig struct {
 	MetaOptional []string `mapstructure:"meta_optional" hcl:"meta_optional,optional"`
 }
 
+// JobSubmission is used to hold information about the original content of a job
+// specification being submitted to Nomad.
+//
+// At any time a JobSubmission may be nil, indicating no information is known about
+// the job submission.
+type JobSubmission struct {
+	// Source contains the original job definition (may be in the format of
+	// hcl1, hcl2, or json).
+	Source string
+
+	// Format indicates what the Source content was (hcl1, hcl2, or json).
+	Format string
+
+	// VariableFlags contains the CLI "-var" flag arguments as submitted with the
+	// job (hcl2 only).
+	VariableFlags map[string]string
+
+	// Variables contains the opaque variables configuration as coming from
+	// a var-file or the WebUI variables input (hcl2 only).
+	Variables string
+}
+
+func (js *JobSubmission) Canonicalize() {
+	if js == nil {
+		return
+	}
+
+	if len(js.VariableFlags) == 0 {
+		js.VariableFlags = nil
+	}
+}
+
+func (js *JobSubmission) Copy() *JobSubmission {
+	if js == nil {
+		return nil
+	}
+
+	return &JobSubmission{
+		Source:        js.Source,
+		Format:        js.Format,
+		VariableFlags: maps.Clone(js.VariableFlags),
+		Variables:     js.Variables,
+	}
+}
+
 // Job is used to serialize a job.
 type Job struct {
 	/* Fields parsed from HCL config */
@@ -821,6 +968,7 @@ type Job struct {
 	Priority         *int                    `hcl:"priority,optional"`
 	AllAtOnce        *bool                   `mapstructure:"all_at_once" hcl:"all_at_once,optional"`
 	Datacenters      []string                `hcl:"datacenters,optional"`
+	NodePool         *string                 `mapstructure:"node_pool" hcl:"node_pool,optional"`
 	Constraints      []*Constraint           `hcl:"constraint,block"`
 	Affinities       []*Affinity             `hcl:"affinity,block"`
 	TaskGroups       []*TaskGroup            `hcl:"group,block"`
@@ -872,70 +1020,70 @@ func (j *Job) IsMultiregion() bool {
 
 func (j *Job) Canonicalize() {
 	if j.ID == nil {
-		j.ID = stringToPtr("")
+		j.ID = pointerOf("")
 	}
 	if j.Name == nil {
-		j.Name = stringToPtr(*j.ID)
+		j.Name = pointerOf(*j.ID)
 	}
 	if j.ParentID == nil {
-		j.ParentID = stringToPtr("")
+		j.ParentID = pointerOf("")
 	}
 	if j.Namespace == nil {
-		j.Namespace = stringToPtr(DefaultNamespace)
+		j.Namespace = pointerOf(DefaultNamespace)
 	}
 	if j.Priority == nil {
-		j.Priority = intToPtr(50)
+		j.Priority = pointerOf(JobDefaultPriority)
 	}
 	if j.Stop == nil {
-		j.Stop = boolToPtr(false)
+		j.Stop = pointerOf(false)
 	}
 	if j.Region == nil {
-		j.Region = stringToPtr(GlobalRegion)
+		j.Region = pointerOf(GlobalRegion)
 	}
-	if j.Namespace == nil {
-		j.Namespace = stringToPtr("default")
+	if j.NodePool == nil {
+		j.NodePool = pointerOf("")
 	}
 	if j.Type == nil {
-		j.Type = stringToPtr("service")
+		j.Type = pointerOf("service")
 	}
 	if j.AllAtOnce == nil {
-		j.AllAtOnce = boolToPtr(false)
+		j.AllAtOnce = pointerOf(false)
 	}
 	if j.ConsulToken == nil {
-		j.ConsulToken = stringToPtr("")
+		j.ConsulToken = pointerOf("")
 	}
 	if j.ConsulNamespace == nil {
-		j.ConsulNamespace = stringToPtr("")
+		j.ConsulNamespace = pointerOf("")
 	}
 	if j.VaultToken == nil {
-		j.VaultToken = stringToPtr("")
+		j.VaultToken = pointerOf("")
 	}
 	if j.VaultNamespace == nil {
-		j.VaultNamespace = stringToPtr("")
+		j.VaultNamespace = pointerOf("")
 	}
 	if j.NomadTokenID == nil {
-		j.NomadTokenID = stringToPtr("")
+		j.NomadTokenID = pointerOf("")
 	}
 	if j.Status == nil {
-		j.Status = stringToPtr("")
+		j.Status = pointerOf("")
 	}
 	if j.StatusDescription == nil {
-		j.StatusDescription = stringToPtr("")
+		j.StatusDescription = pointerOf("")
 	}
 	if j.Stable == nil {
-		j.Stable = boolToPtr(false)
+		j.Stable = pointerOf(false)
 	}
 	if j.Version == nil {
-		j.Version = uint64ToPtr(0)
+		j.Version = pointerOf(uint64(0))
 	}
 	if j.CreateIndex == nil {
-		j.CreateIndex = uint64ToPtr(0)
+		j.CreateIndex = pointerOf(uint64(0))
 	}
 	if j.ModifyIndex == nil {
-		j.ModifyIndex = uint64ToPtr(0)
+		j.ModifyIndex = pointerOf(uint64(0))
 	}
 	if j.JobModifyIndex == nil {
-		j.JobModifyIndex = uint64ToPtr(0)
+		j.JobModifyIndex = pointerOf(uint64(0))
 	}
 	if j.Periodic != nil {
 		j.Periodic.Canonicalize()
@@ -1007,6 +1155,7 @@ type TaskGroupSummary struct {
 	Running  int
 	Starting int
 	Lost     int
+	Unknown  int
 }
 
 // JobListStub is used to return a subset of information about
@@ -1029,6 +1178,7 @@ type JobListStub struct {
 	ModifyIndex       uint64
 	JobModifyIndex    uint64
 	SubmitTime        int64
+	Meta              map[string]string `json:",omitempty"`
 }
 
 // JobIDSort is used to sort jobs by their job ID's.
@@ -1065,6 +1215,13 @@ func NewBatchJob(id, name, region string, pri int) *Job {
 // the relative job priority.
 func NewSystemJob(id, name, region string, pri int) *Job {
 	return newJob(id, name, region, JobTypeSystem, pri)
+}
+
+// NewSysbatchJob creates and returns a new sysbatch-style job for short-lived
+// processes designed to run on all clients, using the provided name and ID
+// along with the relative job priority.
+func NewSysbatchJob(id, name, region string, pri int) *Job {
+	return newJob(id, name, region, JobTypeSysbatch, pri)
 }
 
 // newJob is used to create a new Job struct.
@@ -1185,7 +1342,9 @@ type JobRevertRequest struct {
 
 // JobRegisterRequest is used to update a job
 type JobRegisterRequest struct {
-	Job *Job
+	Submission *JobSubmission
+	Job        *Job
+
 	// If EnforceIndex is set then the job will only be registered if the passed
 	// JobModifyIndex matches the current Jobs index. If the index is zero, the
 	// register only occurs if the job is new.
@@ -1302,9 +1461,10 @@ type DesiredUpdates struct {
 }
 
 type JobDispatchRequest struct {
-	JobID   string
-	Payload []byte
-	Meta    map[string]string
+	JobID            string
+	Payload          []byte
+	Meta             map[string]string
+	IdPrefixTemplate string
 }
 
 type JobDispatchResponse struct {
@@ -1319,6 +1479,12 @@ type JobDispatchResponse struct {
 type JobVersionsResponse struct {
 	Versions []*Job
 	Diffs    []*JobDiff
+	QueryMeta
+}
+
+// JobSubmissionResponse is used for a job get submission request
+type JobSubmissionResponse struct {
+	Submission *JobSubmission
 	QueryMeta
 }
 
@@ -1349,4 +1515,32 @@ type JobEvaluateRequest struct {
 // EvalOptions is used to encapsulate options when forcing a job evaluation
 type EvalOptions struct {
 	ForceReschedule bool
+}
+
+// ActionExec is used to run a pre-defined command inside a running task.
+// The call blocks until command terminates (or an error occurs), and returns the exit code.
+func (j *Jobs) ActionExec(ctx context.Context,
+	alloc *Allocation, job string, task string, tty bool, command []string,
+	action string,
+	stdin io.Reader, stdout, stderr io.Writer,
+	terminalSizeCh <-chan TerminalSize, q *QueryOptions) (exitCode int, err error) {
+
+	s := &execSession{
+		client:  j.client,
+		alloc:   alloc,
+		job:     job,
+		task:    task,
+		tty:     tty,
+		command: command,
+		action:  action,
+
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+
+		terminalSizeCh: terminalSizeCh,
+		q:              q,
+	}
+
+	return s.run(ctx)
 }

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package java
 
 import (
@@ -9,17 +12,17 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/hashicorp/nomad/client/lib/cgutil"
-	"github.com/hashicorp/nomad/drivers/shared/capabilities"
-
 	"github.com/hashicorp/consul-template/signals"
 	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
+	"github.com/hashicorp/nomad/drivers/shared/capabilities"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/drivers/shared/resolvconf"
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/drivers/utils"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
@@ -102,7 +105,7 @@ var (
 	driverCapabilities = &drivers.Capabilities{
 		SendSignals: false,
 		Exec:        false,
-		FSIsolation: drivers.FSIsolationNone,
+		FSIsolation: fsisolation.None,
 		NetIsolationModes: []drivers.NetIsolationMode{
 			drivers.NetIsolationModeHost,
 			drivers.NetIsolationModeGroup,
@@ -115,7 +118,7 @@ var (
 
 func init() {
 	if runtime.GOOS == "linux" {
-		driverCapabilities.FSIsolation = drivers.FSIsolationChroot
+		driverCapabilities.FSIsolation = fsisolation.Chroot
 		driverCapabilities.MountConfigs = drivers.MountConfigSupportAll
 	}
 }
@@ -329,17 +332,9 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 			return fp
 		}
 
-		mount, err := cgutil.FindCgroupMountpointDir()
-		if err != nil {
+		if cgroupslib.GetMode() == cgroupslib.OFF {
 			fp.Health = drivers.HealthStateUnhealthy
 			fp.HealthDescription = drivers.NoCgroupMountMessage
-			d.logger.Warn(fp.HealthDescription, "error", err)
-			return fp
-		}
-
-		if mount == "" {
-			fp.Health = drivers.HealthStateUnhealthy
-			fp.HealthDescription = drivers.CgroupMountEmpty
 			return fp
 		}
 	}
@@ -378,11 +373,6 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		return fmt.Errorf("handle cannot be nil")
 	}
 
-	// COMPAT(0.10): pre 0.9 upgrade path check
-	if handle.Version == 0 {
-		return d.recoverPre09Task(handle)
-	}
-
 	// If already attached to handle there's nothing to recover.
 	if _, ok := d.tasks.Get(handle.Config.ID); ok {
 		d.logger.Debug("nothing to recover; task already exists",
@@ -404,8 +394,12 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		return fmt.Errorf("failed to build ReattachConfig from taskConfig state: %v", err)
 	}
 
-	execImpl, pluginClient, err := executor.ReattachToExecutor(plugRC,
-		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID))
+	execImpl, pluginClient, err := executor.ReattachToExecutor(
+		plugRC,
+		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
+		d.nomadConfig.Topology.Compute(),
+	)
+
 	if err != nil {
 		d.logger.Error("failed to reattach to executor", "error", err, "task_id", handle.Config.ID)
 		return fmt.Errorf("failed to reattach to executor: %v", err)
@@ -462,7 +456,8 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	executorConfig := &executor.ExecutorConfig{
 		LogFile:     pluginLogFile,
 		LogLevel:    "debug",
-		FSIsolation: driverCapabilities.FSIsolation == drivers.FSIsolationChroot,
+		FSIsolation: driverCapabilities.FSIsolation == fsisolation.Chroot,
+		Compute:     d.nomadConfig.Topology.Compute(),
 	}
 
 	exec, pluginClient, err := executor.CreateExecutor(
@@ -599,8 +594,9 @@ func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *dr
 		}
 	} else {
 		result = &drivers.ExitResult{
-			ExitCode: ps.ExitCode,
-			Signal:   ps.Signal,
+			ExitCode:  ps.ExitCode,
+			Signal:    ps.Signal,
+			OOMKilled: ps.OOMKilled,
 		}
 	}
 
@@ -641,7 +637,7 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 
 	if !handle.pluginClient.Exited() {
 		if err := handle.exec.Shutdown("", 0); err != nil {
-			handle.logger.Error("destroying executor failed", "err", err)
+			handle.logger.Error("destroying executor failed", "error", err)
 		}
 
 		handle.pluginClient.Kill()

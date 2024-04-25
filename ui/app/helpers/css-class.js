@@ -1,5 +1,10 @@
-import { helper } from '@ember/component/helper';
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
 
+import { helper } from '@ember/component/helper';
+import { dasherize } from '@ember/string';
 /**
  * CSS Class
  *
@@ -9,8 +14,7 @@ import { helper } from '@ember/component/helper';
  * Differs from dasherize by handling slashes.
  */
 export function cssClass([updateType]) {
-  /* eslint-disable-next-line ember/no-string-prototype-extensions */
-  return updateType.replace(/\//g, '-').dasherize();
+  return dasherize(updateType.replace(/\//g, '-'));
 }
 
 export default helper(cssClass);

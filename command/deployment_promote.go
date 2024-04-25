@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -140,9 +143,15 @@ func (c *DeploymentPromoteCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Nothing to do
 	evalCreated := u.EvalID != ""
-	if detach || !evalCreated {
+
+	// Nothing to do
+	if !evalCreated {
+		return 0
+	}
+
+	if detach {
+		c.Ui.Output("Evaluation ID: " + u.EvalID)
 		return 0
 	}
 

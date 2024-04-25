@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
 variable "cn_network" {
   default     = "dc1"
   description = "Data Ceneter that the job needs to be run in"
@@ -24,8 +27,8 @@ variable "gluster_volname" {
 }
 
 variable "kadalu_version" {
-  default     = "0.8.6"
-  description = "Kadalu CSI version which is tested against Nomad (v1.1.4)"
+  default     = "0.8.15"
+  description = "Kadalu CSI version which is tested against Nomad version mentioned in README.md"
 }
 
 variable "gluster_user" {
@@ -110,7 +113,7 @@ job "kadalu-csi-controller" {
         image = "docker.io/kadalu/kadalu-csi:${var.kadalu_version}"
 
         # Nomad client config for docker plugin should have privileged set to 'true'
-        # refer https://www.nomadproject.io/docs/drivers/docker#privileged
+        # refer https://developer.hashicorp.com/nomad/docs/drivers/docker#privileged
         # Need to access '/dev/fuse' for mounting external gluster volume
         privileged = true
 
@@ -134,7 +137,7 @@ job "kadalu-csi-controller" {
         }
 
         mount {
-          # If you are not using gluster native quota comment out this stanza
+          # If you are not using gluster native quota comment out this block
           type     = "bind"
           source   = "./${NOMAD_SECRETS_DIR}/ssh-privatekey"
           target   = "/etc/secret-volume/ssh-privatekey"

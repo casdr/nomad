@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 import (
@@ -10,37 +13,10 @@ import (
 	"strconv"
 	"strings"
 
-	multierror "github.com/hashicorp/go-multierror"
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/go-set/v2"
 	"github.com/hashicorp/nomad/acl"
 	"golang.org/x/crypto/blake2b"
 )
-
-// MergeMultierrorWarnings takes job warnings and canonicalize warnings and
-// merges them into a returnable string. Both the errors may be nil.
-func MergeMultierrorWarnings(errs ...error) string {
-	if len(errs) == 0 {
-		return ""
-	}
-
-	var mErr multierror.Error
-	_ = multierror.Append(&mErr, errs...)
-	mErr.ErrorFormat = warningsFormatter
-
-	return mErr.Error()
-}
-
-// warningsFormatter is used to format job warnings
-func warningsFormatter(es []error) string {
-	sb := strings.Builder{}
-	sb.WriteString(fmt.Sprintf("%d warning(s):\n", len(es)))
-
-	for i := range es {
-		sb.WriteString(fmt.Sprintf("\n* %s", es[i]))
-	}
-
-	return sb.String()
-}
 
 // RemoveAllocs is used to remove any allocs with the given IDs
 // from the list of allocations
@@ -61,6 +37,24 @@ func RemoveAllocs(allocs []*Allocation, remove []*Allocation) []*Allocation {
 		}
 	}
 	return r
+}
+
+func AllocSubset(allocs []*Allocation, subset []*Allocation) bool {
+	if len(subset) == 0 {
+		return true
+	}
+	// Convert allocs into a map
+	allocMap := make(map[string]struct{})
+	for _, alloc := range allocs {
+		allocMap[alloc.ID] = struct{}{}
+	}
+
+	for _, alloc := range subset {
+		if _, ok := allocMap[alloc.ID]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // FilterTerminalAllocs filters out all allocations in a terminal state and
@@ -154,11 +148,11 @@ func AllocsFit(node *Node, allocs []*Allocation, netIdx *NetworkIndex, checkDevi
 	// For each alloc, add the resources
 	for _, alloc := range allocs {
 		// Do not consider the resource impact of terminal allocations
-		if alloc.TerminalStatus() {
+		if alloc.ClientTerminalStatus() {
 			continue
 		}
 
-		cr := alloc.ComparableResources()
+		cr := alloc.AllocatedResources.Comparable()
 		used.Add(cr)
 
 		// Adding the comparable resource unions reserved core sets, need to check if reserved cores overlap
@@ -177,8 +171,8 @@ func AllocsFit(node *Node, allocs []*Allocation, netIdx *NetworkIndex, checkDevi
 
 	// Check that the node resources (after subtracting reserved) are a
 	// super set of those that are being allocated
-	available := node.ComparableResources()
-	available.Subtract(node.ComparableReservedResources())
+	available := node.NodeResources.Comparable()
+	available.Subtract(node.ReservedResources.Comparable())
 	if superset, dimension := available.Superset(used); !superset {
 		return false, dimension, used, nil
 	}
@@ -188,8 +182,11 @@ func AllocsFit(node *Node, allocs []*Allocation, netIdx *NetworkIndex, checkDevi
 		netIdx = NewNetworkIndex()
 		defer netIdx.Release()
 
-		if collision, reason := netIdx.SetNode(node); collision {
-			return false, fmt.Sprintf("reserved node port collision: %v", reason), used, nil
+		if err := netIdx.SetNode(node); err != nil {
+			// To maintain backward compatibility with when SetNode
+			// returned collision+reason like AddAllocs, return
+			// this as a reason instead of an error.
+			return false, fmt.Sprintf("reserved node port collision: %v", err), used, nil
 		}
 		if collision, reason := netIdx.AddAllocs(allocs); collision {
 			return false, fmt.Sprintf("reserved alloc port collision: %v", reason), used, nil
@@ -214,9 +211,8 @@ func AllocsFit(node *Node, allocs []*Allocation, netIdx *NetworkIndex, checkDevi
 }
 
 func computeFreePercentage(node *Node, util *ComparableResources) (freePctCpu, freePctRam float64) {
-	// COMPAT(0.11): Remove in 0.11
-	reserved := node.ComparableReservedResources()
-	res := node.ComparableResources()
+	reserved := node.ReservedResources.Comparable()
+	res := node.NodeResources.Comparable()
 
 	// Determine the node availability
 	nodeCpu := float64(res.Flattened.Cpu.CpuShares)
@@ -345,41 +341,29 @@ func CopySliceNodeScoreMeta(s []*NodeScoreMeta) []*NodeScoreMeta {
 // VaultPoliciesSet takes the structure returned by VaultPolicies and returns
 // the set of required policies
 func VaultPoliciesSet(policies map[string]map[string]*Vault) []string {
-	set := make(map[string]struct{})
-
+	s := set.New[string](10)
 	for _, tgp := range policies {
 		for _, tp := range tgp {
-			for _, p := range tp.Policies {
-				set[p] = struct{}{}
+			if tp != nil {
+				s.InsertSlice(tp.Policies)
 			}
 		}
 	}
-
-	flattened := make([]string, 0, len(set))
-	for p := range set {
-		flattened = append(flattened, p)
-	}
-	return flattened
+	return s.Slice()
 }
 
 // VaultNamespaceSet takes the structure returned by VaultPolicies and
 // returns a set of required namespaces
 func VaultNamespaceSet(policies map[string]map[string]*Vault) []string {
-	set := make(map[string]struct{})
-
+	s := set.New[string](10)
 	for _, tgp := range policies {
 		for _, tp := range tgp {
-			if tp.Namespace != "" {
-				set[tp.Namespace] = struct{}{}
+			if tp != nil && tp.Namespace != "" {
+				s.Insert(tp.Namespace)
 			}
 		}
 	}
-
-	flattened := make([]string, 0, len(set))
-	for p := range set {
-		flattened = append(flattened, p)
-	}
-	return flattened
+	return s.Slice()
 }
 
 // DenormalizeAllocationJobs is used to attach a job to all allocations that are
@@ -397,7 +381,7 @@ func DenormalizeAllocationJobs(job *Job, allocs []*Allocation) {
 
 // AllocName returns the name of the allocation given the input.
 func AllocName(job, group string, idx uint) string {
-	return fmt.Sprintf("%s.%s[%d]", job, group, idx)
+	return job + "." + group + "[" + strconv.FormatUint(uint64(idx), 10) + "]"
 }
 
 // AllocSuffix returns the alloc index suffix that was added by the AllocName
@@ -426,7 +410,7 @@ func ACLPolicyListHash(policies []*ACLPolicy) string {
 }
 
 // CompileACLObject compiles a set of ACL policies into an ACL object with a cache
-func CompileACLObject(cache *lru.TwoQueueCache, policies []*ACLPolicy) (*acl.ACL, error) {
+func CompileACLObject(cache *ACLCache[*acl.ACL], policies []*ACLPolicy) (*acl.ACL, error) {
 	// Sort the policies to ensure consistent ordering
 	sort.Slice(policies, func(i, j int) bool {
 		return policies[i].Name < policies[j].Name
@@ -434,9 +418,9 @@ func CompileACLObject(cache *lru.TwoQueueCache, policies []*ACLPolicy) (*acl.ACL
 
 	// Determine the cache key
 	cacheKey := ACLPolicyListHash(policies)
-	aclRaw, ok := cache.Get(cacheKey)
+	entry, ok := cache.Get(cacheKey)
 	if ok {
-		return aclRaw.(*acl.ACL), nil
+		return entry.Get(), nil
 	}
 
 	// Parse the policies
@@ -516,6 +500,10 @@ func ParsePortRanges(spec string) ([]uint64, error) {
 				port, err := strconv.ParseUint(val, 10, 0)
 				if err != nil {
 					return nil, err
+				}
+
+				if port > MaxValidPort {
+					return nil, fmt.Errorf("port must be < %d but found %d", MaxValidPort, port)
 				}
 				ports[port] = struct{}{}
 			}

@@ -1,14 +1,16 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -16,10 +18,10 @@ import (
 	"github.com/hashicorp/nomad/ci"
 	client "github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/testutil"
-	"github.com/hashicorp/nomad/helper"
-	"github.com/hashicorp/nomad/helper/freeport"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,8 +45,6 @@ func TestConfig_Merge(t *testing.T) {
 		Ports:          &Ports{},
 		Addresses:      &Addresses{},
 		AdvertiseAddrs: &AdvertiseAddrs{},
-		Vault:          &config.VaultConfig{},
-		Consul:         &config.ConsulConfig{},
 		Sentinel:       &config.SentinelConfig{},
 		Autopilot:      &config.AutopilotConfig{},
 	}
@@ -56,13 +56,14 @@ func TestConfig_Merge(t *testing.T) {
 		DataDir:                   "/tmp/dir1",
 		PluginDir:                 "/tmp/pluginDir1",
 		LogLevel:                  "INFO",
+		LogIncludeLocation:        false,
 		LogJson:                   false,
 		EnableDebug:               false,
 		LeaveOnInt:                false,
 		LeaveOnTerm:               false,
 		EnableSyslog:              false,
 		SyslogFacility:            "local0.info",
-		DisableUpdateCheck:        helper.BoolToPtr(false),
+		DisableUpdateCheck:        pointer.Of(false),
 		DisableAnonymousSignature: false,
 		BindAddr:                  "127.0.0.1",
 		Telemetry: &Telemetry{
@@ -88,7 +89,7 @@ func TestConfig_Merge(t *testing.T) {
 			PrefixFilter:                       []string{"filter1", "filter2"},
 		},
 		Audit: &config.AuditConfig{
-			Enabled: helper.BoolToPtr(true),
+			Enabled: pointer.Of(true),
 			Sinks: []*config.AuditSink{
 				{
 					DeliveryGuarantee: "enforced",
@@ -108,6 +109,7 @@ func TestConfig_Merge(t *testing.T) {
 			StateDir:  "/tmp/state1",
 			AllocDir:  "/tmp/alloc1",
 			NodeClass: "class1",
+			NodePool:  "dev",
 			Options: map[string]string{
 				"foo": "bar",
 			},
@@ -120,7 +122,7 @@ func TestConfig_Merge(t *testing.T) {
 			ClientMaxPort:     19996,
 			DisableRemoteExec: false,
 			TemplateConfig: &client.ClientTemplateConfig{
-				FunctionDenylist: []string{"plugin"},
+				FunctionDenylist: client.DefaultTemplateFunctionDenylist,
 				DisableSandbox:   false,
 			},
 			Reserved: &Resources{
@@ -129,6 +131,7 @@ func TestConfig_Merge(t *testing.T) {
 				DiskMB:        10,
 				ReservedPorts: "1,10-30,55",
 			},
+			NomadServiceDiscovery: pointer.Of(false),
 		},
 		Server: &ServerConfig{
 			Enabled:                false,
@@ -137,22 +140,35 @@ func TestConfig_Merge(t *testing.T) {
 			DataDir:                "/tmp/data1",
 			ProtocolVersion:        1,
 			RaftProtocol:           1,
-			RaftMultiplier:         helper.IntToPtr(5),
-			NumSchedulers:          helper.IntToPtr(1),
+			RaftMultiplier:         pointer.Of(5),
+			RaftSnapshotThreshold:  pointer.Of(100),
+			RaftSnapshotInterval:   pointer.Of("30m"),
+			RaftTrailingLogs:       pointer.Of(200),
+			NumSchedulers:          pointer.Of(1),
 			NodeGCThreshold:        "1h",
+			BatchEvalGCThreshold:   "4h",
 			HeartbeatGrace:         30 * time.Second,
 			MinHeartbeatTTL:        30 * time.Second,
 			MaxHeartbeatsPerSecond: 30.0,
 			RedundancyZone:         "foo",
 			UpgradeVersion:         "foo",
-			EnableEventBroker:      helper.BoolToPtr(false),
-			EventBufferSize:        helper.IntToPtr(0),
+			EnableEventBroker:      pointer.Of(false),
+			EventBufferSize:        pointer.Of(0),
+			PlanRejectionTracker: &PlanRejectionTracker{
+				Enabled:       pointer.Of(true),
+				NodeThreshold: 100,
+				NodeWindow:    11 * time.Minute,
+			},
+			OIDCIssuer: "https://oidc.test.nomadproject.io",
 		},
 		ACL: &ACLConfig{
-			Enabled:          true,
-			TokenTTL:         60 * time.Second,
-			PolicyTTL:        60 * time.Second,
-			ReplicationToken: "foo",
+			Enabled:               true,
+			TokenTTL:              60 * time.Second,
+			PolicyTTL:             60 * time.Second,
+			RoleTTL:               60 * time.Second,
+			TokenMinExpirationTTL: 60 * time.Second,
+			TokenMaxExpirationTTL: 60 * time.Second,
+			ReplicationToken:      "foo",
 		},
 		Ports: &Ports{
 			HTTP: 4646,
@@ -171,7 +187,8 @@ func TestConfig_Merge(t *testing.T) {
 		HTTPAPIResponseHeaders: map[string]string{
 			"Access-Control-Allow-Origin": "*",
 		},
-		Vault: &config.VaultConfig{
+		Vaults: []*config.VaultConfig{{
+			Name:                 structs.VaultDefaultCluster,
 			Token:                "1",
 			AllowUnauthenticated: &falseValue,
 			TaskTokenTTL:         "1",
@@ -182,8 +199,8 @@ func TestConfig_Merge(t *testing.T) {
 			TLSKeyFile:           "1",
 			TLSSkipVerify:        &falseValue,
 			TLSServerName:        "1",
-		},
-		Consul: &config.ConsulConfig{
+		}},
+		Consuls: []*config.ConsulConfig{{
 			ServerServiceName:    "1",
 			ClientServiceName:    "1",
 			AutoAdvertise:        &falseValue,
@@ -200,7 +217,7 @@ func TestConfig_Merge(t *testing.T) {
 			ServerAutoJoin:       &falseValue,
 			ClientAutoJoin:       &falseValue,
 			ChecksUseAdvertise:   &falseValue,
-		},
+		}},
 		Autopilot: &config.AutopilotConfig{
 			CleanupDeadServers:      &falseValue,
 			ServerStabilizationTime: 1 * time.Second,
@@ -229,17 +246,18 @@ func TestConfig_Merge(t *testing.T) {
 		DataDir:                   "/tmp/dir2",
 		PluginDir:                 "/tmp/pluginDir2",
 		LogLevel:                  "DEBUG",
+		LogIncludeLocation:        true,
 		LogJson:                   true,
 		EnableDebug:               true,
 		LeaveOnInt:                true,
 		LeaveOnTerm:               true,
 		EnableSyslog:              true,
 		SyslogFacility:            "local0.debug",
-		DisableUpdateCheck:        helper.BoolToPtr(true),
+		DisableUpdateCheck:        pointer.Of(true),
 		DisableAnonymousSignature: true,
 		BindAddr:                  "127.0.0.2",
 		Audit: &config.AuditConfig{
-			Enabled: helper.BoolToPtr(true),
+			Enabled: pointer.Of(true),
 			Sinks: []*config.AuditSink{
 				{
 					DeliveryGuarantee: "enforced",
@@ -278,13 +296,15 @@ func TestConfig_Merge(t *testing.T) {
 			CirconusBrokerSelectTag:            "dc:dc2",
 			PrefixFilter:                       []string{"prefix1", "prefix2"},
 			DisableDispatchedJobSummaryMetrics: true,
-			FilterDefault:                      helper.BoolToPtr(false),
+			DisableRPCRateMetricsLabels:        true,
+			FilterDefault:                      pointer.Of(false),
 		},
 		Client: &ClientConfig{
 			Enabled:   true,
 			StateDir:  "/tmp/state2",
 			AllocDir:  "/tmp/alloc2",
 			NodeClass: "class2",
+			NodePool:  "dev",
 			Servers:   []string{"server2"},
 			Meta: map[string]string{
 				"baz": "zip",
@@ -304,8 +324,17 @@ func TestConfig_Merge(t *testing.T) {
 			MaxKillTimeout:    "50s",
 			DisableRemoteExec: false,
 			TemplateConfig: &client.ClientTemplateConfig{
-				FunctionDenylist: []string{"plugin"},
-				DisableSandbox:   false,
+				FunctionDenylist:   client.DefaultTemplateFunctionDenylist,
+				DisableSandbox:     false,
+				BlockQueryWaitTime: pointer.Of(5 * time.Minute),
+				MaxStale:           pointer.Of(client.DefaultTemplateMaxStale),
+				Wait: &client.WaitConfig{
+					Min: pointer.Of(5 * time.Second),
+					Max: pointer.Of(4 * time.Minute),
+				},
+				ConsulRetry: &client.RetryConfig{Attempts: pointer.Of(0)},
+				VaultRetry:  &client.RetryConfig{Attempts: pointer.Of(0)},
+				NomadRetry:  &client.RetryConfig{Attempts: pointer.Of(0)},
 			},
 			Reserved: &Resources{
 				CPU:           15,
@@ -317,6 +346,7 @@ func TestConfig_Merge(t *testing.T) {
 			GCParallelDestroys:    6,
 			GCDiskUsageThreshold:  71,
 			GCInodeUsageThreshold: 86,
+			NomadServiceDiscovery: pointer.Of(false),
 		},
 		Server: &ServerConfig{
 			Enabled:                true,
@@ -325,10 +355,14 @@ func TestConfig_Merge(t *testing.T) {
 			DataDir:                "/tmp/data2",
 			ProtocolVersion:        2,
 			RaftProtocol:           2,
-			RaftMultiplier:         helper.IntToPtr(6),
-			NumSchedulers:          helper.IntToPtr(2),
+			RaftMultiplier:         pointer.Of(6),
+			RaftSnapshotThreshold:  pointer.Of(100),
+			RaftSnapshotInterval:   pointer.Of("30m"),
+			RaftTrailingLogs:       pointer.Of(200),
+			NumSchedulers:          pointer.Of(2),
 			EnabledSchedulers:      []string{structs.JobTypeBatch},
 			NodeGCThreshold:        "12h",
+			BatchEvalGCThreshold:   "4h",
 			HeartbeatGrace:         2 * time.Minute,
 			MinHeartbeatTTL:        2 * time.Minute,
 			MaxHeartbeatsPerSecond: 200.0,
@@ -339,14 +373,25 @@ func TestConfig_Merge(t *testing.T) {
 			NonVotingServer:        true,
 			RedundancyZone:         "bar",
 			UpgradeVersion:         "bar",
-			EnableEventBroker:      helper.BoolToPtr(true),
-			EventBufferSize:        helper.IntToPtr(100),
+			EnableEventBroker:      pointer.Of(true),
+			EventBufferSize:        pointer.Of(100),
+			PlanRejectionTracker: &PlanRejectionTracker{
+				Enabled:       pointer.Of(true),
+				NodeThreshold: 100,
+				NodeWindow:    11 * time.Minute,
+			},
+			JobMaxPriority:     pointer.Of(200),
+			JobDefaultPriority: pointer.Of(100),
+			OIDCIssuer:         "https://oidc.test.nomadproject.io",
 		},
 		ACL: &ACLConfig{
-			Enabled:          true,
-			TokenTTL:         20 * time.Second,
-			PolicyTTL:        20 * time.Second,
-			ReplicationToken: "foobar",
+			Enabled:               true,
+			TokenTTL:              20 * time.Second,
+			PolicyTTL:             20 * time.Second,
+			RoleTTL:               20 * time.Second,
+			TokenMinExpirationTTL: 20 * time.Second,
+			TokenMaxExpirationTTL: 20 * time.Second,
+			ReplicationToken:      "foobar",
 		},
 		Ports: &Ports{
 			HTTP: 20000,
@@ -366,7 +411,8 @@ func TestConfig_Merge(t *testing.T) {
 			"Access-Control-Allow-Origin":  "*",
 			"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 		},
-		Vault: &config.VaultConfig{
+		Vaults: []*config.VaultConfig{{
+			Name:                 structs.VaultDefaultCluster,
 			Token:                "2",
 			AllowUnauthenticated: &trueValue,
 			TaskTokenTTL:         "2",
@@ -377,25 +423,34 @@ func TestConfig_Merge(t *testing.T) {
 			TLSKeyFile:           "2",
 			TLSSkipVerify:        &trueValue,
 			TLSServerName:        "2",
-		},
-		Consul: &config.ConsulConfig{
-			ServerServiceName:    "2",
-			ClientServiceName:    "2",
-			AutoAdvertise:        &trueValue,
-			Addr:                 "2",
-			AllowUnauthenticated: &trueValue,
-			Timeout:              2 * time.Second,
-			Token:                "2",
-			Auth:                 "2",
-			EnableSSL:            &trueValue,
-			VerifySSL:            &trueValue,
-			CAFile:               "2",
-			CertFile:             "2",
-			KeyFile:              "2",
-			ServerAutoJoin:       &trueValue,
-			ClientAutoJoin:       &trueValue,
-			ChecksUseAdvertise:   &trueValue,
-		},
+			ConnectionRetryIntv:  time.Duration(30000000000),
+			JWTAuthBackendPath:   "jwt",
+		}},
+		Consuls: []*config.ConsulConfig{{
+			Name:                      "default",
+			ServerServiceName:         "2",
+			ClientServiceName:         "2",
+			AutoAdvertise:             &trueValue,
+			Addr:                      "2",
+			AllowUnauthenticated:      &trueValue,
+			Timeout:                   2 * time.Second,
+			Token:                     "2",
+			Auth:                      "2",
+			EnableSSL:                 &trueValue,
+			VerifySSL:                 &trueValue,
+			CAFile:                    "2",
+			CertFile:                  "2",
+			KeyFile:                   "2",
+			ServerAutoJoin:            &trueValue,
+			ClientAutoJoin:            &trueValue,
+			ChecksUseAdvertise:        &trueValue,
+			ServerHTTPCheckName:       "Nomad Server HTTP Check",
+			ServerSerfCheckName:       "Nomad Server Serf Check",
+			ServerRPCCheckName:        "Nomad Server RPC Check",
+			ClientHTTPCheckName:       "Nomad Client HTTP Check",
+			ServiceIdentityAuthMethod: structs.ConsulWorkloadsDefaultAuthMethodName,
+			TaskIdentityAuthMethod:    structs.ConsulWorkloadsDefaultAuthMethodName,
+		}},
 		Sentinel: &config.SentinelConfig{
 			Imports: []*config.SentinelImport{
 				{
@@ -431,12 +486,19 @@ func TestConfig_Merge(t *testing.T) {
 				},
 			},
 		},
+		Reporting: &config.ReportingConfig{
+			License: &config.LicenseReportingConfig{
+				Enabled: pointer.Of(true),
+			},
+		},
 	}
 
 	result := c0.Merge(c1)
 	result = result.Merge(c2)
 	result = result.Merge(c3)
-	require.Equal(t, c3, result)
+	expected := c3.Copy()
+
+	must.Eq(t, expected, result)
 }
 
 func TestConfig_ParseConfigFile(t *testing.T) {
@@ -447,7 +509,7 @@ func TestConfig_ParseConfigFile(t *testing.T) {
 		t.Fatalf("expected error, got nothing")
 	}
 
-	fh, err := ioutil.TempFile("", "nomad")
+	fh, err := os.CreateTemp("", "nomad")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -489,11 +551,7 @@ func TestConfig_LoadConfigDir(t *testing.T) {
 		t.Fatalf("expected error, got nothing")
 	}
 
-	dir, err := ioutil.TempDir("", "nomad")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// Returns empty config on empty dir
 	config, err := LoadConfig(dir)
@@ -505,19 +563,19 @@ func TestConfig_LoadConfigDir(t *testing.T) {
 	}
 
 	file1 := filepath.Join(dir, "conf1.hcl")
-	err = ioutil.WriteFile(file1, []byte(`{"region":"west"}`), 0600)
+	err = os.WriteFile(file1, []byte(`{"region":"west"}`), 0600)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
 	file2 := filepath.Join(dir, "conf2.hcl")
-	err = ioutil.WriteFile(file2, []byte(`{"datacenter":"sfo"}`), 0600)
+	err = os.WriteFile(file2, []byte(`{"datacenter":"sfo"}`), 0600)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
 	file3 := filepath.Join(dir, "conf3.hcl")
-	err = ioutil.WriteFile(file3, []byte(`nope;!!!`), 0600)
+	err = os.WriteFile(file3, []byte(`nope;!!!`), 0600)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -549,7 +607,7 @@ func TestConfig_LoadConfig(t *testing.T) {
 		t.Fatalf("expected error, got nothing")
 	}
 
-	fh, err := ioutil.TempFile("", "nomad")
+	fh, err := os.CreateTemp("", "nomad")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -574,14 +632,10 @@ func TestConfig_LoadConfig(t *testing.T) {
 			expectedConfigFiles, config.Files)
 	}
 
-	dir, err := ioutil.TempDir("", "nomad")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	file1 := filepath.Join(dir, "config1.hcl")
-	err = ioutil.WriteFile(file1, []byte(`{"datacenter":"sfo"}`), 0600)
+	err = os.WriteFile(file1, []byte(`{"datacenter":"sfo"}`), 0600)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -650,8 +704,7 @@ func TestConfig_Listener(t *testing.T) {
 	}
 
 	// Works with valid inputs
-	ports := freeport.MustTake(2)
-	defer freeport.Return(ports)
+	ports := ci.PortAllocator.Grab(2)
 
 	ln, err := config.Listener("tcp", "127.0.0.1", ports[0])
 	if err != nil {
@@ -681,59 +734,61 @@ func TestConfig_Listener(t *testing.T) {
 	}
 }
 
-func TestConfig_DevModeFlag(t *testing.T) {
+func TestConfig_DevMode_validate(t *testing.T) {
 	ci.Parallel(t)
 
 	cases := []struct {
-		dev         bool
-		connect     bool
-		expected    *devModeConfig
+		devConfig   *devModeConfig
 		expectedErr string
 	}{}
 	if runtime.GOOS != "linux" {
 		cases = []struct {
-			dev         bool
-			connect     bool
-			expected    *devModeConfig
+			devConfig   *devModeConfig
 			expectedErr string
 		}{
-			{false, false, nil, ""},
-			{true, false, &devModeConfig{defaultMode: true, connectMode: false}, ""},
-			{true, true, nil, "-dev-connect is only supported on linux"},
-			{false, true, nil, "-dev-connect is only supported on linux"},
+			{
+				devConfig: &devModeConfig{
+					connectMode: true,
+				},
+				expectedErr: "-dev-connect is only supported on linux",
+			},
+			{
+				devConfig: &devModeConfig{
+					defaultMode: true,
+					connectMode: true,
+				},
+				expectedErr: "-dev-connect is only supported on linux",
+			},
 		}
 	}
 	if runtime.GOOS == "linux" {
 		testutil.RequireRoot(t)
 		cases = []struct {
-			dev         bool
-			connect     bool
-			expected    *devModeConfig
+			devConfig   *devModeConfig
 			expectedErr string
 		}{
-			{false, false, nil, ""},
-			{true, false, &devModeConfig{defaultMode: true, connectMode: false}, ""},
-			{true, true, &devModeConfig{defaultMode: true, connectMode: true}, ""},
-			{false, true, &devModeConfig{defaultMode: false, connectMode: true}, ""},
+			{
+				devConfig: &devModeConfig{
+					connectMode: true,
+				},
+				expectedErr: "",
+			},
+			{
+				devConfig: &devModeConfig{
+					defaultMode: true,
+					connectMode: true,
+				},
+				expectedErr: "",
+			},
 		}
 	}
 	for _, c := range cases {
 		t.Run("", func(t *testing.T) {
-			mode, err := newDevModeConfig(c.dev, c.connect)
-			if err != nil && c.expectedErr == "" {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if err != nil && !strings.Contains(err.Error(), c.expectedErr) {
-				t.Fatalf("expected %s; got %v", c.expectedErr, err)
-			}
-			if mode == nil && c.expected != nil {
-				t.Fatalf("expected %+v but got nil", c.expected)
-			}
-			if mode != nil {
-				if c.expected.defaultMode != mode.defaultMode ||
-					c.expected.connectMode != mode.connectMode {
-					t.Fatalf("expected %+v, got %+v", c.expected, mode)
-				}
+			err := c.devConfig.validate()
+			if c.expectedErr != "" {
+				must.Error(t, err)
+			} else {
+				must.NoError(t, err)
 			}
 		})
 	}
@@ -1122,7 +1177,7 @@ func TestConfig_templateNetworkInterface(t *testing.T) {
 		{
 			name: "insignificant whitespace",
 			clientConfig: &ClientConfig{
-				Enabled: true,
+				Enabled:          true,
 				NetworkInterface: `		{{GetAllInterfaces | attr "name" }}`,
 			},
 			expectedInterface: iface.Name,
@@ -1331,19 +1386,75 @@ func TestTelemetry_PrefixFilters(t *testing.T) {
 	}
 }
 
+func TestTelemetry_Validate(t *testing.T) {
+	ci.Parallel(t)
+
+	testCases := []struct {
+		name           string
+		inputTelemetry *Telemetry
+		expectedError  error
+	}{
+		{
+			name:           "nil",
+			inputTelemetry: nil,
+			expectedError:  nil,
+		},
+		{
+			name: "invalid",
+			inputTelemetry: &Telemetry{
+				inMemoryCollectionInterval: 10 * time.Second,
+				inMemoryRetentionPeriod:    1 * time.Second,
+			},
+			expectedError: errors.New("telemetry in-memory collection interval cannot be greater than retention period"),
+		},
+		{
+			name: "valid",
+			inputTelemetry: &Telemetry{
+				inMemoryCollectionInterval: 1 * time.Second,
+				inMemoryRetentionPeriod:    10 * time.Second,
+			},
+			expectedError: nil,
+		},
+		{
+			name: "missing in-memory interval",
+			inputTelemetry: &Telemetry{
+				inMemoryRetentionPeriod: 10 * time.Second,
+			},
+			expectedError: errors.New("telemetry in-memory collection interval must be greater than zero"),
+		},
+		{
+			name: "missing in-memory collection",
+			inputTelemetry: &Telemetry{
+				inMemoryCollectionInterval: 10 * time.Second,
+			},
+			expectedError: errors.New("telemetry in-memory retention period must be greater than zero"),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actualError := tc.inputTelemetry.Validate()
+			if tc.expectedError != nil {
+				must.EqError(t, actualError, tc.expectedError.Error())
+			} else {
+				must.NoError(t, actualError)
+			}
+		})
+	}
+}
+
 func TestTelemetry_Parse(t *testing.T) {
 	ci.Parallel(t)
 
 	require := require.New(t)
-	dir, err := ioutil.TempDir("", "nomad")
-	require.NoError(err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	file1 := filepath.Join(dir, "config1.hcl")
-	err = ioutil.WriteFile(file1, []byte(`telemetry{
+	err := os.WriteFile(file1, []byte(`telemetry{
 		prefix_filter = ["+nomad.raft"]
 		filter_default = false
 		disable_dispatched_job_summary_metrics = true
+		disable_rpc_rate_metrics_labels = true
 	}`), 0600)
 	require.NoError(err)
 
@@ -1354,6 +1465,7 @@ func TestTelemetry_Parse(t *testing.T) {
 	require.False(*config.Telemetry.FilterDefault)
 	require.Exactly([]string{"+nomad.raft"}, config.Telemetry.PrefixFilter)
 	require.True(config.Telemetry.DisableDispatchedJobSummaryMetrics)
+	require.True(config.Telemetry.DisableRPCRateMetricsLabels)
 }
 
 func TestEventBroker_Parse(t *testing.T) {
@@ -1362,8 +1474,8 @@ func TestEventBroker_Parse(t *testing.T) {
 	require := require.New(t)
 	{
 		a := &ServerConfig{
-			EnableEventBroker: helper.BoolToPtr(false),
-			EventBufferSize:   helper.IntToPtr(0),
+			EnableEventBroker: pointer.Of(false),
+			EventBufferSize:   pointer.Of(0),
 		}
 		b := DefaultConfig().Server
 		b.EnableEventBroker = nil
@@ -1376,8 +1488,8 @@ func TestEventBroker_Parse(t *testing.T) {
 
 	{
 		a := &ServerConfig{
-			EnableEventBroker: helper.BoolToPtr(true),
-			EventBufferSize:   helper.IntToPtr(5000),
+			EnableEventBroker: pointer.Of(true),
+			EventBufferSize:   pointer.Of(5000),
 		}
 		b := DefaultConfig().Server
 		b.EnableEventBroker = nil
@@ -1390,12 +1502,12 @@ func TestEventBroker_Parse(t *testing.T) {
 
 	{
 		a := &ServerConfig{
-			EnableEventBroker: helper.BoolToPtr(false),
-			EventBufferSize:   helper.IntToPtr(0),
+			EnableEventBroker: pointer.Of(false),
+			EventBufferSize:   pointer.Of(0),
 		}
 		b := DefaultConfig().Server
-		b.EnableEventBroker = helper.BoolToPtr(true)
-		b.EventBufferSize = helper.IntToPtr(20000)
+		b.EnableEventBroker = pointer.Of(true)
+		b.EventBufferSize = pointer.Of(20000)
 
 		result := a.Merge(b)
 		require.Equal(true, *result.EnableEventBroker)
@@ -1406,87 +1518,196 @@ func TestEventBroker_Parse(t *testing.T) {
 func TestConfig_LoadConsulTemplateConfig(t *testing.T) {
 	ci.Parallel(t)
 
-	defaultConfig := DefaultConfig()
-	// Test that loading without template config didn't create load errors
-	agentConfig, err := LoadConfig("test-resources/minimal_client.hcl")
-	require.NoError(t, err)
+	t.Run("minimal client expect defaults", func(t *testing.T) {
+		defaultConfig := DefaultConfig()
+		agentConfig, err := LoadConfig("test-resources/minimal_client.hcl")
+		must.NoError(t, err)
+		agentConfig = defaultConfig.Merge(agentConfig)
+		must.Eq(t, defaultConfig.Client.TemplateConfig, agentConfig.Client.TemplateConfig)
+	})
 
-	// Test loading with this config didn't create load errors
-	agentConfig, err = LoadConfig("test-resources/client_with_template.hcl")
-	require.NoError(t, err)
+	t.Run("client config with nil function denylist", func(t *testing.T) {
+		defaultConfig := DefaultConfig()
+		agentConfig, err := LoadConfig("test-resources/client_with_function_denylist_nil.hcl")
+		must.NoError(t, err)
+		agentConfig = defaultConfig.Merge(agentConfig)
 
-	agentConfig = defaultConfig.Merge(agentConfig)
+		templateConfig := agentConfig.Client.TemplateConfig
+		must.Len(t, 2, templateConfig.FunctionDenylist)
+	})
 
-	clientAgent := Agent{config: agentConfig}
-	clientConfig, err := clientAgent.clientConfig()
-	require.NoError(t, err)
+	t.Run("client config with basic template", func(t *testing.T) {
+		defaultConfig := DefaultConfig()
+		agentConfig, err := LoadConfig("test-resources/client_with_basic_template.hcl")
+		must.NoError(t, err)
+		agentConfig = defaultConfig.Merge(agentConfig)
 
-	templateConfig := clientConfig.TemplateConfig
+		templateConfig := agentConfig.Client.TemplateConfig
 
-	// Make sure all fields to test are set
-	require.NotNil(t, templateConfig.BlockQueryWaitTime)
-	require.NotNil(t, templateConfig.MaxStale)
-	require.NotNil(t, templateConfig.Wait)
-	require.NotNil(t, templateConfig.WaitBounds)
-	require.NotNil(t, templateConfig.ConsulRetry)
-	require.NotNil(t, templateConfig.VaultRetry)
+		// check explicit overrides
+		must.Eq(t, true, templateConfig.DisableSandbox)
+		must.Len(t, 0, templateConfig.FunctionDenylist)
 
-	// Direct properties
-	require.Equal(t, 300*time.Second, *templateConfig.MaxStale)
-	require.Equal(t, 90*time.Second, *templateConfig.BlockQueryWaitTime)
-	// Wait
-	require.Equal(t, 2*time.Second, *templateConfig.Wait.Min)
-	require.Equal(t, 60*time.Second, *templateConfig.Wait.Max)
-	// WaitBounds
-	require.Equal(t, 2*time.Second, *templateConfig.WaitBounds.Min)
-	require.Equal(t, 60*time.Second, *templateConfig.WaitBounds.Max)
-	// Consul Retry
-	require.NotNil(t, templateConfig.ConsulRetry)
-	require.Equal(t, 5, *templateConfig.ConsulRetry.Attempts)
-	require.Equal(t, 5*time.Second, *templateConfig.ConsulRetry.Backoff)
-	require.Equal(t, 10*time.Second, *templateConfig.ConsulRetry.MaxBackoff)
-	// Vault Retry
-	require.NotNil(t, templateConfig.VaultRetry)
-	require.Equal(t, 10, *templateConfig.VaultRetry.Attempts)
-	require.Equal(t, 15*time.Second, *templateConfig.VaultRetry.Backoff)
-	require.Equal(t, 20*time.Second, *templateConfig.VaultRetry.MaxBackoff)
+		// check all the complex defaults
+		must.Eq(t, 87600*time.Hour, *templateConfig.MaxStale)
+		must.Eq(t, 5*time.Minute, *templateConfig.BlockQueryWaitTime)
+
+		// Wait
+		must.NotNil(t, templateConfig.Wait)
+		must.Eq(t, 5*time.Second, *templateConfig.Wait.Min)
+		must.Eq(t, 4*time.Minute, *templateConfig.Wait.Max)
+
+		// WaitBounds
+		must.Nil(t, templateConfig.WaitBounds)
+
+		// Consul Retry
+		must.NotNil(t, templateConfig.ConsulRetry)
+		must.Eq(t, 0, *templateConfig.ConsulRetry.Attempts)
+		must.Nil(t, templateConfig.ConsulRetry.Backoff)
+		must.Nil(t, templateConfig.ConsulRetry.MaxBackoff)
+
+		// Vault Retry
+		must.NotNil(t, templateConfig.VaultRetry)
+		must.Eq(t, 0, *templateConfig.VaultRetry.Attempts)
+		must.Nil(t, templateConfig.VaultRetry.Backoff)
+		must.Nil(t, templateConfig.VaultRetry.MaxBackoff)
+
+		// Nomad Retry
+		must.NotNil(t, templateConfig.NomadRetry)
+		must.Eq(t, 0, *templateConfig.NomadRetry.Attempts)
+		must.Nil(t, templateConfig.NomadRetry.Backoff)
+		must.Nil(t, templateConfig.NomadRetry.MaxBackoff)
+	})
+
+	t.Run("client config with full template block", func(t *testing.T) {
+		defaultConfig := DefaultConfig()
+
+		agentConfig, err := LoadConfig("test-resources/client_with_template.hcl")
+		must.NoError(t, err)
+
+		agentConfig = defaultConfig.Merge(agentConfig)
+
+		clientAgent := Agent{config: agentConfig}
+		clientConfig, err := clientAgent.clientConfig()
+		must.NoError(t, err)
+
+		templateConfig := clientConfig.TemplateConfig
+
+		// Make sure all fields to test are set
+		must.NotNil(t, templateConfig.BlockQueryWaitTime)
+		must.NotNil(t, templateConfig.MaxStale)
+		must.NotNil(t, templateConfig.Wait)
+		must.NotNil(t, templateConfig.WaitBounds)
+		must.NotNil(t, templateConfig.ConsulRetry)
+		must.NotNil(t, templateConfig.VaultRetry)
+		must.NotNil(t, templateConfig.NomadRetry)
+
+		// Direct properties
+		must.Eq(t, 300*time.Second, *templateConfig.MaxStale)
+		must.Eq(t, 90*time.Second, *templateConfig.BlockQueryWaitTime)
+
+		// Wait
+		must.Eq(t, 2*time.Second, *templateConfig.Wait.Min)
+		must.Eq(t, 60*time.Second, *templateConfig.Wait.Max)
+
+		// WaitBounds
+		must.Eq(t, 2*time.Second, *templateConfig.WaitBounds.Min)
+		must.Eq(t, 60*time.Second, *templateConfig.WaitBounds.Max)
+
+		// Consul Retry
+		must.NotNil(t, templateConfig.ConsulRetry)
+		must.Eq(t, 5, *templateConfig.ConsulRetry.Attempts)
+		must.Eq(t, 5*time.Second, *templateConfig.ConsulRetry.Backoff)
+		must.Eq(t, 10*time.Second, *templateConfig.ConsulRetry.MaxBackoff)
+
+		// Vault Retry
+		must.NotNil(t, templateConfig.VaultRetry)
+		must.Eq(t, 10, *templateConfig.VaultRetry.Attempts)
+		must.Eq(t, 15*time.Second, *templateConfig.VaultRetry.Backoff)
+		must.Eq(t, 20*time.Second, *templateConfig.VaultRetry.MaxBackoff)
+
+		// Nomad Retry
+		must.NotNil(t, templateConfig.NomadRetry)
+		must.Eq(t, 15, *templateConfig.NomadRetry.Attempts)
+		must.Eq(t, 20*time.Second, *templateConfig.NomadRetry.Backoff)
+		must.Eq(t, 25*time.Second, *templateConfig.NomadRetry.MaxBackoff)
+	})
+
 }
 
-func TestConfig_LoadConsulTemplateBasic(t *testing.T) {
-	ci.Parallel(t)
+func TestConfig_LoadConsulTemplate_FunctionDenylist(t *testing.T) {
+	cases := []struct {
+		File     string
+		Expected *client.ClientTemplateConfig
+	}{
+		{
+			"test-resources/minimal_client.hcl",
+			nil,
+		},
+		{
+			"test-resources/client_with_basic_template.json",
+			&client.ClientTemplateConfig{
+				DisableSandbox:   true,
+				FunctionDenylist: []string{},
+			},
+		},
+		{
+			"test-resources/client_with_basic_template.hcl",
+			&client.ClientTemplateConfig{
+				DisableSandbox:   true,
+				FunctionDenylist: []string{},
+			},
+		},
+		{
+			"test-resources/client_with_function_denylist.hcl",
+			&client.ClientTemplateConfig{
+				DisableSandbox:   false,
+				FunctionDenylist: []string{"foo"},
+			},
+		},
+		{
+			"test-resources/client_with_function_denylist_empty.hcl",
+			&client.ClientTemplateConfig{
+				DisableSandbox:   false,
+				FunctionDenylist: []string{},
+			},
+		},
+		{
+			"test-resources/client_with_function_denylist_empty_string.hcl",
+			&client.ClientTemplateConfig{
+				DisableSandbox:   true,
+				FunctionDenylist: []string{""},
+			},
+		},
+		{
+			"test-resources/client_with_function_denylist_empty_string.json",
+			&client.ClientTemplateConfig{
+				DisableSandbox:   true,
+				FunctionDenylist: []string{""},
+			},
+		},
+		{
+			"test-resources/client_with_function_denylist_nil.hcl",
+			&client.ClientTemplateConfig{
+				DisableSandbox: true,
+			},
+		},
+		{
+			"test-resources/client_with_empty_template.hcl",
+			nil,
+		},
+	}
 
-	defaultConfig := DefaultConfig()
+	for _, tc := range cases {
+		t.Run(tc.File, func(t *testing.T) {
+			agentConfig, err := LoadConfig(tc.File)
 
-	// hcl
-	agentConfig, err := LoadConfig("test-resources/client_with_basic_template.hcl")
-	require.NoError(t, err)
-	require.NotNil(t, agentConfig.Client.TemplateConfig)
+			require.NoError(t, err)
 
-	agentConfig = defaultConfig.Merge(agentConfig)
-
-	clientAgent := Agent{config: agentConfig}
-	clientConfig, err := clientAgent.clientConfig()
-	require.NoError(t, err)
-
-	templateConfig := clientConfig.TemplateConfig
-	require.NotNil(t, templateConfig)
-	require.True(t, templateConfig.DisableSandbox)
-	require.Len(t, templateConfig.FunctionDenylist, 1)
-
-	// json
-	agentConfig, err = LoadConfig("test-resources/client_with_basic_template.json")
-	require.NoError(t, err)
-
-	agentConfig = defaultConfig.Merge(agentConfig)
-
-	clientAgent = Agent{config: agentConfig}
-	clientConfig, err = clientAgent.clientConfig()
-	require.NoError(t, err)
-
-	templateConfig = clientConfig.TemplateConfig
-	require.NotNil(t, templateConfig)
-	require.True(t, templateConfig.DisableSandbox)
-	require.Len(t, templateConfig.FunctionDenylist, 1)
+			templateConfig := agentConfig.Client.TemplateConfig
+			require.Equal(t, tc.Expected, templateConfig)
+		})
+	}
 }
 
 func TestParseMultipleIPTemplates(t *testing.T) {

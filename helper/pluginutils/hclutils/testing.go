@@ -1,9 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package hclutils
 
 import (
 	"testing"
 
-	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/hashicorp/nomad/helper/pluginutils/hclspecutils"
@@ -40,12 +43,8 @@ func (b *HCLParser) WithVars(vars map[string]cty.Value) *HCLParser {
 // out parameter should be a golang reference to a driver specific TaskConfig reference.
 // The function terminates and reports errors if any is found during conversion.
 //
-// Sample invocation would be
-//
-// ```
-// var tc *TaskConfig
-// hclutils.NewConfigParser(spec).ParseJson(t, configString, &tc)
-// ```
+//	var tc *TaskConfig
+//	hclutils.NewConfigParser(spec).ParseJson(t, configString, &tc)
 func (b *HCLParser) ParseJson(t *testing.T, configStr string, out interface{}) {
 	config := JsonConfigToInterface(t, configStr)
 	b.parse(t, config, out)
@@ -55,7 +54,7 @@ func (b *HCLParser) ParseJson(t *testing.T, configStr string, out interface{}) {
 // out parameter should be a golang reference to a driver specific TaskConfig reference.
 // The function terminates and reports errors if any is found during conversion.
 //
-// Sample invocation would be
+// # Sample invocation would be
 //
 // ```
 // var tc *TaskConfig

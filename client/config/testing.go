@@ -1,11 +1,17 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package config
 
 import (
-	"io/ioutil"
+	"context"
+	"net"
 	"os"
 	"path/filepath"
+	"time"
 
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/mock"
 	testing "github.com/mitchellh/go-testing-interface"
@@ -29,12 +35,17 @@ func TestClientConfig(t testing.T) (*Config, func()) {
 	tmpDir = filepath.Clean(tmpDir)
 
 	// Create a tempdir to hold state and alloc subdirs
-	parent, err := ioutil.TempDir(tmpDir, "nomadtest")
+	parent, err := os.MkdirTemp(tmpDir, "nomadtest")
 	if err != nil {
 		t.Fatalf("error creating client dir: %v", err)
 	}
 	cleanup := func() {
 		os.RemoveAll(parent)
+	}
+
+	// Fixup nomadtest dir permissions
+	if err = os.Chmod(parent, 0777); err != nil {
+		t.Fatalf("error updating permissions on nomadtest dir")
 	}
 
 	allocDir := filepath.Join(parent, "allocs")
@@ -51,11 +62,30 @@ func TestClientConfig(t testing.T) (*Config, func()) {
 	}
 	conf.StateDir = stateDir
 
-	conf.VaultConfig.Enabled = helper.BoolToPtr(false)
+	// Use a minimal chroot environment
+	conf.ChrootEnv = ci.TinyChroot
+
+	// Helps make sure we are respecting configured parent
+	conf.CgroupParent = "testing.slice"
+
+	conf.GetDefaultVault().Enabled = pointer.Of(false)
 	conf.DevMode = true
 
 	// Loosen GC threshold
 	conf.GCDiskUsageThreshold = 98.0
 	conf.GCInodeUsageThreshold = 98.0
+
+	// Same as default; necessary for task Event messages
+	conf.MaxKillTimeout = 30 * time.Second
+
+	// Provide a stub APIListenerRegistrar implementation
+	conf.APIListenerRegistrar = NoopAPIListenerRegistrar{}
+
 	return conf, cleanup
+}
+
+type NoopAPIListenerRegistrar struct{}
+
+func (NoopAPIListenerRegistrar) Serve(_ context.Context, _ net.Listener) error {
+	return nil
 }

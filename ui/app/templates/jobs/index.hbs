@@ -1,3 +1,8 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 {{page-title "Jobs"}}
 <section class="section">
   <div class="toolbar">
@@ -43,12 +48,7 @@
             @label="Namespace"
             @options={{this.optionsNamespaces}}
             @selection={{this.qpNamespace}}
-            @onSelect={{action
-              (queue
-                (action this.cacheNamespace)
-                (action this.setFacetQueryParam "qpNamespace")
-              )
-            }}
+            @onSelect={{action this.setFacetQueryParam "qpNamespace"}}
           />
         {{/if}}
         <MultiSelectDropdown
@@ -57,6 +57,13 @@
           @options={{this.optionsType}}
           @selection={{this.selectionType}}
           @onSelect={{action this.setFacetQueryParam "qpType"}}
+        />
+        <MultiSelectDropdown
+          data-test-node-pool-facet
+          @label="Node Pool"
+          @options={{this.optionsNodePool}}
+          @selection={{this.selectionNodePool}}
+          @onSelect={{action this.setFacetQueryParam "qpNodePool"}}
         />
         <MultiSelectDropdown
           data-test-status-facet
@@ -89,6 +96,11 @@
             @query={{hash namespace=this.qpNamespace}}
             data-test-run-job
             class="button is-primary"
+            {{keyboard-shortcut
+              label="Run Job"
+              pattern=(array "r" "u" "n")
+              action=(action this.goToRun)
+            }}
           >
             Run Job
           </LinkTo>
@@ -137,12 +149,12 @@
           <t.sort-by @prop="type">
             Type
           </t.sort-by>
+          <t.sort-by @prop="nodePool">
+              Node Pool
+          </t.sort-by>
           <t.sort-by @prop="priority">
             Priority
           </t.sort-by>
-          <th>
-            Groups
-          </th>
           <th class="is-3">
             Summary
           </th>

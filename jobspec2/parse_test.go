@@ -1,7 +1,9 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package jobspec2
 
 import (
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -9,7 +11,9 @@ import (
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/jobspec"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,7 +21,7 @@ func TestEquivalentToHCL1(t *testing.T) {
 	ci.Parallel(t)
 
 	hclSpecDir := "../jobspec/test-fixtures/"
-	fis, err := ioutil.ReadDir(hclSpecDir)
+	fis, err := os.ReadDir(hclSpecDir)
 	require.NoError(t, err)
 
 	for _, fi := range fis {
@@ -60,6 +64,21 @@ func TestEquivalentToHCL1_ComplexConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, job1, job2)
+}
+
+func TestParse_ConnectJob(t *testing.T) {
+	ci.Parallel(t)
+
+	name := "./test-fixtures/connect-example.hcl"
+	f, err := os.Open(name)
+	must.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+
+	job2, err := Parse(name, f)
+	must.NoError(t, err)
+
+	timeout := job2.TaskGroups[0].Services[0].Connect.SidecarService.Proxy.Upstreams[0].Config["connect_timeout_ms"]
+	must.Eq(t, 9999, timeout)
 }
 
 func TestParse_VarsAndFunctions(t *testing.T) {
@@ -151,7 +170,7 @@ job "example" {
 	})
 
 	t.Run("set via var-files", func(t *testing.T) {
-		varFile, err := ioutil.TempFile("", "")
+		varFile, err := os.CreateTemp("", "")
 		require.NoError(t, err)
 		defer os.Remove(varFile.Name())
 
@@ -311,7 +330,7 @@ job "example" {
 		})
 		require.NoError(t, err)
 
-		expected, err := ioutil.ReadFile("parse_test.go")
+		expected, err := os.ReadFile("parse_test.go")
 		require.NoError(t, err)
 
 		require.NotNil(t, out.Region)
@@ -409,7 +428,7 @@ func TestParse_InvalidHCL(t *testing.T) {
 	})
 
 	t.Run("invalid vars file", func(t *testing.T) {
-		tmp, err := ioutil.TempFile("", "nomad-jobspec2-")
+		tmp, err := os.CreateTemp("", "nomad-jobspec2-")
 		require.NoError(t, err)
 		defer os.Remove(tmp.Name())
 
@@ -644,13 +663,13 @@ job "job-webserver" {
 		{
 			"prod",
 			&api.Job{
-				ID:          stringToPtr("job-webserver"),
-				Name:        stringToPtr("job-webserver"),
+				ID:          pointer.Of("job-webserver"),
+				Name:        pointer.Of("job-webserver"),
 				Datacenters: []string{"prod-dc1", "prod-dc2"},
 				TaskGroups: []*api.TaskGroup{
 					{
-						Name:  stringToPtr("group-webserver"),
-						Count: intToPtr(20),
+						Name:  pointer.Of("group-webserver"),
+						Count: pointer.Of(20),
 
 						Tasks: []*api.Task{
 							{
@@ -670,13 +689,13 @@ job "job-webserver" {
 		{
 			"staging",
 			&api.Job{
-				ID:          stringToPtr("job-webserver"),
-				Name:        stringToPtr("job-webserver"),
+				ID:          pointer.Of("job-webserver"),
+				Name:        pointer.Of("job-webserver"),
 				Datacenters: []string{"dc1"},
 				TaskGroups: []*api.TaskGroup{
 					{
-						Name:  stringToPtr("group-webserver"),
-						Count: intToPtr(3),
+						Name:  pointer.Of("group-webserver"),
+						Count: pointer.Of(3),
 
 						Tasks: []*api.Task{
 							{
@@ -696,13 +715,13 @@ job "job-webserver" {
 		{
 			"unknown",
 			&api.Job{
-				ID:          stringToPtr("job-webserver"),
-				Name:        stringToPtr("job-webserver"),
+				ID:          pointer.Of("job-webserver"),
+				Name:        pointer.Of("job-webserver"),
 				Datacenters: []string{},
 				TaskGroups: []*api.TaskGroup{
 					{
-						Name:  stringToPtr("group-webserver"),
-						Count: intToPtr(0),
+						Name:  pointer.Of("group-webserver"),
+						Count: pointer.Of(0),
 
 						Tasks: []*api.Task{
 							{
@@ -1005,11 +1024,11 @@ func TestParseServiceCheck(t *testing.T) {
 	require.NoError(t, err)
 
 	expectedJob := &api.Job{
-		ID:   stringToPtr("group_service_check_script"),
-		Name: stringToPtr("group_service_check_script"),
+		ID:   pointer.Of("group_service_check_script"),
+		Name: pointer.Of("group_service_check_script"),
 		TaskGroups: []*api.TaskGroup{
 			{
-				Name: stringToPtr("group"),
+				Name: pointer.Of("group"),
 				Services: []*api.Service{
 					{
 						Name:      "foo-service",
@@ -1033,7 +1052,7 @@ func TestParseServiceCheck(t *testing.T) {
 
 func TestWaitConfig(t *testing.T) {
 	ci.Parallel(t)
-	
+
 	hclBytes, err := os.ReadFile("test-fixtures/template-wait-config.hcl")
 	require.NoError(t, err)
 
@@ -1050,4 +1069,66 @@ func TestWaitConfig(t *testing.T) {
 	require.NotNil(t, tmpl.Wait)
 	require.Equal(t, 5*time.Second, *tmpl.Wait.Min)
 	require.Equal(t, 60*time.Second, *tmpl.Wait.Max)
+}
+
+func TestErrMissingKey(t *testing.T) {
+	ci.Parallel(t)
+	hclBytes, err := os.ReadFile("test-fixtures/template-err-missing-key.hcl")
+	require.NoError(t, err)
+	job, err := ParseWithConfig(&ParseConfig{
+		Path:    "test-fixtures/template-err-missing-key.hcl",
+		Body:    hclBytes,
+		AllowFS: false,
+	})
+	require.NoError(t, err)
+	tmpl := job.TaskGroups[0].Tasks[0].Templates[0]
+	require.NotNil(t, tmpl)
+	require.NotNil(t, tmpl.ErrMissingKey)
+	require.True(t, *tmpl.ErrMissingKey)
+}
+
+func TestRestartRenderTemplates(t *testing.T) {
+	ci.Parallel(t)
+	hclBytes, err := os.ReadFile("test-fixtures/restart-render-templates.hcl")
+	require.NoError(t, err)
+	job, err := ParseWithConfig(&ParseConfig{
+		Path:    "test-fixtures/restart-render-templates.hcl",
+		Body:    hclBytes,
+		AllowFS: false,
+	})
+	require.NoError(t, err)
+	tg := job.TaskGroups[0]
+	require.NotNil(t, tg.RestartPolicy)
+	require.True(t, *tg.RestartPolicy.RenderTemplates)
+
+	require.Nil(t, tg.Tasks[0].RestartPolicy)
+	require.False(t, *tg.Tasks[1].RestartPolicy.RenderTemplates)
+}
+
+// TestIdentity asserts that the default identity will be moved from the
+// Identities slice to the pre-1.7 Identity field in case >=1.7 CLIs are used
+// with <1.7 APIs.
+func TestIdentity(t *testing.T) {
+	ci.Parallel(t)
+	hclBytes, err := os.ReadFile("test-fixtures/identity-compat.nomad.hcl")
+	must.NoError(t, err)
+	job, err := ParseWithConfig(&ParseConfig{
+		Path:    "test-fixtures/identity-compat.nomad.hcl",
+		Body:    hclBytes,
+		AllowFS: false,
+	})
+	must.NoError(t, err)
+	must.NotNil(t, job.TaskGroups[0].Tasks[0].Identity)
+	must.True(t, job.TaskGroups[0].Tasks[0].Identity.Env)
+	must.True(t, job.TaskGroups[0].Tasks[0].Identity.File)
+
+	must.Len(t, 1, job.TaskGroups[0].Tasks[0].Identities)
+	altID := job.TaskGroups[0].Tasks[0].Identities[0]
+	must.Eq(t, "foo", altID.Name)
+	must.Eq(t, []string{"bar"}, altID.Audience)
+	must.True(t, altID.File)
+	must.False(t, altID.Env)
+	must.Eq(t, "signal", altID.ChangeMode)
+	must.Eq(t, "sighup", altID.ChangeSignal)
+	must.Eq(t, 2*time.Hour, altID.TTL)
 }

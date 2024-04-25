@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -27,10 +30,7 @@ Update Options:
     Sets the human readable name for the ACL token.
 
   -type="client"
-    Sets the type of token. Must be one of "client" (default), or "management".
-
-  -global=false
-    Toggles the global mode of the token. Global tokens are replicated to all regions.
+    Sets the type of token. Must be one of "client" or "management".
 
   -policy=""
     Specifies a policy to associate with the token. Can be specified multiple times,
@@ -45,7 +45,6 @@ func (c *ACLTokenUpdateCommand) AutocompleteFlags() complete.Flags {
 		complete.Flags{
 			"name":   complete.PredictAnything,
 			"type":   complete.PredictAnything,
-			"global": complete.PredictNothing,
 			"policy": complete.PredictAnything,
 		})
 }
@@ -62,13 +61,11 @@ func (*ACLTokenUpdateCommand) Name() string { return "acl token update" }
 
 func (c *ACLTokenUpdateCommand) Run(args []string) int {
 	var name, tokenType string
-	var global bool
 	var policies []string
 	flags := c.Meta.FlagSet(c.Name(), FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.StringVar(&name, "name", "", "")
-	flags.StringVar(&tokenType, "type", "client", "")
-	flags.BoolVar(&global, "global", false, "")
+	flags.StringVar(&tokenType, "type", "", "")
 	flags.Var((funcVar)(func(s string) error {
 		policies = append(policies, s)
 		return nil
@@ -110,11 +107,6 @@ func (c *ACLTokenUpdateCommand) Run(args []string) int {
 		token.Type = tokenType
 	}
 
-	// This will default to false if the user does not specify it
-	if global != token.Global {
-		token.Global = global
-	}
-
 	if len(policies) != 0 {
 		token.Policies = policies
 	}
@@ -127,6 +119,6 @@ func (c *ACLTokenUpdateCommand) Run(args []string) int {
 	}
 
 	// Format the output
-	c.Ui.Output(formatKVACLToken(updatedToken))
+	outputACLToken(c.Ui, updatedToken)
 	return 0
 }

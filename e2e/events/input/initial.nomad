@@ -1,5 +1,8 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "deployment_auto.nomad" {
-  datacenters = ["dc1"]
+  datacenters = ["dc1", "dc2"]
 
   constraint {
     attribute = "${attr.kernel.name}"
@@ -10,22 +13,30 @@ job "deployment_auto.nomad" {
     count = 3
 
     update {
-      max_parallel = 3
-      auto_promote = true
-      canary       = 2
+      max_parallel     = 3
+      auto_promote     = true
+      canary           = 2
+      min_healthy_time = "1s"
+    }
+
+    network {
+      port "db" {
+        to = 1234
+      }
     }
 
     task "one" {
-      driver = "raw_exec"
+      driver = "docker"
 
       env {
         version = "0"
       }
-      config {
-        command = "/bin/sleep"
 
-        # change args to update the job, the only changes
-        args = ["1000000"]
+      config {
+        image   = "busybox:1"
+        command = "nc"
+        args    = ["-ll", "-p", "1234", "-e", "/bin/cat"]
+        ports   = ["db"]
       }
 
       resources {

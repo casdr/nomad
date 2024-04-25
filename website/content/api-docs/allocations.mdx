@@ -17,8 +17,8 @@ This endpoint lists all allocations.
 | `GET`  | `/v1/allocations` | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs#blocking-queries) and
-[required ACLs](/api-docs#acls).
+[blocking queries](/nomad/api-docs#blocking-queries) and
+[required ACLs](/nomad/api-docs#acls).
 
 | Blocking Queries | ACL Required         |
 | ---------------- | -------------------- |
@@ -41,7 +41,7 @@ The table below shows this endpoint's support for
   `X-Nomad-NextToken` header of the last response can be used as the
   `next_token` of the next request to fetch additional pages.
 
-- `filter` `(string: "")` - Specifies the [expression](/api-docs#filtering)
+- `filter` `(string: "")` - Specifies the [expression](/nomad/api-docs#filtering)
   used to filter the results. Consider using pagination or a query parameter to
   reduce resource used to serve the request.
 
@@ -223,8 +223,8 @@ This endpoint reads information about a specific allocation.
 | `GET`  | `/v1/allocation/:alloc_id` | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs#blocking-queries) and
-[required ACLs](/api-docs#acls).
+[blocking queries](/nomad/api-docs#blocking-queries) and
+[required ACLs](/nomad/api-docs#acls).
 
 | Blocking Queries | ACL Required         |
 | ---------------- | -------------------- |
@@ -299,7 +299,7 @@ $ curl \
                   "db": 6379
                 }
               ],
-              "image": "redis:3.2"
+              "image": "redis:7"
             },
             "Env": null,
             "Services": [
@@ -438,6 +438,7 @@ $ curl \
     "NodesAvailable": {
       "dc1": 1
     },
+    "NodesInPool": 1,
     "ClassFiltered": null,
     "ConstraintFiltered": null,
     "NodesExhausted": 0,
@@ -506,7 +507,7 @@ $ curl \
           "VaultError": "",
           "TaskSignalReason": "",
           "TaskSignal": "",
-          "DriverMessage": "Downloading image redis:3.2"
+          "DriverMessage": "Downloading image redis:7"
         },
         {
           "Type": "Started",
@@ -549,7 +550,7 @@ $ curl \
   updated. This is primarily intended for use by the Nomad client when running
   the allocation, and it may include stale information on some job fields.
   Up-to-date information about the job status is available from the
-  [jobs API](/api-docs/jobs); take care to fetch the version of the job
+  [jobs API](/nomad/api-docs/jobs); take care to fetch the version of the job
   associated with this allocation.
 
 - `TaskStates` - A map of tasks to their current state and the latest events
@@ -609,7 +610,7 @@ $ curl \
     - `Failed Artifact Download` - Artifact(s) specified in the task failed to
       download.
 
-    - `Restart Signaled` - The task was singled to be restarted.
+    - `Restart Signaled` - The task was signaled to be restarted.
 
     - `Signaling` - The task was is being sent a signal.
 
@@ -634,8 +635,8 @@ This endpoint stops and reschedules a specific allocation.
 | `POST` / `PUT` | `/v1/allocation/:alloc_id/stop` | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs#blocking-queries) and
-[required ACLs](/api-docs#acls).
+[blocking queries](/nomad/api-docs#blocking-queries) and
+[required ACLs](/nomad/api-docs#acls).
 
 | Blocking Queries | ACL Required                |
 | ---------------- | --------------------------- |
@@ -646,6 +647,11 @@ The table below shows this endpoint's support for
 - `:alloc_id` `(string: <required>)`- Specifies the UUID of the allocation. This
   must be the full UUID, not the short 8-character one. This is specified as
   part of the path.
+
+- `no_shutdown_delay` `(bool: false)` - Ignore the group and task
+  [`shutdown_delay`] configuration so that there is no delay between service
+  deregistration and task shutdown. Note that using this parameter will result
+  in failed network connections to the allocation being stopped.
 
 ### Sample Request
 
@@ -672,8 +678,8 @@ This endpoint sends a signal to an allocation or task.
 | `POST` / `PUT` | `/v1/client/allocation/:alloc_id/signal` | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs#blocking-queries) and
-[required ACLs](/api-docs#acls).
+[blocking queries](/nomad/api-docs#blocking-queries) and
+[required ACLs](/nomad/api-docs#acls).
 
 | Blocking Queries | ACL Required                |
 | ---------------- | --------------------------- |
@@ -718,8 +724,8 @@ This endpoint restarts an allocation or task in-place.
 | `POST` / `PUT` | `/v1/client/allocation/:alloc_id/restart` | `application/json` |
 
 The table below shows this endpoint's support for
-[blocking queries](/api-docs#blocking-queries) and
-[required ACLs](/api-docs#acls).
+[blocking queries](/nomad/api-docs#blocking-queries) and
+[required ACLs](/nomad/api-docs#acls).
 
 | Blocking Queries | ACL Required                |
 | ---------------- | --------------------------- |
@@ -730,6 +736,13 @@ The table below shows this endpoint's support for
 - `:alloc_id` `(string: <required>)`- Specifies the UUID of the allocation. This
   must be the full UUID, not the short 8-character one. This is specified as
   part of the path.
+
+- `TaskName` `(string: "")` - Specifies the individual task to restart. Cannot
+  be used with `AllTasks` set to `true`.
+
+- `AllTasks` `(bool: false)` -  If set to `true` all tasks in the allocation
+  will be restarted, even the ones that already ran. Cannot be set to `true` if
+  `TaskName` is defined.
 
 ### Sample Payload
 
@@ -762,8 +775,8 @@ It opens a WebSocket to transmit input to and output from the command.
 | `WebSocket` | `/v1/client/allocation/:alloc_id/exec` | WebSocket JSON streams |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries) and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/nomad/api-docs#blocking-queries) and
+[required ACLs](/nomad/api-docs#acls).
 
 | Blocking Queries | ACL Required                                                                                 |
 | ---------------- | -------------------------------------------------------------------------------------------- |
@@ -843,3 +856,106 @@ Request and response frames encompass the full range of terminal emulator inputs
 # CSI-H (move cursor to top left corner), CSI-2J (clear entire screen), print "$ "
 {"stdout":{"data":"G1tIG1sySiQg"}}
 ```
+
+## Allocation Services
+
+The endpoint is used to read all services registered within Nomad belonging to the passed
+allocation ID.
+
+| Method | Path                             | Produces           |
+| ------ | -------------------------------- | ------------------ |
+| `GET`  | `/allocation/:alloc_id/services` | `application/json` |
+
+The table below shows this endpoint's support for
+[blocking queries](/nomad/api-docs#blocking-queries), [consistency modes](/nomad/api-docs#consistency-modes) and
+[required ACLs](/nomad/api-docs#acls).
+
+| Blocking Queries | Consistency Modes | ACL Required         |
+| ---------------- | ----------------- | -------------------- |
+| `YES`            | `all`             | `namespace:read-job` |
+
+### Parameters
+
+- `:alloc_id` `(string: <required>)` - Specifies the service name. This is
+specified as part of the path.
+
+- `namespace` `(string: "default")` - Specifies the target namespace.
+
+### Sample Request
+
+```shell-session
+$ curl \
+    https://localhost:4646/v1/allocation/177160af-26f6-619f-9c9f-5e46d1104395/services
+```
+
+### Sample Response
+
+```json
+[
+  {
+    "Address": "127.0.0.1",
+    "AllocID": "177160af-26f6-619f-9c9f-5e46d1104395",
+    "CreateIndex": 14,
+    "Datacenter": "dc1",
+    "ID": "_nomad-task-177160af-26f6-619f-9c9f-5e46d1104395-redis-example-cache-redis-db",
+    "JobID": "example",
+    "ModifyIndex": 24,
+    "Namespace": "default",
+    "NodeID": "7406e90b-de16-d118-80fe-60d0f2730cb3",
+    "Port": 29702,
+    "ServiceName": "example-cache-redis",
+    "Tags": [
+      "db",
+      "cache"
+    ]
+  }
+]
+```
+
+## Allocation Checks
+
+The endpoint is used to read all health checks registered within Nomad belonging
+to the passed allocation ID.
+
+| Method | Path                           | Produces           |
+| ------ | ------------------------------ | ------------------ |
+| `GET`  | `/allocation/:alloc_id/checks` | `application/json` |
+
+The table below shows this endpoint's support for
+[blocking queries](/nomad/api-docs#blocking-queries), [consistency modes](/nomad/api-docs#consistency-modes) and
+[required ACLs](/nomad/api-docs#acls).
+
+| Blocking Queries | ACL Required          |
+| ---------------- | --------------------- |
+| `NO`             | `namespace:read-job`` |
+
+### Parameters
+
+- `:alloc_id` `(string: <required>)` - Specifies the allocation ID. This is
+specified as part of the path.
+
+### Sample Request
+
+```shell-session
+$ curl \
+    https://localhost:4646/v1/allocation/177160af-26f6-619f-9c9f-5e46d1104395/checks
+```
+
+### Sample Response
+
+```json
+{
+  "a1ed96606694742bf201a640a607e306": {
+    "Check": "redis_probe",
+    "Group": "example.cache[0]",
+    "ID": "a1ed96606694742bf201a640a607e306",
+    "Mode": "healthiness",
+    "Output": "nomad: tcp ok",
+    "Service": "redis",
+    "Status": "success",
+    "Timestamp": 1690442203
+  }
+}
+```
+
+[`shutdown_delay`]: /nomad/docs/job-specification/group#shutdown_delay

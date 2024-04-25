@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 // DeviceAccounter is used to account for device usage on a node. It can detect
@@ -61,7 +64,7 @@ func NewDeviceAccounter(n *Node) *DeviceAccounter {
 func (d *DeviceAccounter) AddAllocs(allocs []*Allocation) (collision bool) {
 	for _, a := range allocs {
 		// Filter any terminal allocation
-		if a.TerminalStatus() {
+		if a.ClientTerminalStatus() {
 			continue
 		}
 

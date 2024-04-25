@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
 # Please refer 'controller.nomad' file for  variable and job descriptions
 variable "cn_network" {
   default = "dc1"
@@ -16,7 +19,7 @@ variable "gluster_volname" {
 }
 
 variable "kadalu_version" {
-  default = "0.8.6"
+  default = "0.8.15"
 }
 
 job "kadalu-csi-nodeplugin" {

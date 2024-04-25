@@ -1,10 +1,13 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/hashicorp/nomad/api/internal/testutil"
+	"github.com/shoenig/test/must"
 )
 
 func TestCompose(t *testing.T) {
@@ -15,13 +18,13 @@ func TestCompose(t *testing.T) {
 		SetMeta("foo", "bar").
 		Constrain(NewConstraint("kernel.name", "=", "linux")).
 		Require(&Resources{
-			CPU:      intToPtr(1250),
-			MemoryMB: intToPtr(1024),
-			DiskMB:   intToPtr(2048),
+			CPU:      pointerOf(1250),
+			MemoryMB: pointerOf(1024),
+			DiskMB:   pointerOf(2048),
 			Networks: []*NetworkResource{
 				{
 					CIDR:          "0.0.0.0/0",
-					MBits:         intToPtr(100),
+					MBits:         pointerOf(100),
 					ReservedPorts: []Port{{"", 80, 0, ""}, {"", 443, 0, ""}},
 				},
 			},
@@ -47,11 +50,11 @@ func TestCompose(t *testing.T) {
 
 	// Check that the composed result looks correct
 	expect := &Job{
-		Region:   stringToPtr("global"),
-		ID:       stringToPtr("job1"),
-		Name:     stringToPtr("myjob"),
-		Type:     stringToPtr(JobTypeService),
-		Priority: intToPtr(2),
+		Region:   pointerOf("global"),
+		ID:       pointerOf("job1"),
+		Name:     pointerOf("myjob"),
+		Type:     pointerOf(JobTypeService),
+		Priority: pointerOf(2),
 		Datacenters: []string{
 			"dc1",
 		},
@@ -67,8 +70,8 @@ func TestCompose(t *testing.T) {
 		},
 		TaskGroups: []*TaskGroup{
 			{
-				Name:  stringToPtr("grp1"),
-				Count: intToPtr(2),
+				Name:  pointerOf("grp1"),
+				Count: pointerOf(2),
 				Constraints: []*Constraint{
 					{
 						LTarget: "kernel.name",
@@ -81,13 +84,13 @@ func TestCompose(t *testing.T) {
 						LTarget: "${node.class}",
 						RTarget: "large",
 						Operand: "=",
-						Weight:  int8ToPtr(50),
+						Weight:  pointerOf(int8(50)),
 					},
 				},
 				Spreads: []*Spread{
 					{
 						Attribute: "${node.datacenter}",
-						Weight:    int8ToPtr(30),
+						Weight:    pointerOf(int8(30)),
 						SpreadTarget: []*SpreadTarget{
 							{
 								Value:   "dc1",
@@ -105,13 +108,13 @@ func TestCompose(t *testing.T) {
 						Name:   "task1",
 						Driver: "exec",
 						Resources: &Resources{
-							CPU:      intToPtr(1250),
-							MemoryMB: intToPtr(1024),
-							DiskMB:   intToPtr(2048),
+							CPU:      pointerOf(1250),
+							MemoryMB: pointerOf(1024),
+							DiskMB:   pointerOf(2048),
 							Networks: []*NetworkResource{
 								{
 									CIDR:  "0.0.0.0/0",
-									MBits: intToPtr(100),
+									MBits: pointerOf(100),
 									ReservedPorts: []Port{
 										{"", 80, 0, ""},
 										{"", 443, 0, ""},
@@ -140,7 +143,5 @@ func TestCompose(t *testing.T) {
 			},
 		},
 	}
-	if !reflect.DeepEqual(job, expect) {
-		t.Fatalf("expect: %#v, got: %#v", expect, job)
-	}
+	must.Eq(t, expect, job)
 }

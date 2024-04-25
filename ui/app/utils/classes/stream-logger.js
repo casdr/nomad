@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import EmberObject, { computed } from '@ember/object';
 import { task } from 'ember-concurrency';
 import TextDecoder from 'nomad-ui/utils/classes/text-decoder';
@@ -10,7 +15,7 @@ import classic from 'ember-classic-decorator';
 export default class StreamLogger extends EmberObject.extend(AbstractLogger) {
   reader = null;
 
-  get isSupported() {
+  static get isSupported() {
     return !!window.ReadableStream;
   }
 

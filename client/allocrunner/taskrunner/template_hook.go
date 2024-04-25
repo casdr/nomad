@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package taskrunner
 
 import (
@@ -10,6 +13,7 @@ import (
 	ti "github.com/hashicorp/nomad/client/allocrunner/taskrunner/interfaces"
 	"github.com/hashicorp/nomad/client/allocrunner/taskrunner/template"
 	"github.com/hashicorp/nomad/client/config"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -19,6 +23,9 @@ const (
 )
 
 type templateHookConfig struct {
+	// the allocation
+	alloc *structs.Allocation
+
 	// logger is used to log
 	logger log.Logger
 
@@ -39,6 +46,15 @@ type templateHookConfig struct {
 
 	// consulNamespace is the current Consul namespace
 	consulNamespace string
+
+	// nomadNamespace is the job's Nomad namespace
+	nomadNamespace string
+
+	// renderOnTaskRestart is flag to explicitly render templates on task restart
+	renderOnTaskRestart bool
+
+	// hookResources are used to fetch Consul tokens
+	hookResources *cstructs.AllocHookResources
 }
 
 type templateHook struct {
@@ -51,6 +67,12 @@ type templateHook struct {
 	templateManager *template.TaskTemplateManager
 	managerLock     sync.Mutex
 
+	// driverHandle is the task driver executor used by the template manager to
+	// run scripts when the template change mode is set to script.
+	//
+	// Must obtain a managerLock before changing. It may be nil.
+	driverHandle ti.ScriptExecutor
+
 	// consulNamespace is the current Consul namespace
 	consulNamespace string
 
@@ -60,8 +82,22 @@ type templateHook struct {
 	// vaultNamespace is the current Vault namespace
 	vaultNamespace string
 
+	// nomadToken is the current Nomad token
+	nomadToken string
+
+	// consulToken is the Consul ACL token obtained from consul_hook via
+	// workload identity
+	consulToken string
+
+	// task is the task that defines these templates
+	task *structs.Task
+
 	// taskDir is the task directory
 	taskDir string
+
+	// taskID is a unique identifier for this templateHook, for use in
+	// downstream platform-specific template runner consumers
+	taskID string
 }
 
 func newTemplateHook(config *templateHookConfig) *templateHook {
@@ -82,12 +118,60 @@ func (h *templateHook) Prestart(ctx context.Context, req *interfaces.TaskPrestar
 
 	// If we have already run prerun before exit early.
 	if h.templateManager != nil {
-		return nil
+		if !h.config.renderOnTaskRestart {
+			return nil
+		}
+		h.logger.Info("re-rendering templates on task restart")
+		h.templateManager.Stop()
+		h.templateManager = nil
 	}
 
-	// Store the current Vault token and the task directory
+	// Store request information so they can be used in other hooks.
+	h.task = req.Task
 	h.taskDir = req.TaskDir.Dir
 	h.vaultToken = req.VaultToken
+	h.nomadToken = req.NomadToken
+	h.taskID = req.Alloc.ID + "-" + req.Task.Name
+
+	// Set the consul token if the task uses WI.
+	tg := h.config.alloc.Job.LookupTaskGroup(h.config.alloc.TaskGroup)
+	consulBlock := tg.Consul
+	if req.Task.Consul != nil {
+		consulBlock = req.Task.Consul
+	}
+	consulWIDName := consulBlock.IdentityName()
+
+	// Check if task has an identity for Consul and assume WI flow if it does.
+	// COMPAT simplify this logic and assume WI flow in 1.9+
+	hasConsulIdentity := false
+	for _, wid := range req.Task.Identities {
+		if wid.Name == consulWIDName {
+			hasConsulIdentity = true
+			break
+		}
+	}
+	if hasConsulIdentity {
+		consulCluster := req.Task.GetConsulClusterName(tg)
+		consulTokens := h.config.hookResources.GetConsulTokens()
+		clusterTokens := consulTokens[consulCluster]
+
+		if clusterTokens == nil {
+			return fmt.Errorf(
+				"consul tokens for cluster %s requested by task %s not found",
+				consulCluster, req.Task.Name,
+			)
+		}
+
+		consulToken := clusterTokens[consulWIDName+"/"+req.Task.Name]
+		if consulToken == nil {
+			return fmt.Errorf(
+				"consul tokens for cluster %s and identity %s requested by task %s not found",
+				consulCluster, consulWIDName, req.Task.Name,
+			)
+		}
+
+		h.consulToken = consulToken.SecretID
+	}
 
 	// Set vault namespace if specified
 	if req.Task.Vault != nil {
@@ -108,8 +192,42 @@ func (h *templateHook) Prestart(ctx context.Context, req *interfaces.TaskPrestar
 	return nil
 }
 
+func (h *templateHook) Poststart(_ context.Context, req *interfaces.TaskPoststartRequest, resp *interfaces.TaskPoststartResponse) error {
+	h.managerLock.Lock()
+	defer h.managerLock.Unlock()
+
+	if h.templateManager == nil {
+		return nil
+	}
+
+	if req.DriverExec != nil {
+		h.driverHandle = req.DriverExec
+		h.templateManager.SetDriverHandle(h.driverHandle)
+	} else {
+		for _, tmpl := range h.config.templates {
+			if tmpl.ChangeMode == structs.TemplateChangeModeScript {
+				return fmt.Errorf("template has change mode set to 'script' but the driver it uses does not provide exec capability")
+			}
+		}
+	}
+	return nil
+}
+
 func (h *templateHook) newManager() (unblock chan struct{}, err error) {
 	unblock = make(chan struct{})
+
+	vaultCluster := h.task.GetVaultClusterName()
+	vaultConfig := h.config.clientConfig.GetVaultConfigs(h.logger)[vaultCluster]
+
+	// Fail if task has a vault block but not client config was found.
+	if h.task.Vault != nil && vaultConfig == nil {
+		return nil, fmt.Errorf("Vault cluster %q is disabled or not configured", vaultCluster)
+	}
+
+	tg := h.config.alloc.Job.LookupTaskGroup(h.config.alloc.TaskGroup)
+	consulCluster := h.task.GetConsulClusterName(tg)
+	consulConfig := h.config.clientConfig.GetConsulConfigs(h.logger)[consulCluster]
+
 	m, err := template.NewTaskTemplateManager(&template.TaskTemplateManagerConfig{
 		UnblockCh:            unblock,
 		Lifecycle:            h.config.lifecycle,
@@ -117,11 +235,18 @@ func (h *templateHook) newManager() (unblock chan struct{}, err error) {
 		Templates:            h.config.templates,
 		ClientConfig:         h.config.clientConfig,
 		ConsulNamespace:      h.config.consulNamespace,
+		ConsulToken:          h.consulToken,
+		ConsulConfig:         consulConfig,
 		VaultToken:           h.vaultToken,
+		VaultConfig:          vaultConfig,
 		VaultNamespace:       h.vaultNamespace,
 		TaskDir:              h.taskDir,
 		EnvBuilder:           h.config.envBuilder,
 		MaxTemplateEventRate: template.DefaultMaxTemplateEventRate,
+		NomadNamespace:       h.config.nomadNamespace,
+		NomadToken:           h.nomadToken,
+		TaskID:               h.taskID,
+		Logger:               h.logger,
 	})
 	if err != nil {
 		h.logger.Error("failed to create template manager", "error", err)
@@ -129,10 +254,13 @@ func (h *templateHook) newManager() (unblock chan struct{}, err error) {
 	}
 
 	h.templateManager = m
+	if h.driverHandle != nil {
+		h.templateManager.SetDriverHandle(h.driverHandle)
+	}
 	return unblock, nil
 }
 
-func (h *templateHook) Stop(ctx context.Context, req *interfaces.TaskStopRequest, resp *interfaces.TaskStopResponse) error {
+func (h *templateHook) Stop(_ context.Context, req *interfaces.TaskStopRequest, resp *interfaces.TaskStopResponse) error {
 	h.managerLock.Lock()
 	defer h.managerLock.Unlock()
 
@@ -144,32 +272,33 @@ func (h *templateHook) Stop(ctx context.Context, req *interfaces.TaskStopRequest
 	return nil
 }
 
-// Handle new Vault token
-func (h *templateHook) Update(ctx context.Context, req *interfaces.TaskUpdateRequest, resp *interfaces.TaskUpdateResponse) error {
+// Update is used to handle updates to vault and/or nomad tokens.
+func (h *templateHook) Update(_ context.Context, req *interfaces.TaskUpdateRequest, resp *interfaces.TaskUpdateResponse) error {
 	h.managerLock.Lock()
 	defer h.managerLock.Unlock()
 
-	// Nothing to do
+	// no template manager to manage
 	if h.templateManager == nil {
 		return nil
 	}
 
-	// Check if the Vault token has changed
-	if req.VaultToken == h.vaultToken {
+	// neither vault or nomad token has been updated, nothing to do
+	if req.VaultToken == h.vaultToken && req.NomadToken == h.nomadToken {
 		return nil
 	} else {
 		h.vaultToken = req.VaultToken
+		h.nomadToken = req.NomadToken
 	}
 
-	// Shutdown the old template
+	// shutdown the old template
 	h.templateManager.Stop()
 	h.templateManager = nil
 
-	// Create the new template
+	// create the new template
 	if _, err := h.newManager(); err != nil {
-		err := fmt.Errorf("failed to build template manager: %v", err)
+		err = fmt.Errorf("failed to build template manager: %v", err)
 		h.logger.Error("failed to build template manager", "error", err)
-		h.config.lifecycle.Kill(context.Background(),
+		_ = h.config.lifecycle.Kill(context.Background(),
 			structs.NewTaskEvent(structs.TaskKilling).
 				SetFailsTask().
 				SetDisplayMessage(fmt.Sprintf("Template update %v", err)))

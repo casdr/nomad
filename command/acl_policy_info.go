@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -13,7 +16,7 @@ type ACLPolicyInfoCommand struct {
 
 func (c *ACLPolicyInfoCommand) Help() string {
 	helpText := `
-Usage: nomad acl policy info <name>
+Usage: nomad acl policy info [options] <name>
 
   Info is used to fetch information on an existing ACL policy.
 
@@ -74,6 +77,6 @@ func (c *ACLPolicyInfoCommand) Run(args []string) int {
 		return 1
 	}
 
-	c.Ui.Output(formatKVPolicy(policy))
+	c.Ui.Output(c.Colorize().Color(formatACLPolicy(policy)))
 	return 0
 }

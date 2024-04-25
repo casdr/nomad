@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { computed } from '@ember/object';
 import Fragment from 'ember-data-model-fragments/fragment';
 import { attr } from '@ember-data/model';
@@ -18,9 +23,40 @@ export default class TaskGroup extends Fragment {
   @attr('string') name;
   @attr('number') count;
 
+  @computed('job.{variables,parent,plainId}', 'name')
+  get pathLinkedVariable() {
+    if (this.job.parent.get('id')) {
+      return this.job.variables?.findBy(
+        'path',
+        `nomad/jobs/${this.job.parent.get('plainId')}/${this.name}`
+      );
+    } else {
+      return this.job.variables?.findBy(
+        'path',
+        `nomad/jobs/${this.job.plainId}/${this.name}`
+      );
+    }
+  }
+
+  // TODO: This async fetcher seems like a better fit for most of our use-cases than the above getter (which cannot do async/await)
+  async getPathLinkedVariable() {
+    await this.job.variables;
+    if (this.job.parent.get('id')) {
+      return await this.job.variables?.findBy(
+        'path',
+        `nomad/jobs/${this.job.parent.get('plainId')}/${this.name}`
+      );
+    } else {
+      return await this.job.variables?.findBy(
+        'path',
+        `nomad/jobs/${this.job.plainId}/${this.name}`
+      );
+    }
+  }
+
   @fragmentArray('task') tasks;
 
-  @fragmentArray('service') services;
+  @fragmentArray('service-fragment') services;
 
   @fragmentArray('volume-definition') volumes;
 

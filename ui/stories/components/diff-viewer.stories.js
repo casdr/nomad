@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import hbs from 'htmlbars-inline-precompile';
 
 export default {
@@ -187,7 +192,7 @@ export let DiffViewerWithManyChanges = () => {
                         Annotations: null,
                         Name: 'image',
                         New: 'redis:3.4',
-                        Old: 'redis:3.2',
+                        Old: 'redis:7',
                         Type: 'Edited',
                       },
                       {
@@ -431,6 +436,13 @@ export let DiffViewerWithManyChanges = () => {
                           },
                           {
                             Annotations: null,
+                            Name: 'TLSServerName',
+                            New: '',
+                            Old: '',
+                            Type: 'None',
+                          },
+                          {
+                            Annotations: null,
                             Name: 'TLSSkipVerify',
                             New: 'false',
                             Old: 'false',
@@ -595,7 +607,7 @@ export let DiffViewerWithManyChanges = () => {
                       {
                         Annotations: null,
                         Name: 'image',
-                        New: 'redis:3.2',
+                        New: 'redis:7',
                         Old: '',
                         Type: 'Added',
                       },

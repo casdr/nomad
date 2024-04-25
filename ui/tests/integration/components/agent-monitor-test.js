@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable ember/no-string-prototype-extensions */
 import { run } from '@ember/runloop';
 import { module, test } from 'qunit';
@@ -12,6 +17,7 @@ import {
   selectOpenChoose,
 } from '../../utils/ember-power-select-extensions';
 import { componentA11yAudit } from 'nomad-ui/tests/helpers/a11y-audit';
+import { capitalize } from '@ember/string';
 
 module('Integration | Component | agent-monitor', function (hooks) {
   setupRenderingTest(hooks);
@@ -123,7 +129,7 @@ module('Integration | Component | agent-monitor', function (hooks) {
 
     const contentId = await selectOpen('[data-test-level-switcher-parent]');
     run.later(run, run.cancelTimers, INTERVAL);
-    await selectOpenChoose(contentId, newLevel.capitalize());
+    await selectOpenChoose(contentId, capitalize(newLevel));
     await settled();
 
     assert.ok(onLevelChange.calledOnce);
@@ -154,7 +160,7 @@ module('Integration | Component | agent-monitor', function (hooks) {
 
     const contentId = await selectOpen('[data-test-level-switcher-parent]');
     run.later(run, run.cancelTimers, INTERVAL);
-    await selectOpenChoose(contentId, newLevel.capitalize());
+    await selectOpenChoose(contentId, capitalize(newLevel));
     await settled();
 
     assert.equal(
@@ -197,7 +203,7 @@ module('Integration | Component | agent-monitor', function (hooks) {
 
     const contentId = await selectOpen('[data-test-level-switcher-parent]');
     run.later(run, run.cancelTimers, INTERVAL);
-    await selectOpenChoose(contentId, newLevel.capitalize());
+    await selectOpenChoose(contentId, capitalize(newLevel));
     await settled();
 
     assert.equal(

@@ -1,11 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
 	"fmt"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
-	log "github.com/hashicorp/go-hclog"
+	"github.com/armon/go-metrics"
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -13,18 +16,21 @@ import (
 // Plan endpoint is used for plan interactions
 type Plan struct {
 	srv    *Server
-	logger log.Logger
+	ctx    *RPCContext
+	logger hclog.Logger
+}
 
-	// ctx provides context regarding the underlying connection
-	ctx *RPCContext
+func NewPlanEndpoint(srv *Server, ctx *RPCContext) *Plan {
+	return &Plan{srv: srv, ctx: ctx, logger: srv.logger.Named("plan")}
 }
 
 // Submit is used to submit a plan to the leader
 func (p *Plan) Submit(args *structs.PlanRequest, reply *structs.PlanResponse) error {
-	// Ensure the connection was initiated by another server if TLS is used.
-	err := validateTLSCertificateLevel(p.srv, p.ctx, tlsCertificateLevelServer)
-	if err != nil {
-		return err
+
+	aclObj, err := p.srv.AuthenticateServerOnly(p.ctx, args)
+	p.srv.MeasureRPCRate("plan", structs.RateMetricWrite, args)
+	if err != nil || !aclObj.AllowServerOp() {
+		return structs.ErrPermissionDenied
 	}
 
 	if done, err := p.srv.forward("Plan.Submit", args, args, reply); done {

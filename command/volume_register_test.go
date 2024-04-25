@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -6,7 +9,7 @@ import (
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/stretchr/testify/require"
+	"github.com/shoenig/test/must"
 )
 
 func TestVolumeDispatchParse(t *testing.T) {
@@ -32,13 +35,12 @@ rando = "bar"
 	for _, c := range cases {
 		t.Run(c.hcl, func(t *testing.T) {
 			_, s, err := parseVolumeType(c.hcl)
-			require.Equal(t, c.t, s)
+			must.Eq(t, c.t, s)
 			if c.err == "" {
-				require.NoError(t, err)
+				must.NoError(t, err)
 			} else {
-				require.Contains(t, err.Error(), c.err)
+				must.ErrorContains(t, err, c.err)
 			}
-
 		})
 	}
 }
@@ -55,6 +57,7 @@ func TestCSIVolumeDecode(t *testing.T) {
 		name: "volume creation",
 		hcl: `
 id              = "testvolume"
+namespace       = "prod"
 name            = "test"
 type            = "csi"
 plugin_id       = "myplugin"
@@ -99,6 +102,7 @@ topology_request {
 `,
 		expected: &api.CSIVolume{
 			ID:                   "testvolume",
+			Namespace:            "prod",
 			Name:                 "test",
 			PluginID:             "myplugin",
 			SnapshotID:           "snap-12345",
@@ -136,6 +140,7 @@ topology_request {
 		name: "volume registration",
 		hcl: `
 id              = "testvolume"
+namespace       = "prod"
 external_id     = "vol-12345"
 name            = "test"
 type            = "csi"
@@ -162,6 +167,7 @@ topology_request {
 `,
 		expected: &api.CSIVolume{
 			ID:         "testvolume",
+			Namespace:  "prod",
 			ExternalID: "vol-12345",
 			Name:       "test",
 			PluginID:   "myplugin",
@@ -186,16 +192,14 @@ topology_request {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			ast, err := hcl.ParseString(c.hcl)
-			require.NoError(t, err)
+			must.NoError(t, err)
 			vol, err := csiDecodeVolume(ast)
 			if c.err == "" {
-				require.NoError(t, err)
+				must.NoError(t, err)
 			} else {
-				require.Contains(t, err.Error(), c.err)
+				must.ErrorContains(t, err, c.err)
 			}
-			require.Equal(t, c.expected, vol)
-
+			must.Eq(t, c.expected, vol)
 		})
-
 	}
 }

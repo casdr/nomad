@@ -1,60 +1,78 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package config
 
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/nomad/ci"
-	"github.com/stretchr/testify/require"
+	"github.com/hashicorp/nomad/helper/pointer"
+	"github.com/shoenig/test/must"
 )
 
 func TestVaultConfig_Merge(t *testing.T) {
 	ci.Parallel(t)
 
-	trueValue, falseValue := true, false
 	c1 := &VaultConfig{
-		Enabled:              &falseValue,
+		Enabled:              pointer.Of(false),
 		Token:                "1",
 		Role:                 "1",
-		AllowUnauthenticated: &trueValue,
+		AllowUnauthenticated: pointer.Of(true),
 		TaskTokenTTL:         "1",
 		Addr:                 "1",
+		JWTAuthBackendPath:   "jwt",
 		TLSCaFile:            "1",
 		TLSCaPath:            "1",
 		TLSCertFile:          "1",
 		TLSKeyFile:           "1",
-		TLSSkipVerify:        &trueValue,
+		TLSSkipVerify:        pointer.Of(true),
 		TLSServerName:        "1",
+		DefaultIdentity:      nil,
 	}
 
 	c2 := &VaultConfig{
-		Enabled:              &trueValue,
+		Enabled:              pointer.Of(true),
 		Token:                "2",
 		Role:                 "2",
-		AllowUnauthenticated: &falseValue,
+		AllowUnauthenticated: pointer.Of(false),
 		TaskTokenTTL:         "2",
 		Addr:                 "2",
+		JWTAuthBackendPath:   "jwt2",
 		TLSCaFile:            "2",
 		TLSCaPath:            "2",
 		TLSCertFile:          "2",
 		TLSKeyFile:           "2",
 		TLSSkipVerify:        nil,
 		TLSServerName:        "2",
+		DefaultIdentity: &WorkloadIdentityConfig{
+			Audience: []string{"vault.dev"},
+			Env:      pointer.Of(true),
+			File:     pointer.Of(false),
+		},
 	}
 
 	e := &VaultConfig{
-		Enabled:              &trueValue,
+		Enabled:              pointer.Of(true),
 		Token:                "2",
 		Role:                 "2",
-		AllowUnauthenticated: &falseValue,
+		AllowUnauthenticated: pointer.Of(false),
 		TaskTokenTTL:         "2",
 		Addr:                 "2",
+		JWTAuthBackendPath:   "jwt2",
 		TLSCaFile:            "2",
 		TLSCaPath:            "2",
 		TLSCertFile:          "2",
 		TLSKeyFile:           "2",
-		TLSSkipVerify:        &trueValue,
+		TLSSkipVerify:        pointer.Of(true),
 		TLSServerName:        "2",
+		DefaultIdentity: &WorkloadIdentityConfig{
+			Audience: []string{"vault.dev"},
+			Env:      pointer.Of(true),
+			File:     pointer.Of(false),
+		},
 	}
 
 	result := c1.Merge(c2)
@@ -63,72 +81,100 @@ func TestVaultConfig_Merge(t *testing.T) {
 	}
 }
 
-func TestVaultConfig_IsEqual(t *testing.T) {
+func TestVaultConfig_Equals(t *testing.T) {
 	ci.Parallel(t)
-	
-	require := require.New(t)
 
-	trueValue, falseValue := true, false
 	c1 := &VaultConfig{
-		Enabled:              &falseValue,
+		Enabled:              pointer.Of(false),
 		Token:                "1",
 		Role:                 "1",
-		AllowUnauthenticated: &trueValue,
+		Namespace:            "1",
+		AllowUnauthenticated: pointer.Of(true),
 		TaskTokenTTL:         "1",
 		Addr:                 "1",
+		JWTAuthBackendPath:   "jwt",
+		ConnectionRetryIntv:  time.Second,
 		TLSCaFile:            "1",
 		TLSCaPath:            "1",
 		TLSCertFile:          "1",
 		TLSKeyFile:           "1",
-		TLSSkipVerify:        &trueValue,
+		TLSSkipVerify:        pointer.Of(true),
 		TLSServerName:        "1",
+		DefaultIdentity: &WorkloadIdentityConfig{
+			Audience: []string{"vault.dev"},
+			Env:      pointer.Of(true),
+			File:     pointer.Of(false),
+		},
 	}
 
 	c2 := &VaultConfig{
-		Enabled:              &falseValue,
+		Enabled:              pointer.Of(false),
 		Token:                "1",
 		Role:                 "1",
-		AllowUnauthenticated: &trueValue,
+		Namespace:            "1",
+		AllowUnauthenticated: pointer.Of(true),
 		TaskTokenTTL:         "1",
 		Addr:                 "1",
+		JWTAuthBackendPath:   "jwt",
+		ConnectionRetryIntv:  time.Second,
 		TLSCaFile:            "1",
 		TLSCaPath:            "1",
 		TLSCertFile:          "1",
 		TLSKeyFile:           "1",
-		TLSSkipVerify:        &trueValue,
+		TLSSkipVerify:        pointer.Of(true),
 		TLSServerName:        "1",
+		DefaultIdentity: &WorkloadIdentityConfig{
+			Audience: []string{"vault.dev"},
+			Env:      pointer.Of(true),
+			File:     pointer.Of(false),
+		},
 	}
 
-	require.True(c1.IsEqual(c2))
+	must.Equal(t, c1, c2)
 
 	c3 := &VaultConfig{
-		Enabled:              &trueValue,
+		Enabled:              pointer.Of(true),
 		Token:                "1",
 		Role:                 "1",
-		AllowUnauthenticated: &trueValue,
+		Namespace:            "1",
+		AllowUnauthenticated: pointer.Of(true),
 		TaskTokenTTL:         "1",
 		Addr:                 "1",
+		ConnectionRetryIntv:  time.Second,
 		TLSCaFile:            "1",
 		TLSCaPath:            "1",
 		TLSCertFile:          "1",
 		TLSKeyFile:           "1",
-		TLSSkipVerify:        &trueValue,
+		TLSSkipVerify:        pointer.Of(true),
 		TLSServerName:        "1",
+		DefaultIdentity: &WorkloadIdentityConfig{
+			Audience: []string{"vault.dev"},
+			Env:      pointer.Of(true),
+			File:     pointer.Of(false),
+		},
 	}
 
 	c4 := &VaultConfig{
-		Enabled:              &falseValue,
+		Enabled:              pointer.Of(false),
 		Token:                "1",
 		Role:                 "1",
-		AllowUnauthenticated: &trueValue,
+		Namespace:            "1",
+		AllowUnauthenticated: pointer.Of(true),
 		TaskTokenTTL:         "1",
 		Addr:                 "1",
+		ConnectionRetryIntv:  time.Second,
 		TLSCaFile:            "1",
 		TLSCaPath:            "1",
 		TLSCertFile:          "1",
 		TLSKeyFile:           "1",
-		TLSSkipVerify:        &trueValue,
+		TLSSkipVerify:        pointer.Of(true),
 		TLSServerName:        "1",
+		DefaultIdentity: &WorkloadIdentityConfig{
+			Audience: []string{"vault.io"},
+			Env:      pointer.Of(false),
+			File:     pointer.Of(true),
+		},
 	}
-	require.False(c3.IsEqual(c4))
+
+	must.NotEqual(t, c3, c4)
 }

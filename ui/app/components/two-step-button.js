@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Component from '@ember/component';
 import { action } from '@ember/object';
 import { next } from '@ember/runloop';
@@ -24,6 +29,7 @@ export default class TwoStepButton extends Component {
   inlineText = false;
   onConfirm() {}
   onCancel() {}
+  onPrompt() {}
 
   state = 'idle';
   @equal('state', 'idle') isIdle;
@@ -33,6 +39,9 @@ export default class TwoStepButton extends Component {
     while (true) {
       let ev = yield waitForEvent(document.body, 'click');
       if (!this.element.contains(ev.target) && !this.awaitingConfirmation) {
+        if (this.onCancel) {
+          this.onCancel();
+        }
         this.send('setToIdle');
       }
     }
@@ -47,6 +56,9 @@ export default class TwoStepButton extends Component {
 
   @action
   promptForConfirmation() {
+    if (this.onPrompt) {
+      this.onPrompt();
+    }
     this.set('state', 'prompt');
     next(() => {
       this.cancelOnClickOutside.perform();

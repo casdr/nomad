@@ -1,9 +1,18 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import faker from 'faker';
 import config from 'nomad-ui/config/environment';
 
 const searchIncludesSeed = window.location.search.includes('faker-seed');
 
-if (config.environment !== 'test' || searchIncludesSeed) {
+if (
+  config.environment !== 'test' ||
+  config.percy.enabled ||
+  searchIncludesSeed
+) {
   if (searchIncludesSeed) {
     const params = new URLSearchParams(window.location.search);
     const seed = parseInt(params.get('faker-seed'));

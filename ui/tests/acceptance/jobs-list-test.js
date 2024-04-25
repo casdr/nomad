@@ -1,12 +1,18 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable qunit/require-expect */
-import { currentURL } from '@ember/test-helpers';
+import { currentURL, click } from '@ember/test-helpers';
 import { module, test } from 'qunit';
 import { setupApplicationTest } from 'ember-qunit';
 import { setupMirage } from 'ember-cli-mirage/test-support';
 import a11yAudit from 'nomad-ui/tests/helpers/a11y-audit';
 import pageSizeSelect from './behaviors/page-size-select';
 import JobsList from 'nomad-ui/tests/pages/jobs/list';
-import Layout from 'nomad-ui/tests/pages/layout';
+import percySnapshot from '@percy/ember';
+import faker from 'nomad-ui/mirage/faker';
 
 let managementToken, clientToken;
 
@@ -16,6 +22,7 @@ module('Acceptance | jobs list', function (hooks) {
 
   hooks.beforeEach(function () {
     // Required for placing allocations (a result of creating jobs)
+    server.create('node-pool');
     server.create('node');
 
     managementToken = server.create('token');
@@ -38,10 +45,13 @@ module('Acceptance | jobs list', function (hooks) {
   });
 
   test('/jobs should list the first page of jobs sorted by modify index', async function (assert) {
+    faker.seed(1);
     const jobsCount = JobsList.pageSize + 1;
-    server.createList('job', jobsCount, { createAllocations: false });
+    server.createList('job', jobsCount, { createAllocations: true });
 
     await JobsList.visit();
+
+    await percySnapshot(assert);
 
     const sortedJobs = server.db.jobs.sortBy('modifyIndex').reverse();
     assert.equal(JobsList.jobs.length, JobsList.pageSize);
@@ -53,7 +63,6 @@ module('Acceptance | jobs list', function (hooks) {
   test('each job row should contain information about the job', async function (assert) {
     server.createList('job', 2);
     const job = server.db.jobs.sortBy('modifyIndex').reverse()[0];
-    const taskGroups = server.db.taskGroups.where({ jobId: job.id });
 
     await JobsList.visit();
 
@@ -61,11 +70,11 @@ module('Acceptance | jobs list', function (hooks) {
 
     assert.equal(jobRow.name, job.name, 'Name');
     assert.notOk(jobRow.hasNamespace);
-    assert.equal(jobRow.link, `/ui/jobs/${job.id}`, 'Detail Link');
+    assert.equal(jobRow.nodePool, job.nodePool, 'Node Pool');
+    assert.equal(jobRow.link, `/ui/jobs/${job.id}@default`, 'Detail Link');
     assert.equal(jobRow.status, job.status, 'Status');
     assert.equal(jobRow.type, typeForJob(job), 'Type');
     assert.equal(jobRow.priority, job.priority, 'Priority');
-    assert.equal(jobRow.taskGroups, taskGroups.length, '# Groups');
   });
 
   test('each job row should link to the corresponding job', async function (assert) {
@@ -75,7 +84,7 @@ module('Acceptance | jobs list', function (hooks) {
     await JobsList.visit();
     await JobsList.jobs.objectAt(0).clickName();
 
-    assert.equal(currentURL(), `/jobs/${job.id}`);
+    assert.equal(currentURL(), `/jobs/${job.id}@default`);
   });
 
   test('the new job button transitions to the new job page', async function (assert) {
@@ -114,7 +123,10 @@ module('Acceptance | jobs list', function (hooks) {
   });
 
   test('when there are no jobs, there is an empty message', async function (assert) {
+    faker.seed(1);
     await JobsList.visit();
+
+    await percySnapshot(assert);
 
     assert.ok(JobsList.isEmpty, 'There is an empty message');
     assert.equal(
@@ -156,6 +168,47 @@ module('Acceptance | jobs list', function (hooks) {
     await JobsList.search.fillIn('foobar');
 
     assert.equal(currentURL(), '/jobs?search=foobar', 'No page query param');
+  });
+
+  test('Search order overrides Sort order', async function (assert) {
+    server.create('job', { name: 'car', modifyIndex: 1, priority: 200 });
+    server.create('job', { name: 'cat', modifyIndex: 2, priority: 150 });
+    server.create('job', { name: 'dog', modifyIndex: 3, priority: 100 });
+    server.create('job', { name: 'dot', modifyIndex: 4, priority: 50 });
+
+    await JobsList.visit();
+
+    // Expect list to be in reverse modifyIndex order by default
+    assert.equal(JobsList.jobs.objectAt(0).name, 'dot');
+    assert.equal(JobsList.jobs.objectAt(1).name, 'dog');
+    assert.equal(JobsList.jobs.objectAt(2).name, 'cat');
+    assert.equal(JobsList.jobs.objectAt(3).name, 'car');
+
+    // When sorting by name, expect list to be in alphabetical order
+    await click('[data-test-sort-by="name"]'); // sorts desc
+    await click('[data-test-sort-by="name"]'); // sorts asc
+
+    assert.equal(JobsList.jobs.objectAt(0).name, 'car');
+    assert.equal(JobsList.jobs.objectAt(1).name, 'cat');
+    assert.equal(JobsList.jobs.objectAt(2).name, 'dog');
+    assert.equal(JobsList.jobs.objectAt(3).name, 'dot');
+
+    // When searching, the "name" sort is locked in. Fuzzy results for cat return both car and cat, but cat first.
+    await JobsList.search.fillIn('cat');
+    assert.equal(JobsList.jobs.length, 2);
+    assert.equal(JobsList.jobs.objectAt(0).name, 'cat'); // higher fuzzy
+    assert.equal(JobsList.jobs.objectAt(1).name, 'car');
+
+    // Clicking priority sorter will maintain the search filter, but change the order
+    await click('[data-test-sort-by="priority"]'); // sorts desc
+    assert.equal(JobsList.jobs.objectAt(0).name, 'car'); // higher priority first
+    assert.equal(JobsList.jobs.objectAt(1).name, 'cat');
+
+    // Modifying search again will prioritize search "fuzzy" order
+    await JobsList.search.fillIn(''); // trigger search reset
+    await JobsList.search.fillIn('cat');
+    assert.equal(JobsList.jobs.objectAt(0).name, 'cat'); // higher fuzzy
+    assert.equal(JobsList.jobs.objectAt(1).name, 'car');
   });
 
   test('when a cluster has namespaces, each job row includes the job namespace', async function (assert) {
@@ -258,6 +311,7 @@ module('Acceptance | jobs list', function (hooks) {
     paramName: 'type',
     expectedOptions: [
       'Batch',
+      'Pack',
       'Parameterized',
       'Periodic',
       'Service',
@@ -418,19 +472,6 @@ module('Acceptance | jobs list', function (hooks) {
     );
   });
 
-  test('the active namespace is carried over to the storage pages', async function (assert) {
-    server.createList('namespace', 2);
-
-    const namespace = server.db.namespaces[1];
-    await JobsList.visit();
-    await JobsList.facets.namespace.toggle();
-    await JobsList.facets.namespace.options.objectAt(2).select();
-
-    await Layout.gutter.visitStorage();
-
-    assert.equal(currentURL(), `/csi/volumes?namespace=${namespace.id}`);
-  });
-
   test('when the user has a client token that has a namespace with a policy to run a job', async function (assert) {
     const READ_AND_WRITE_NAMESPACE = 'read-and-write-namespace';
     const READ_ONLY_NAMESPACE = 'read-only-namespace';
@@ -462,6 +503,37 @@ module('Acceptance | jobs list', function (hooks) {
 
     await JobsList.visit({ namespace: READ_AND_WRITE_NAMESPACE });
     assert.notOk(JobsList.runJobButton.isDisabled);
+
+    await JobsList.visit({ namespace: READ_ONLY_NAMESPACE });
+    assert.notOk(JobsList.runJobButton.isDisabled);
+  });
+
+  test('when the user has no client tokens that allow them to run a job', async function (assert) {
+    const READ_AND_WRITE_NAMESPACE = 'read-and-write-namespace';
+    const READ_ONLY_NAMESPACE = 'read-only-namespace';
+
+    server.create('namespace', { id: READ_ONLY_NAMESPACE });
+
+    const policy = server.create('policy', {
+      id: 'something',
+      name: 'something',
+      rulesJSON: {
+        Namespaces: [
+          {
+            Name: READ_ONLY_NAMESPACE,
+            Capabilities: ['list-job'],
+          },
+        ],
+      },
+    });
+
+    clientToken.policyIds = [policy.id];
+    clientToken.save();
+
+    window.localStorage.nomadTokenSecret = clientToken.secretId;
+
+    await JobsList.visit({ namespace: READ_AND_WRITE_NAMESPACE });
+    assert.ok(JobsList.runJobButton.isDisabled);
 
     await JobsList.visit({ namespace: READ_ONLY_NAMESPACE });
     assert.ok(JobsList.runJobButton.isDisabled);

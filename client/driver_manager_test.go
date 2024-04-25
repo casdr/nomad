@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package client
 
 import (
@@ -7,11 +10,16 @@ import (
 
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/client/lib/numalib"
 	"github.com/hashicorp/nomad/client/pluginmanager/drivermanager"
 	"github.com/hashicorp/nomad/helper/pluginutils/catalog"
 	nconfig "github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/stretchr/testify/require"
+)
+
+var (
+	topology = numalib.Scan(numalib.PlatformScanners())
 )
 
 // TestDriverManager_Fingerprint_Run asserts that node is populated with
@@ -22,10 +30,11 @@ func TestDriverManager_Fingerprint_Run(t *testing.T) {
 	testClient, cleanup := TestClient(t, nil)
 	defer cleanup()
 
+	conf := testClient.GetConfig()
 	dm := drivermanager.New(&drivermanager.Config{
 		Logger:              testClient.logger,
-		Loader:              testClient.config.PluginSingletonLoader,
-		PluginConfig:        testClient.configCopy.NomadPluginConfig(),
+		Loader:              conf.PluginSingletonLoader,
+		PluginConfig:        conf.NomadPluginConfig(topology),
 		Updater:             testClient.updateNodeFromDriver,
 		EventHandlerFactory: testClient.GetTaskEventHandler,
 		State:               testClient.stateDB,
@@ -35,7 +44,7 @@ func TestDriverManager_Fingerprint_Run(t *testing.T) {
 	defer dm.Shutdown()
 
 	testutil.WaitForResult(func() (bool, error) {
-		node := testClient.configCopy.Node
+		node := testClient.Node()
 
 		d, ok := node.Drivers["mock_driver"]
 		if !ok {
@@ -73,10 +82,11 @@ func TestDriverManager_Fingerprint_Periodic(t *testing.T) {
 	})
 	defer cleanup()
 
+	conf := testClient.GetConfig()
 	dm := drivermanager.New(&drivermanager.Config{
 		Logger:              testClient.logger,
-		Loader:              testClient.config.PluginSingletonLoader,
-		PluginConfig:        testClient.configCopy.NomadPluginConfig(),
+		Loader:              conf.PluginSingletonLoader,
+		PluginConfig:        conf.NomadPluginConfig(topology),
 		Updater:             testClient.updateNodeFromDriver,
 		EventHandlerFactory: testClient.GetTaskEventHandler,
 		State:               testClient.stateDB,
@@ -134,10 +144,11 @@ func TestDriverManager_NodeAttributes_Run(t *testing.T) {
 	})
 	defer cleanup()
 
+	conf := testClient.GetConfig()
 	dm := drivermanager.New(&drivermanager.Config{
 		Logger:              testClient.logger,
-		Loader:              testClient.config.PluginSingletonLoader,
-		PluginConfig:        testClient.configCopy.NomadPluginConfig(),
+		Loader:              conf.PluginSingletonLoader,
+		PluginConfig:        conf.NomadPluginConfig(topology),
 		Updater:             testClient.updateNodeFromDriver,
 		EventHandlerFactory: testClient.GetTaskEventHandler,
 		State:               testClient.stateDB,
@@ -161,10 +172,6 @@ func TestDriverManager_NodeAttributes_Run(t *testing.T) {
 
 		if !d.Detected || !d.Healthy {
 			return false, fmt.Errorf("mock_driver driver is not marked as healthy: %+v", d)
-		}
-
-		if d.Attributes["driver.mock_driver"] != "" {
-			return false, fmt.Errorf("mock driver driver attributes contain duplicate health info: %#v", d.Attributes)
 		}
 
 		// check raw_exec

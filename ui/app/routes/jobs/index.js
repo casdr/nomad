@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { inject as service } from '@ember/service';
 import Route from '@ember/routing/route';
 import RSVP from 'rsvp';
@@ -22,9 +27,10 @@ export default class IndexRoute extends Route.extend(
   model(params) {
     return RSVP.hash({
       jobs: this.store
-        .query('job', { namespace: params.qpNamespace })
+        .query('job', { namespace: params.qpNamespace, meta: true })
         .catch(notifyForbidden(this)),
       namespaces: this.store.findAll('namespace'),
+      nodePools: this.store.findAll('node-pool'),
     });
   }
 
@@ -32,7 +38,7 @@ export default class IndexRoute extends Route.extend(
     controller.set('namespacesWatch', this.watchNamespaces.perform());
     controller.set(
       'modelWatch',
-      this.watchJobs.perform({ namespace: controller.qpNamesapce })
+      this.watchJobs.perform({ namespace: controller.qpNamespace, meta: true })
     );
   }
 

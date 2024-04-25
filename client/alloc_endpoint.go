@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package client
 
 import (
@@ -6,17 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
-	"github.com/hashicorp/go-msgpack/codec"
-
+	"github.com/armon/go-metrics"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/nomad/acl"
 	cstructs "github.com/hashicorp/nomad/client/structs"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
 	nstructs "github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 )
 
 // Allocations endpoint is used for interacting with client allocations
@@ -37,7 +41,7 @@ func (a *Allocations) GarbageCollectAll(args *nstructs.NodeSpecificRequest, repl
 	// Check node write permissions
 	if aclObj, err := a.c.ResolveToken(args.AuthToken); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNodeWrite() {
+	} else if !aclObj.AllowNodeWrite() {
 		return nstructs.ErrPermissionDenied
 	}
 
@@ -57,7 +61,7 @@ func (a *Allocations) GarbageCollect(args *nstructs.AllocSpecificRequest, reply 
 	// Check namespace submit job permission.
 	if aclObj, err := a.c.ResolveToken(args.AuthToken); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilitySubmitJob) {
+	} else if !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilitySubmitJob) {
 		return nstructs.ErrPermissionDenied
 	}
 
@@ -80,7 +84,7 @@ func (a *Allocations) Signal(args *nstructs.AllocSignalRequest, reply *nstructs.
 	// Check namespace alloc-lifecycle permission.
 	if aclObj, err := a.c.ResolveToken(args.AuthToken); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityAllocLifecycle) {
+	} else if !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityAllocLifecycle) {
 		return nstructs.ErrPermissionDenied
 	}
 
@@ -99,11 +103,11 @@ func (a *Allocations) Restart(args *nstructs.AllocRestartRequest, reply *nstruct
 	// Check namespace alloc-lifecycle permission.
 	if aclObj, err := a.c.ResolveToken(args.AuthToken); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityAllocLifecycle) {
+	} else if !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityAllocLifecycle) {
 		return nstructs.ErrPermissionDenied
 	}
 
-	return a.c.RestartAllocation(args.AllocID, args.TaskName)
+	return a.c.RestartAllocation(args.AllocID, args.TaskName, args.AllTasks)
 }
 
 // Stats is used to collect allocation statistics
@@ -118,7 +122,7 @@ func (a *Allocations) Stats(args *cstructs.AllocStatsRequest, reply *cstructs.Al
 	// Check read-job permission.
 	if aclObj, err := a.c.ResolveToken(args.AuthToken); err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityReadJob) {
+	} else if !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityReadJob) {
 		return nstructs.ErrPermissionDenied
 	}
 
@@ -137,6 +141,29 @@ func (a *Allocations) Stats(args *cstructs.AllocStatsRequest, reply *cstructs.Al
 	return nil
 }
 
+// Checks is used to retrieve nomad service discovery check status information.
+func (a *Allocations) Checks(args *cstructs.AllocChecksRequest, reply *cstructs.AllocChecksResponse) error {
+	defer metrics.MeasureSince([]string{"client", "allocations", "checks"}, time.Now())
+
+	// Get the allocation
+	alloc, err := a.c.GetAlloc(args.AllocID)
+	if err != nil {
+		return err
+	}
+
+	// Check read-job permission
+	if aclObj, aclErr := a.c.ResolveToken(args.AuthToken); aclErr != nil {
+		return aclErr
+	} else if !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityReadJob) {
+		return nstructs.ErrPermissionDenied
+	}
+
+	// Get the status information for the allocation
+	reply.Results = a.c.checkStore.List(alloc.ID)
+
+	return nil
+}
+
 // exec is used to execute command in a running task
 func (a *Allocations) exec(conn io.ReadWriteCloser) {
 	defer metrics.MeasureSince([]string{"client", "allocations", "exec"}, time.Now())
@@ -152,7 +179,6 @@ func (a *Allocations) exec(conn io.ReadWriteCloser) {
 		handleStreamResultError(err, code, encoder)
 		return
 	}
-
 	a.c.logger.Info("task exec session ended", "exec_id", execID)
 }
 
@@ -161,7 +187,7 @@ func (a *Allocations) execImpl(encoder *codec.Encoder, decoder *codec.Decoder, e
 	// Decode the arguments
 	var req cstructs.AllocExecRequest
 	if err := decoder.Decode(&req); err != nil {
-		return helper.Int64ToPtr(500), err
+		return pointer.Of(int64(500)), err
 	}
 
 	if a.c.GetConfig().DisableRemoteExec {
@@ -169,65 +195,99 @@ func (a *Allocations) execImpl(encoder *codec.Encoder, decoder *codec.Decoder, e
 	}
 
 	if req.AllocID == "" {
-		return helper.Int64ToPtr(400), allocIDNotPresentErr
+		return pointer.Of(int64(400)), allocIDNotPresentErr
 	}
 	ar, err := a.c.getAllocRunner(req.AllocID)
 	if err != nil {
-		code := helper.Int64ToPtr(500)
+		code := pointer.Of(int64(500))
 		if nstructs.IsErrUnknownAllocation(err) {
-			code = helper.Int64ToPtr(404)
+			code = pointer.Of(int64(404))
 		}
 
 		return code, err
 	}
 	alloc := ar.Alloc()
 
-	aclObj, token, err := a.c.resolveTokenAndACL(req.QueryOptions.AuthToken)
+	aclObj, ident, err := a.c.resolveTokenAndACL(req.QueryOptions.AuthToken)
 	{
 		// log access
-		tokenName, tokenID := "", ""
-		if token != nil {
-			tokenName, tokenID = token.Name, token.AccessorID
-		}
-
-		a.c.logger.Info("task exec session starting",
+		logArgs := []any{
 			"exec_id", execID,
 			"alloc_id", req.AllocID,
 			"task", req.Task,
 			"command", req.Cmd,
 			"tty", req.Tty,
-			"access_token_name", tokenName,
-			"access_token_id", tokenID,
-		)
+			"action", req.Action,
+		}
+		if ident != nil {
+			if ident.ACLToken != nil {
+				logArgs = append(logArgs,
+					"access_token_name", ident.ACLToken.Name,
+					"access_token_id", ident.ACLToken.AccessorID,
+				)
+			} else if ident.Claims != nil {
+				logArgs = append(logArgs,
+					"ns", ident.Claims.Namespace,
+					"job", ident.Claims.JobID,
+					"alloc", ident.Claims.AllocationID,
+					"task", ident.Claims.TaskName,
+				)
+			}
+		}
+
+		a.c.logger.Info("task exec session starting", logArgs...)
 	}
 
 	// Check alloc-exec permission.
 	if err != nil {
-		return nil, err
-	} else if aclObj != nil && !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityAllocExec) {
+		return pointer.Of(int64(400)), err
+	} else if !aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityAllocExec) {
 		return nil, nstructs.ErrPermissionDenied
 	}
 
 	// Validate the arguments
 	if req.Task == "" {
-		return helper.Int64ToPtr(400), taskNotPresentErr
+		return pointer.Of(int64(400)), taskNotPresentErr
 	}
+
+	if req.JobID != "" && req.JobID != alloc.JobID {
+		return pointer.Of(int64(http.StatusBadRequest)),
+			fmt.Errorf("job %s does not have allocation %s", req.JobID, req.AllocID)
+	}
+
+	// If an action is present, go find the command and args
+	if req.Action != "" {
+		task := alloc.LookupTask(req.Task)
+		if task == nil {
+			return pointer.Of(int64(http.StatusBadRequest)),
+				fmt.Errorf("task %s not found in allocation %s", req.Task, alloc.ID)
+		}
+		jobAction := task.GetAction(req.Action)
+		if jobAction == nil {
+			return pointer.Of(int64(http.StatusBadRequest)),
+				fmt.Errorf("action %s not found in task %s", req.Action, req.Task)
+		}
+
+		// append both Command and Args
+		req.Cmd = append([]string{jobAction.Command}, jobAction.Args...)
+	}
+
 	if len(req.Cmd) == 0 {
-		return helper.Int64ToPtr(400), errors.New("command is not present")
+		return pointer.Of(int64(400)), errors.New("command is not present")
 	}
 
 	capabilities, err := ar.GetTaskDriverCapabilities(req.Task)
 	if err != nil {
-		code := helper.Int64ToPtr(500)
+		code := pointer.Of(int64(500))
 		if nstructs.IsErrUnknownAllocation(err) {
-			code = helper.Int64ToPtr(404)
+			code = pointer.Of(int64(404))
 		}
 
 		return code, err
 	}
 
 	// check node access
-	if aclObj != nil && capabilities.FSIsolation == drivers.FSIsolationNone {
+	if capabilities.FSIsolation == fsisolation.None {
 		exec := aclObj.AllowNsOp(alloc.Namespace, acl.NamespaceCapabilityAllocNodeExec)
 		if !exec {
 			return nil, nstructs.ErrPermissionDenied
@@ -236,9 +296,9 @@ func (a *Allocations) execImpl(encoder *codec.Encoder, decoder *codec.Decoder, e
 
 	allocState, err := a.c.GetAllocState(req.AllocID)
 	if err != nil {
-		code := helper.Int64ToPtr(500)
+		code := pointer.Of(int64(500))
 		if nstructs.IsErrUnknownAllocation(err) {
-			code = helper.Int64ToPtr(404)
+			code = pointer.Of(int64(404))
 		}
 
 		return code, err
@@ -247,11 +307,11 @@ func (a *Allocations) execImpl(encoder *codec.Encoder, decoder *codec.Decoder, e
 	// Check that the task is there
 	taskState := allocState.TaskStates[req.Task]
 	if taskState == nil {
-		return helper.Int64ToPtr(400), fmt.Errorf("unknown task name %q", req.Task)
+		return pointer.Of(int64(400)), fmt.Errorf("unknown task name %q", req.Task)
 	}
 
 	if taskState.StartedAt.IsZero() {
-		return helper.Int64ToPtr(404), fmt.Errorf("task %q not started yet.", req.Task)
+		return pointer.Of(int64(404)), fmt.Errorf("task %q not started yet.", req.Task)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -259,12 +319,12 @@ func (a *Allocations) execImpl(encoder *codec.Encoder, decoder *codec.Decoder, e
 
 	h := ar.GetTaskExecHandler(req.Task)
 	if h == nil {
-		return helper.Int64ToPtr(404), fmt.Errorf("task %q is not running.", req.Task)
+		return pointer.Of(int64(404)), fmt.Errorf("task %q is not running.", req.Task)
 	}
 
 	err = h(ctx, req.Cmd, req.Tty, newExecStream(decoder, encoder))
 	if err != nil {
-		code := helper.Int64ToPtr(500)
+		code := pointer.Of(int64(500))
 		return code, err
 	}
 

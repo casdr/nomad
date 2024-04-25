@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package client
 
 import (
@@ -7,12 +10,12 @@ import (
 	"io"
 	"time"
 
-	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 
 	"github.com/hashicorp/nomad/command/agent/host"
 	"github.com/hashicorp/nomad/command/agent/monitor"
 	"github.com/hashicorp/nomad/command/agent/pprof"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/nomad/structs"
 
 	metrics "github.com/armon/go-metrics"
@@ -37,12 +40,11 @@ func (a *Agent) Profile(args *structs.AgentPprofRequest, reply *structs.AgentPpr
 	aclObj, err := a.c.ResolveToken(args.AuthToken)
 	if err != nil {
 		return err
-	} else if aclObj != nil && !aclObj.AllowAgentWrite() {
+	} else if !aclObj.AllowAgentWrite() {
 		return structs.ErrPermissionDenied
 	}
 
-	// If ACLs are disabled, EnableDebug must be enabled
-	if aclObj == nil && !a.c.config.EnableDebug {
+	if !aclObj.AllowAgentDebug(a.c.GetConfig().EnableDebug) {
 		return structs.ErrPermissionDenied
 	}
 
@@ -89,16 +91,16 @@ func (a *Agent) monitor(conn io.ReadWriteCloser) {
 	encoder := codec.NewEncoder(conn, structs.MsgpackHandle)
 
 	if err := decoder.Decode(&args); err != nil {
-		handleStreamResultError(err, helper.Int64ToPtr(500), encoder)
+		handleStreamResultError(err, pointer.Of(int64(500)), encoder)
 		return
 	}
 
 	// Check acl
 	if aclObj, err := a.c.ResolveToken(args.AuthToken); err != nil {
-		handleStreamResultError(err, helper.Int64ToPtr(403), encoder)
+		handleStreamResultError(err, pointer.Of(int64(403)), encoder)
 		return
-	} else if aclObj != nil && !aclObj.AllowAgentRead() {
-		handleStreamResultError(structs.ErrPermissionDenied, helper.Int64ToPtr(403), encoder)
+	} else if !aclObj.AllowAgentRead() {
+		handleStreamResultError(structs.ErrPermissionDenied, pointer.Of(int64(403)), encoder)
 		return
 	}
 
@@ -108,7 +110,7 @@ func (a *Agent) monitor(conn io.ReadWriteCloser) {
 	}
 
 	if logLevel == log.NoLevel {
-		handleStreamResultError(errors.New("Unknown log level"), helper.Int64ToPtr(400), encoder)
+		handleStreamResultError(errors.New("Unknown log level"), pointer.Of(int64(400)), encoder)
 		return
 	}
 
@@ -116,8 +118,9 @@ func (a *Agent) monitor(conn io.ReadWriteCloser) {
 	defer cancel()
 
 	monitor := monitor.New(512, a.c.logger, &log.LoggerOptions{
-		JSONFormat: args.LogJSON,
-		Level:      logLevel,
+		JSONFormat:      args.LogJSON,
+		Level:           logLevel,
+		IncludeLocation: args.LogIncludeLocation,
 	})
 
 	frames := make(chan *sframer.StreamFrame, streamFramesBuffer)
@@ -206,7 +209,7 @@ OUTER:
 	}
 
 	if streamErr != nil {
-		handleStreamResultError(streamErr, helper.Int64ToPtr(500), encoder)
+		handleStreamResultError(streamErr, pointer.Of(int64(500)), encoder)
 		return
 	}
 }
@@ -217,8 +220,7 @@ func (a *Agent) Host(args *structs.HostDataRequest, reply *structs.HostDataRespo
 	if err != nil {
 		return err
 	}
-	if (aclObj != nil && !aclObj.AllowAgentRead()) ||
-		(aclObj == nil && !a.c.config.EnableDebug) {
+	if !aclObj.AllowAgentRead() && !a.c.GetConfig().EnableDebug {
 		return structs.ErrPermissionDenied
 	}
 

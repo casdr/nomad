@@ -1,25 +1,27 @@
 ---
 layout: docs
-page_title: csi_plugin Stanza - Job Specification
+page_title: csi_plugin Block - Job Specification
 description: >-
-  The "csi_plugin" stanza allows the task to specify it provides a
+  The "csi_plugin" block allows the task to specify it provides a
   Container Storage Interface plugin to the cluster.
 ---
 
-# `csi_plugin` Stanza
+# `csi_plugin` Block
 
-<Placement groups={['job', 'group', 'task', 'volume']} />
+<Placement groups={['job', 'group', 'task', 'csi_plugin']} />
 
-The "csi_plugin" stanza allows the task to specify it provides a
+The "csi_plugin" block allows the task to specify it provides a
 Container Storage Interface plugin to the cluster. Nomad will
 automatically register the plugin so that it can be used by other jobs
 to claim [volumes][csi_volumes].
 
 ```hcl
 csi_plugin {
-  id        = "csi-hostpath"
-  type      = "monolith"
-  mount_dir = "/csi"
+  id                     = "csi-hostpath"
+  type                   = "monolith"
+  mount_dir              = "/csi"
+  stage_publish_base_dir = "/local/csi"
+  health_timeout         = "30s"
 }
 ```
 
@@ -39,9 +41,21 @@ csi_plugin {
   `node` at the same time, and these are called `monolith`
   plugins. Refer to your CSI plugin's documentation.
 
-- `mount_dir` `(string: <required>)` - The directory path inside the
+- `mount_dir` `(string: <optional>)` - The directory path inside the
   container where the plugin will expect a Unix domain socket for
-  bidirectional communication with Nomad.
+  bidirectional communication with Nomad. This field is typically not
+  required. Refer to your CSI plugin's documentation for details.
+
+- `stage_publish_base_dir` `(string: <optional>)` - The base directory
+  path inside the container where the plugin will be instructed to
+  stage and publish volumes. This field is typically not required.
+  Refer to your CSI plugin's documentation for details. This can not
+  be a subdirectory of `mount_dir`.
+
+- `health_timeout` `(duration: <optional>)` - The duration that
+  the plugin supervisor will wait before restarting an unhealthy
+  CSI plugin. Must be a duration value such as `30s` or `2m`.
+  Defaults to `30s` if not set.
 
 ~> **Note:** Plugins running as `node` or `monolith` require root
 privileges (or `CAP_SYS_ADMIN` on Linux) to mount volumes on the
@@ -51,28 +65,28 @@ option.
 
 ## Recommendations for Deploying CSI Plugins
 
-CSI plugins run as Nomad jobs but after mounting the volume are not in the
-data path for the volume. Jobs that mount volumes write and read directly to
+CSI plugins run as Nomad tasks, but after mounting the volume are not in the
+data path for the volume. Tasks that mount volumes write and read directly to
 the volume via a bind-mount and there is no communication between the job and
 the CSI plugin. But when an allocation that mounts a volume stops, Nomad will
 need to communicate with the plugin on that allocation's node to unmount the
 volume. This has implications on how to deploy CSI plugins:
 
-* During node drains, jobs that claim volumes must be moved before the `node`
-  or `monolith` plugin for those volumes. You should run `node` or `monolith`
-  plugins as [`system`][system] jobs and use the `-ignore-system` flag on
-  `nomad node drain` to ensure that the plugins are running while the node is
-  being drained.
+* If you are stopping jobs on a node, you must stop tasks that claim
+  volumes before stopping the `node` or `monolith` plugin for those
+  volumes. If you use the `node drain` feature, plugin tasks will
+  automatically be drained last.
 
-* Only one plugin instance of a given plugin ID and type (controller or node)
-  should be deployed on any given client node. Use a constraint as shown
-  below.
+* Only the most recently-placed allocation for a given plugin ID and
+  type (controller or node) will be used by any given client node. Run
+  `node` plugins as system jobs and distribute `controller` plugins
+  across client nodes using a constraint as shown below.
 
 * Some plugins will create volumes only in the same location as the
-  plugin. For example, the AWS EBS plugin will create and mount volumes only
-  within the same Availability Zone. You should deploy these plugins with a
-  unique-per-AZ `plugin_id` to allow Nomad to place allocations in the correct
-  AZ.
+  plugin. For example, the AWS EBS plugin will create and mount
+  volumes only within the same Availability Zone. You should configure
+  your plugin task as recommended by the plugin's documentation to use
+  the [`topology_request`] field in your volume specification.
 
 ## `csi_plugin` Examples
 
@@ -111,10 +125,11 @@ job "plugin-efs" {
       }
 
       csi_plugin {
-        id        = "aws-efs0"
-        type      = "node"
-        mount_dir = "/csi"  # this path /csi matches the --endpoint
+        id             = "aws-efs0"
+        type           = "node"
+        mount_dir      = "/csi"  # this path /csi matches the --endpoint
                             # argument for the container
+        health_timeout = "30s"
       }
     }
   }
@@ -122,5 +137,6 @@ job "plugin-efs" {
 ```
 
 [csi]: https://github.com/container-storage-interface/spec
-[csi_volumes]: /docs/job-specification/volume
-[system]: /docs/schedulers#system
+[csi_volumes]: /nomad/docs/job-specification/volume
+[system]: /nomad/docs/schedulers#system
+[`topology_request`]: /nomad/docs/commands/volume/create#topology_request

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package drainer
 
 import (
@@ -66,14 +69,14 @@ func (n *drainingNode) IsDone() (bool, error) {
 	}
 
 	for _, alloc := range allocs {
-		// System jobs are only stopped after a node is done draining
-		// everything else, so ignore them here.
-		if alloc.Job.Type == structs.JobTypeSystem {
+		// System and plugin jobs are only stopped after a node is
+		// done draining everything else, so ignore them here.
+		if alloc.Job.Type == structs.JobTypeSystem || alloc.Job.IsPlugin() {
 			continue
 		}
 
 		// If there is a non-terminal we aren't done
-		if !alloc.TerminalStatus() {
+		if !alloc.ClientTerminalStatus() {
 			return false, nil
 		}
 	}
@@ -139,7 +142,7 @@ func (n *drainingNode) DrainingJobs() ([]structs.NamespacedID, error) {
 	jobIDs := make(map[structs.NamespacedID]struct{})
 	var jobs []structs.NamespacedID
 	for _, alloc := range allocs {
-		if alloc.TerminalStatus() || alloc.Job.Type == structs.JobTypeSystem {
+		if alloc.TerminalStatus() || alloc.Job.Type == structs.JobTypeSystem || alloc.Job.IsPlugin() {
 			continue
 		}
 

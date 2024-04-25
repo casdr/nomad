@@ -1,7 +1,10 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
-	"crypto/tls"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -9,12 +12,14 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/nomad/api"
 	"github.com/posener/complete"
 )
+
+// Stdin represents the system's standard input, but it's declared as a
+// variable here to allow tests to override it with a regular file.
+var Stdin = os.Stdin
 
 type OperatorAPICommand struct {
 	Meta
@@ -31,7 +36,7 @@ Usage: nomad operator api [options] <path>
   api is a utility command for accessing Nomad's HTTP API and is inspired by
   the popular curl command line tool. Nomad's operator api command populates
   Nomad's standard environment variables into their appropriate HTTP headers.
-  If the 'path' does not begin with "http" then $NOMAD_ADDR will be used. 
+  If the 'path' does not begin with "http" then $NOMAD_ADDR will be used.
 
   The 'path' can be in one of the following forms:
 
@@ -130,19 +135,34 @@ func (c *OperatorAPICommand) Run(args []string) int {
 
 	// By default verbose func is a noop
 	verbose := func(string, ...interface{}) {}
+	verboseSocket := func(*api.Config, string, ...interface{}) {}
+
 	if c.verboseFlag {
 		verbose = func(format string, a ...interface{}) {
 			// Use Warn instead of Info because Info goes to stdout
 			c.Ui.Warn(fmt.Sprintf(format, a...))
 		}
+		verboseSocket = func(cfg *api.Config, format string, a ...interface{}) {
+			if cfg.URL() != nil && cfg.URL().Scheme == "unix" {
+				c.Ui.Warn(fmt.Sprintf(format, a...))
+			}
+		}
 	}
 
 	// Opportunistically read from stdin and POST unless method has been
 	// explicitly set.
-	stat, _ := os.Stdin.Stat()
+	stat, _ := Stdin.Stat()
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
 		verbose("* Reading request body from stdin.")
-		c.body = os.Stdin
+
+		// Load stdin into a *bytes.Reader so that http.NewRequest can set the
+		// correct Content-Length value.
+		b, err := io.ReadAll(Stdin)
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Error reading stdin: %v", err))
+			return 1
+		}
+		c.body = bytes.NewReader(b)
 		if c.method == "" {
 			c.method = "POST"
 		}
@@ -150,11 +170,13 @@ func (c *OperatorAPICommand) Run(args []string) int {
 		c.method = "GET"
 	}
 
-	config := c.clientConfig()
-
 	// NewClient mutates or validates Config.Address, so call it to match
-	// the behavior of other commands.
-	_, err := api.NewClient(config)
+	// the behavior of other commands. Typically these are called as a combination
+	// using c.Client(); however, we need access to the client configuration
+	// to build the corresponding curl output.
+	config := c.clientConfig()
+	apiC, err := api.NewClient(config)
+
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error initializing client: %v", err))
 		return 1
@@ -182,29 +204,20 @@ func (c *OperatorAPICommand) Run(args []string) int {
 		c.Ui.Output(out)
 		return 0
 	}
-
-	// Re-implement a big chunk of api/api.go since we don't export it.
-	client := cleanhttp.DefaultClient()
-	transport := client.Transport.(*http.Transport)
-	transport.TLSHandshakeTimeout = 10 * time.Second
-	transport.TLSClientConfig = &tls.Config{
-		MinVersion: tls.VersionTLS12,
-	}
-
-	if err := api.ConfigureTLS(client, config.TLSConfig); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error configuring TLS: %v", err))
-		return 1
-	}
+	apiR := apiC.Raw()
 
 	setQueryParams(config, path)
-
-	verbose("> %s %s", c.method, path)
+	verboseSocket(config, fmt.Sprintf("* Trying %s...", config.URL().EscapedPath()))
 
 	req, err := http.NewRequest(c.method, path.String(), c.body)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error making request: %v", err))
 		return 1
 	}
+
+	h := req.URL.Hostname()
+	verboseSocket(config, fmt.Sprintf("* Connected to %s (%s)", h, config.URL().EscapedPath()))
+	verbose("> %s %s %s", c.method, req.URL.Path, req.Proto)
 
 	// Set headers from command line
 	req.Header = headerFlags.headers
@@ -228,11 +241,11 @@ func (c *OperatorAPICommand) Run(args []string) int {
 			verbose("> %s: %s", k, v)
 		}
 	}
-
+	verbose(">")
 	verbose("* Sending request and receiving response...")
 
 	// Do the request!
-	resp, err := client.Do(req)
+	resp, err := apiR.Do(req)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error performing request: %v", err))
 		return 1
@@ -294,12 +307,17 @@ func (c *OperatorAPICommand) apiToCurl(config *api.Config, headers http.Header, 
 		parts = append(parts, "--verbose")
 	}
 
-	if c.method != "" {
+	// add method flags. Note: curl output complains about `-X GET`
+	if c.method != "" && c.method != http.MethodGet {
 		parts = append(parts, "-X "+c.method)
 	}
 
 	if c.body != nil {
 		parts = append(parts, "--data-binary @-")
+	}
+
+	if config.URL().EscapedPath() != "" {
+		parts = append(parts, fmt.Sprintf("--unix-socket %q", config.URL().EscapedPath()))
 	}
 
 	if config.TLSConfig != nil {
@@ -386,22 +404,43 @@ func tlsToCurl(parts []string, tlsConfig *api.TLSConfig) []string {
 	return parts
 }
 
-// pathToURL converts a curl path argumet to URL. Paths without a host are
+// pathToURL converts a curl path argument to URL. Paths without a host are
 // prefixed with $NOMAD_ADDR or http://127.0.0.1:4646.
+//
+// Callers should pass a config generated by Meta.clientConfig which ensures
+// all default values are set correctly. Failure to do so will likely result in
+// a nil-pointer.
 func pathToURL(config *api.Config, path string) (*url.URL, error) {
-	// If the scheme is missing, add it
-	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
-		scheme := "http"
-		if config.TLSConfig != nil {
-			if config.TLSConfig.CACert != "" ||
-				config.TLSConfig.CAPath != "" ||
-				config.TLSConfig.ClientCert != "" ||
-				config.TLSConfig.TLSServerName != "" ||
-				config.TLSConfig.Insecure {
 
-				// TLS configured, but scheme not set. Assume
-				// https.
-				scheme = "https"
+	// If the scheme is missing from the path, it likely means the path is just
+	// the HTTP handler path. Attempt to infer this.
+	if !strings.HasPrefix(path, "http://") &&
+		!strings.HasPrefix(path, "https://") &&
+		!strings.HasPrefix(path, "unix://") {
+		scheme := "http"
+
+		// If the user has set any TLS configuration value, this is a good sign
+		// Nomad is running with TLS enabled. Otherwise, use the address within
+		// the config to identify a scheme.
+		if config.TLSConfig.CACert != "" ||
+			config.TLSConfig.CAPath != "" ||
+			config.TLSConfig.ClientCert != "" ||
+			config.TLSConfig.TLSServerName != "" ||
+			config.TLSConfig.Insecure {
+
+			// TLS configured, but scheme not set. Assume https.
+			scheme = "https"
+		} else if config.Address != "" {
+
+			confURL, err := url.Parse(config.Address)
+			if err != nil {
+				return nil, fmt.Errorf("unable to parse configured address: %v", err)
+			}
+
+			// Ensure we only overwrite the set scheme value if the parsing
+			// identified a valid scheme.
+			if confURL.Scheme == "http" || confURL.Scheme == "https" {
+				scheme = confURL.Scheme
 			}
 		}
 
@@ -413,7 +452,7 @@ func pathToURL(config *api.Config, path string) (*url.URL, error) {
 		return nil, err
 	}
 
-	// If URL.Scheme is empty, use defaults from client config
+	// If URL.Host is empty, use defaults from client config.
 	if u.Host == "" {
 		confURL, err := url.Parse(config.Address)
 		if err != nil {

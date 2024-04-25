@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 @use 'sass:math';
 
 .table {
@@ -6,6 +11,13 @@
   border: 1px solid $grey-blue;
   border-collapse: separate;
   width: 100%;
+
+  &:not(.no-mobile-condense) {
+    @media #{$mq-table-overflow} {
+      display: block;
+      overflow-x: auto;
+    }
+  }
 
   &.is-fixed {
     table-layout: fixed;
@@ -39,6 +51,10 @@
     .is-selectable a {
       padding: 0.75em;
     }
+  }
+
+  &.with-collapsed-borders {
+    border-collapse: collapse;
   }
 
   &.is-darkened {
@@ -94,6 +110,12 @@
       white-space: nowrap;
     }
 
+    &.node-status-badges {
+      .hds-badge__text {
+        white-space: nowrap;
+      }
+    }
+
     &.is-narrow {
       padding: 1.25em 0 1.25em 0.5em;
 
@@ -114,6 +136,18 @@
       max-width: 200px;
     }
 
+    .visually-hidden {
+      border: 0;
+      clip: rect(0 0 0 0);
+      height: 1px;
+      margin: -1px;
+      overflow: hidden;
+      padding: 0;
+      position: absolute;
+      width: 1px;
+      white-space: nowrap; /* added to ensure the text does not wrap */
+    }
+
     @for $i from 1 through 11 {
       &.is-#{$i} {
         width: math.div(100%, 12) * $i;
@@ -128,7 +162,6 @@
 
       &.is-primary {
         color: $text;
-        text-decoration: none;
         font-weight: $weight-semibold;
       }
     }

@@ -1,3 +1,8 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 <div class="boxed-section">
   <div class="boxed-section-head">
     Task Groups
@@ -33,9 +38,13 @@
       </t.head>
       <t.body as |row|>
         <TaskGroupRow
-          data-test-task-group
+          @data-test-task-group={{row.model.name}}
           @taskGroup={{row.model}}
           @onClick={{fn this.gotoTaskGroup row.model}}
+          {{keyboard-shortcut 
+            enumerated=true
+            action=(fn this.gotoTaskGroup row.model)
+          }}
         />
       </t.body>
     </ListTable>

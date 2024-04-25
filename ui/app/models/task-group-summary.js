@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { sum, collect } from '@ember/object/computed';
 import Fragment from 'ember-data-model-fragments/fragment';
 import { attr } from '@ember-data/model';
@@ -13,6 +18,7 @@ export default class TaskGroupSummary extends Fragment {
   @attr('number') completeAllocs;
   @attr('number') failedAllocs;
   @attr('number') lostAllocs;
+  @attr('number') unknownAllocs;
 
   @collect(
     'queuedAllocs',
@@ -20,7 +26,8 @@ export default class TaskGroupSummary extends Fragment {
     'runningAllocs',
     'completeAllocs',
     'failedAllocs',
-    'lostAllocs'
+    'lostAllocs',
+    'unknownAllocs'
   )
   allocsList;
 

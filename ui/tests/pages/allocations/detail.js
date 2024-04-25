@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import {
   attribute,
   clickable,
@@ -19,6 +24,7 @@ export default create({
 
   stop: twoStepButton('[data-test-stop]'),
   restart: twoStepButton('[data-test-restart]'),
+  restartAll: twoStepButton('[data-test-restart-all]'),
 
   execButton: {
     scope: '[data-test-exec-button]',
@@ -50,6 +56,8 @@ export default create({
     time: text('[data-test-time]'),
     volumes: text('[data-test-volumes]'),
 
+    hasCpuMetrics: isPresent('[data-test-cpu] .inline-chart progress'),
+    hasMemoryMetrics: isPresent('[data-test-mem] .inline-chart progress'),
     hasUnhealthyDriver: isPresent('[data-test-icon="unhealthy-driver"]'),
     hasProxyTag: isPresent('[data-test-proxy-tag]'),
 

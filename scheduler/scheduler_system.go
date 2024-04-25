@@ -1,7 +1,11 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package scheduler
 
 import (
 	"fmt"
+	"runtime/debug"
 
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
@@ -76,7 +80,8 @@ func (s *SystemScheduler) Process(eval *structs.Evaluation) (err error) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("processing eval %q panicked scheduler - please report this as a bug! - %v", eval.ID, r)
+			s.logger.Error("processing eval panicked scheduler - please report this as a bug!", "eval_id", eval.ID, "error", r, "stack_trace", string(debug.Stack()))
+			err = fmt.Errorf("failed to process eval: %v", r)
 		}
 	}()
 
@@ -132,7 +137,8 @@ func (s *SystemScheduler) process() (bool, error) {
 
 	// Get the ready nodes in the required datacenters
 	if !s.job.Stopped() {
-		s.nodes, s.notReadyNodes, s.nodesByDC, err = readyNodesInDCs(s.state, s.job.Datacenters)
+		s.nodes, s.notReadyNodes, s.nodesByDC, err = readyNodesInDCsAndPool(
+			s.state, s.job.Datacenters, s.job.NodePool)
 		if err != nil {
 			return false, fmt.Errorf("failed to get ready nodes: %v", err)
 		}
@@ -150,7 +156,7 @@ func (s *SystemScheduler) process() (bool, error) {
 	// Construct the placement stack
 	s.stack = NewSystemStack(s.sysbatch, s.ctx)
 	if !s.job.Stopped() {
-		s.stack.SetJob(s.job)
+		s.setJob(s.job)
 	}
 
 	// Compute the target job allocations
@@ -205,6 +211,26 @@ func (s *SystemScheduler) process() (bool, error) {
 	return true, nil
 }
 
+// setJob updates the stack with the given job and job's node pool scheduler
+// configuration.
+func (s *SystemScheduler) setJob(job *structs.Job) error {
+	// Fetch node pool and global scheduler configuration to determine how to
+	// configure the scheduler.
+	pool, err := s.state.NodePoolByName(nil, job.NodePool)
+	if err != nil {
+		return fmt.Errorf("failed to get job node pool %q: %v", job.NodePool, err)
+	}
+
+	_, schedConfig, err := s.state.SchedulerConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get scheduler configuration: %v", err)
+	}
+
+	s.stack.SetJob(job)
+	s.stack.SetSchedulerConfiguration(schedConfig.WithNodePool(pool))
+	return nil
+}
+
 // computeJobAllocs is used to reconcile differences between the job,
 // existing allocations and node status to update the allocations.
 func (s *SystemScheduler) computeJobAllocs() error {
@@ -229,11 +255,9 @@ func (s *SystemScheduler) computeJobAllocs() error {
 	live, term := structs.SplitTerminalAllocs(allocs)
 
 	// Diff the required and existing allocations
-	diff := diffSystemAllocs(s.job, s.nodes, s.notReadyNodes, tainted, live, term)
-	s.logger.Debug("reconciled current state with desired state",
-		"place", len(diff.place), "update", len(diff.update),
-		"migrate", len(diff.migrate), "stop", len(diff.stop),
-		"ignore", len(diff.ignore), "lost", len(diff.lost))
+	diff := diffSystemAllocs(s.job, s.nodes, s.notReadyNodes, tainted, live, term,
+		s.planner.ServersMeetMinimumVersion(minVersionMaxClientDisconnect, true))
+	s.logger.Debug("reconciled current state with desired state", "results", log.Fmt("%#v", diff))
 
 	// Add all the allocs to stop
 	for _, e := range diff.stop {
@@ -251,8 +275,17 @@ func (s *SystemScheduler) computeJobAllocs() error {
 		s.plan.AppendStoppedAlloc(e.Alloc, allocLost, structs.AllocClientStatusLost, "")
 	}
 
-	// Attempt to do the upgrades in place
-	destructiveUpdates, inplaceUpdates := inplaceUpdate(s.ctx, s.eval, s.job, s.stack, diff.update)
+	for _, e := range diff.disconnecting {
+		s.plan.AppendUnknownAlloc(e.Alloc)
+	}
+
+	// Attempt to do the upgrades in place.
+	// Reconnecting allocations need to be updated to persists alloc state
+	// changes.
+	updates := make([]allocTuple, 0, len(diff.update)+len(diff.reconnecting))
+	updates = append(updates, diff.update...)
+	updates = append(updates, diff.reconnecting...)
+	destructiveUpdates, inplaceUpdates := inplaceUpdate(s.ctx, s.eval, s.job, s.stack, updates)
 	diff.update = destructiveUpdates
 
 	if s.eval.AnnotatePlan {
@@ -384,6 +417,7 @@ func (s *SystemScheduler) computePlacements(place []allocTuple) error {
 
 			// Store the available nodes by datacenter
 			s.ctx.Metrics().NodesAvailable = s.nodesByDC
+			s.ctx.Metrics().NodesInPool = len(s.nodes)
 
 			// Compute top K scoring node metadata
 			s.ctx.Metrics().PopulateScoreMetaData()
@@ -405,6 +439,7 @@ func (s *SystemScheduler) computePlacements(place []allocTuple) error {
 
 		// Store the available nodes by datacenter
 		s.ctx.Metrics().NodesAvailable = s.nodesByDC
+		s.ctx.Metrics().NodesInPool = len(s.nodes)
 
 		// Compute top K scoring node metadata
 		s.ctx.Metrics().PopulateScoreMetaData()
@@ -508,6 +543,7 @@ func (s *SystemScheduler) canHandle(trigger string) bool {
 	case structs.EvalTriggerAllocStop:
 	case structs.EvalTriggerQueuedAllocs:
 	case structs.EvalTriggerScaling:
+	case structs.EvalTriggerReconnect:
 	default:
 		switch s.sysbatch {
 		case true:

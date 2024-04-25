@@ -1,5 +1,7 @@
-//go:build darwin || dragonfly || freebsd || netbsd || openbsd || solaris || windows
-// +build darwin dragonfly freebsd netbsd openbsd solaris windows
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
+//go:build !linux
 
 package executor
 

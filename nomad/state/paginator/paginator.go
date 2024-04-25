@@ -1,7 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package paginator
 
 import (
+	"cmp"
 	"fmt"
+	"strconv"
 
 	"github.com/hashicorp/go-bexpr"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -23,6 +28,7 @@ type Paginator struct {
 	perPage        int32
 	itemCount      int32
 	seekingToken   string
+	seekingUint    uint64
 	nextToken      string
 	reverse        bool
 	nextTokenFound bool
@@ -34,7 +40,9 @@ type Paginator struct {
 	appendFunc func(interface{}) error
 }
 
-// NewPaginator returns a new Paginator.
+// NewPaginator returns a new Paginator. Any error creating the paginator is
+// due to bad user filter input, RPC functions should therefore return a 400
+// error code along with an appropriate message.
 func NewPaginator(iter Iterator, tokenizer Tokenizer, filters []Filter,
 	opts structs.QueryOptions, appendFunc func(interface{}) error) (*Paginator, error) {
 
@@ -49,12 +57,18 @@ func NewPaginator(iter Iterator, tokenizer Tokenizer, filters []Filter,
 		filters = append(filters, evaluator)
 	}
 
+	// attempt to convert token to uint for iterators ordered numerically.
+	// it's safe to ignore the error here because the `next` method ignores
+	// this field for string tokens and 0 is valid for an unset numeric token.
+	seekingUint, _ := strconv.ParseUint(opts.NextToken, 10, 64)
+
 	return &Paginator{
 		iter:           iter,
 		tokenizer:      tokenizer,
 		filters:        filters,
 		perPage:        opts.PerPage,
 		seekingToken:   opts.NextToken,
+		seekingUint:    seekingUint,
 		reverse:        opts.Reverse,
 		nextTokenFound: opts.NextToken == "",
 		appendFunc:     appendFunc,
@@ -91,15 +105,25 @@ func (p *Paginator) next() (interface{}, paginatorState) {
 	}
 	token := p.tokenizer.GetToken(raw)
 
-	// have we found the token we're seeking (if any)?
-	p.nextToken = token
+	var compared int
+
+	switch t := token.(type) {
+	case string:
+		p.nextToken = t
+		compared = cmp.Compare(t, p.seekingToken)
+	case uint64:
+		p.nextToken = strconv.FormatUint(t, 10)
+		compared = cmp.Compare(t, p.seekingUint)
+	default:
+		panic("unknown token type, neither string nor uint64")
+	}
 
 	var passedToken bool
 
 	if p.reverse {
-		passedToken = token > p.seekingToken
+		passedToken = compared == 1 // token > p.seekingToken
 	} else {
-		passedToken = token < p.seekingToken
+		passedToken = compared == -1 // token < p.seekingToken
 	}
 
 	if !p.nextTokenFound && passedToken {

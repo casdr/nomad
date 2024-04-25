@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 import (
@@ -6,7 +9,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -439,6 +442,74 @@ func TestJobDiff(t *testing.T) {
 			},
 		},
 		{
+			// NodePool added
+			Old: &Job{},
+			New: &Job{
+				NodePool: "default",
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Fields: []*FieldDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "NodePool",
+						Old:  "",
+						New:  "default",
+					},
+				},
+			},
+		},
+		{
+			// NodePool removed
+			Old: &Job{
+				NodePool: "default",
+			},
+			New: &Job{},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Fields: []*FieldDiff{
+					{
+						Type: DiffTypeDeleted,
+						Name: "NodePool",
+						Old:  "default",
+						New:  "",
+					},
+				},
+			},
+		},
+		{
+			// NodePool changed
+			Old: &Job{
+				NodePool: "default",
+			},
+			New: &Job{
+				NodePool: "foo",
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Fields: []*FieldDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "NodePool",
+						Old:  "default",
+						New:  "foo",
+					},
+				},
+			},
+		},
+		{
+			// NodePool unchanged
+			Old: &Job{
+				NodePool: "foo",
+			},
+			New: &Job{
+				NodePool: "foo",
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeNone,
+			},
+		},
+		{
 			// Periodic added
 			Old: &Job{},
 			New: &Job{
@@ -486,6 +557,74 @@ func TestJobDiff(t *testing.T) {
 								Name: "TimeZone",
 								Old:  "",
 								New:  "Europe/Minsk",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Periodic multiple times added
+			Old: &Job{},
+			New: &Job{
+				Periodic: &PeriodicConfig{
+					Enabled:         false,
+					Specs:           []string{"*/15 * * * * *", "*/16 * * * * *"},
+					SpecType:        "foo",
+					ProhibitOverlap: false,
+					TimeZone:        "Europe/Minsk",
+				},
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Periodic",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Enabled",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "ProhibitOverlap",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "SpecType",
+								Old:  "",
+								New:  "foo",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "TimeZone",
+								Old:  "",
+								New:  "Europe/Minsk",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Specs",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Specs",
+										Old:  "",
+										New:  "*/15 * * * * *",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "Specs",
+										Old:  "",
+										New:  "*/16 * * * * *",
+									},
+								},
 							},
 						},
 					},
@@ -602,6 +741,258 @@ func TestJobDiff(t *testing.T) {
 								Name: "TimeZone",
 								Old:  "Europe/Minsk",
 								New:  "America/Los_Angeles",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Periodic single to multiple times
+			Old: &Job{
+				Periodic: &PeriodicConfig{
+					Enabled:         false,
+					Spec:            "*/15 * * * * *",
+					SpecType:        "foo",
+					ProhibitOverlap: false,
+					TimeZone:        "Europe/Minsk",
+				},
+			},
+			New: &Job{
+				Periodic: &PeriodicConfig{
+					Enabled:         true,
+					Specs:           []string{"* * * * * *", "*/5 * * * * *"},
+					SpecType:        "cron",
+					ProhibitOverlap: true,
+					TimeZone:        "America/Los_Angeles",
+				},
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Periodic",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Enabled",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "ProhibitOverlap",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Spec",
+								Old:  "*/15 * * * * *",
+								New:  "",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "SpecType",
+								Old:  "foo",
+								New:  "cron",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "TimeZone",
+								Old:  "Europe/Minsk",
+								New:  "America/Los_Angeles",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Specs",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Specs",
+										Old:  "",
+										New:  "* * * * * *",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "Specs",
+										Old:  "",
+										New:  "*/5 * * * * *",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Periodic multiple times to single
+			Old: &Job{
+				Periodic: &PeriodicConfig{
+					Enabled:         false,
+					Specs:           []string{"* * * * * *", "*/5 * * * * *"},
+					SpecType:        "foo",
+					ProhibitOverlap: false,
+					TimeZone:        "Europe/Minsk",
+				},
+			},
+			New: &Job{
+				Periodic: &PeriodicConfig{
+					Enabled:         true,
+					Spec:            "*/15 * * * * *",
+					SpecType:        "cron",
+					ProhibitOverlap: true,
+					TimeZone:        "America/Los_Angeles",
+				},
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Periodic",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Enabled",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "ProhibitOverlap",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Spec",
+								Old:  "",
+								New:  "*/15 * * * * *",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "SpecType",
+								Old:  "foo",
+								New:  "cron",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "TimeZone",
+								Old:  "Europe/Minsk",
+								New:  "America/Los_Angeles",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Specs",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "Specs",
+										Old:  "* * * * * *",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Specs",
+										Old:  "*/5 * * * * *",
+										New:  "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Periodic edit multiple times
+			Old: &Job{
+				Periodic: &PeriodicConfig{
+					Enabled:         false,
+					Specs:           []string{"*/4 * * * * *", "*/6 * * * * *"},
+					SpecType:        "foo",
+					ProhibitOverlap: false,
+					TimeZone:        "Europe/Minsk",
+				},
+			},
+			New: &Job{
+				Periodic: &PeriodicConfig{
+					Enabled:         true,
+					Specs:           []string{"*/5 * * * * *", "*/7 * * * * *"},
+					SpecType:        "cron",
+					ProhibitOverlap: true,
+					TimeZone:        "America/Los_Angeles",
+				},
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Periodic",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Enabled",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "ProhibitOverlap",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "SpecType",
+								Old:  "foo",
+								New:  "cron",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "TimeZone",
+								Old:  "Europe/Minsk",
+								New:  "America/Los_Angeles",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Specs",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Specs",
+										Old:  "",
+										New:  "*/5 * * * * *",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "Specs",
+										Old:  "",
+										New:  "*/7 * * * * *",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Specs",
+										Old:  "*/4 * * * * *",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Specs",
+										Old:  "*/6 * * * * *",
+										New:  "",
+									},
+								},
 							},
 						},
 					},
@@ -860,32 +1251,38 @@ func TestJobDiff(t *testing.T) {
 			Old: &Job{
 				TaskGroups: []*TaskGroup{
 					{
-						Name:  "foo",
-						Count: 1,
+						Name:                    "foo",
+						Count:                   1,
+						PreventRescheduleOnLost: true,
 					},
 					{
-						Name:  "bar",
-						Count: 1,
+						Name:                    "bar",
+						Count:                   1,
+						PreventRescheduleOnLost: false,
 					},
 					{
-						Name:  "baz",
-						Count: 1,
+						Name:                    "baz",
+						Count:                   1,
+						PreventRescheduleOnLost: true,
 					},
 				},
 			},
 			New: &Job{
 				TaskGroups: []*TaskGroup{
 					{
-						Name:  "bar",
-						Count: 1,
+						Name:                    "bar",
+						Count:                   1,
+						PreventRescheduleOnLost: false,
 					},
 					{
-						Name:  "baz",
-						Count: 2,
+						Name:                    "baz",
+						Count:                   2,
+						PreventRescheduleOnLost: true,
 					},
 					{
-						Name:  "bam",
-						Count: 1,
+						Name:                    "bam",
+						Count:                   1,
+						PreventRescheduleOnLost: true,
 					},
 				},
 			},
@@ -901,6 +1298,12 @@ func TestJobDiff(t *testing.T) {
 								Name: "Count",
 								Old:  "",
 								New:  "1",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "PreventRescheduleOnLost",
+								Old:  "",
+								New:  "true",
 							},
 						},
 					},
@@ -928,6 +1331,12 @@ func TestJobDiff(t *testing.T) {
 								Type: DiffTypeDeleted,
 								Name: "Count",
 								Old:  "1",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "PreventRescheduleOnLost",
+								Old:  "true",
 								New:  "",
 							},
 						},
@@ -1176,7 +1585,6 @@ func TestJobDiff(t *testing.T) {
 				},
 			},
 		},
-
 		{
 			// Multiregion: region added
 			Old: &Job{
@@ -1321,6 +1729,21 @@ func TestJobDiff(t *testing.T) {
 				},
 			},
 		},
+		{
+			// VaultToken is filtered
+			Old: &Job{
+				ID:         "vault-job",
+				VaultToken: "secret",
+			},
+			New: &Job{
+				ID:         "vault-job",
+				VaultToken: "new-secret",
+			},
+			Expected: &JobDiff{
+				Type: DiffTypeNone,
+				ID:   "vault-job",
+			},
+		},
 	}
 
 	for i, c := range cases {
@@ -1430,6 +1853,31 @@ func TestTaskGroupDiff(t *testing.T) {
 						Name: "Meta[foo]",
 						Old:  "bar",
 						New:  "baz",
+					},
+				},
+			},
+		},
+		{
+			TestCase: "Reschedule on lost diff",
+			Old: &TaskGroup{
+				Name:                    "foo",
+				Count:                   100,
+				PreventRescheduleOnLost: true,
+			},
+			New: &TaskGroup{
+				Name:                    "foo",
+				Count:                   100,
+				PreventRescheduleOnLost: false,
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Name: "foo",
+				Fields: []*FieldDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "PreventRescheduleOnLost",
+						Old:  "true",
+						New:  "false",
 					},
 				},
 			},
@@ -1712,6 +2160,8 @@ func TestTaskGroupDiff(t *testing.T) {
 			New: &TaskGroup{
 				Consul: &Consul{
 					Namespace: "team2",
+					Cluster:   "us-east-1",
+					Partition: "us-east-1a",
 				},
 			},
 			Expected: &TaskGroupDiff{
@@ -1722,10 +2172,22 @@ func TestTaskGroupDiff(t *testing.T) {
 						Name: "Consul",
 						Fields: []*FieldDiff{
 							{
+								Type: DiffTypeAdded,
+								Name: "Cluster",
+								Old:  "",
+								New:  "us-east-1",
+							},
+							{
 								Type: DiffTypeEdited,
 								Name: "Namespace",
 								Old:  "team1",
 								New:  "team2",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Partition",
+								Old:  "",
+								New:  "us-east-1a",
 							},
 						},
 					},
@@ -1774,6 +2236,12 @@ func TestTaskGroupDiff(t *testing.T) {
 								Old:  "",
 								New:  "fail",
 							},
+							{
+								Type: DiffTypeAdded,
+								Name: "RenderTemplates",
+								Old:  "",
+								New:  "false",
+							},
 						},
 					},
 				},
@@ -1821,6 +2289,12 @@ func TestTaskGroupDiff(t *testing.T) {
 								Old:  "fail",
 								New:  "",
 							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "RenderTemplates",
+								Old:  "false",
+								New:  "",
+							},
 						},
 					},
 				},
@@ -1838,10 +2312,11 @@ func TestTaskGroupDiff(t *testing.T) {
 			},
 			New: &TaskGroup{
 				RestartPolicy: &RestartPolicy{
-					Attempts: 2,
-					Interval: 2 * time.Second,
-					Delay:    2 * time.Second,
-					Mode:     "delay",
+					Attempts:        2,
+					Interval:        2 * time.Second,
+					Delay:           2 * time.Second,
+					Mode:            "delay",
+					RenderTemplates: true,
 				},
 			},
 			Expected: &TaskGroupDiff{
@@ -1875,6 +2350,12 @@ func TestTaskGroupDiff(t *testing.T) {
 								Old:  "fail",
 								New:  "delay",
 							},
+							{
+								Type: DiffTypeEdited,
+								Name: "RenderTemplates",
+								Old:  "false",
+								New:  "true",
+							},
 						},
 					},
 				},
@@ -1885,18 +2366,20 @@ func TestTaskGroupDiff(t *testing.T) {
 			Contextual: true,
 			Old: &TaskGroup{
 				RestartPolicy: &RestartPolicy{
-					Attempts: 1,
-					Interval: 1 * time.Second,
-					Delay:    1 * time.Second,
-					Mode:     "fail",
+					Attempts:        1,
+					Interval:        1 * time.Second,
+					Delay:           1 * time.Second,
+					Mode:            "fail",
+					RenderTemplates: false,
 				},
 			},
 			New: &TaskGroup{
 				RestartPolicy: &RestartPolicy{
-					Attempts: 2,
-					Interval: 2 * time.Second,
-					Delay:    1 * time.Second,
-					Mode:     "fail",
+					Attempts:        2,
+					Interval:        2 * time.Second,
+					Delay:           1 * time.Second,
+					Mode:            "fail",
+					RenderTemplates: true,
 				},
 			},
 			Expected: &TaskGroupDiff{
@@ -1929,6 +2412,12 @@ func TestTaskGroupDiff(t *testing.T) {
 								Name: "Mode",
 								Old:  "fail",
 								New:  "fail",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "RenderTemplates",
+								Old:  "false",
+								New:  "true",
 							},
 						},
 					},
@@ -2482,6 +2971,209 @@ func TestTaskGroupDiff(t *testing.T) {
 			},
 		},
 		{
+			TestCase: "Disconnect strategy deleted",
+			Old: &TaskGroup{
+				Disconnect: &DisconnectStrategy{
+					LostAfter:         1 * time.Second,
+					Replace:           pointer.Of(true),
+					Reconcile:         ReconcileOptionLongestRunning,
+					StopOnClientAfter: pointer.Of(1 * time.Second),
+				},
+			},
+			New: &TaskGroup{},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeDeleted,
+						Name: "Disconnect",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "LostAfter",
+								Old:  "1000000000",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Reconcile",
+								Old:  ReconcileOptionLongestRunning,
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Replace",
+								Old:  "true",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "StopOnClientAfter",
+								Old:  "1000000000",
+								New:  "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			TestCase: "Disconnect strategy added",
+			Old:      &TaskGroup{},
+			New: &TaskGroup{
+				Disconnect: &DisconnectStrategy{
+					LostAfter:         time.Second,
+					Replace:           pointer.Of(true),
+					Reconcile:         ReconcileOptionLongestRunning,
+					StopOnClientAfter: pointer.Of(1 * time.Second),
+				},
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Disconnect",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "LostAfter",
+								Old:  "",
+								New:  "1000000000",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Reconcile",
+								Old:  "",
+								New:  ReconcileOptionLongestRunning,
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Replace",
+								Old:  "",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "StopOnClientAfter",
+								Old:  "",
+								New:  "1000000000",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			TestCase: "Disconnect strategy edited",
+			Old: &TaskGroup{
+				Disconnect: &DisconnectStrategy{
+					LostAfter:         time.Second,
+					Replace:           pointer.Of(false),
+					Reconcile:         ReconcileOptionLongestRunning,
+					StopOnClientAfter: pointer.Of(1 * time.Second),
+				},
+			},
+			New: &TaskGroup{
+				Disconnect: &DisconnectStrategy{
+					LostAfter:         time.Minute,
+					Replace:           pointer.Of(true),
+					Reconcile:         ReconcileOptionBestScore,
+					StopOnClientAfter: pointer.Of(1 * time.Minute),
+				},
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Disconnect",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "LostAfter",
+								Old:  "1000000000",
+								New:  "60000000000",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "Reconcile",
+								Old:  ReconcileOptionLongestRunning,
+								New:  ReconcileOptionBestScore,
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "Replace",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "StopOnClientAfter",
+								Old:  "1000000000",
+								New:  "60000000000",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			TestCase:   "Disconnect strategy edited with context",
+			Contextual: true,
+			Old: &TaskGroup{
+				Disconnect: &DisconnectStrategy{
+					LostAfter:         time.Second,
+					Replace:           pointer.Of(false),
+					Reconcile:         ReconcileOptionLongestRunning,
+					StopOnClientAfter: pointer.Of(1 * time.Second),
+				},
+			},
+			New: &TaskGroup{
+				Disconnect: &DisconnectStrategy{
+					LostAfter:         time.Minute,
+					Replace:           pointer.Of(true),
+					Reconcile:         ReconcileOptionBestScore,
+					StopOnClientAfter: pointer.Of(1 * time.Second),
+				},
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Disconnect",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "LostAfter",
+								Old:  "1000000000",
+								New:  "60000000000",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "Reconcile",
+								Old:  ReconcileOptionLongestRunning,
+								New:  ReconcileOptionBestScore,
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "Replace",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "StopOnClientAfter",
+								Old:  "1000000000",
+								New:  "1000000000",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			TestCase: "EphemeralDisk added",
 			Old:      &TaskGroup{},
 			New: &TaskGroup{
@@ -2663,6 +3355,7 @@ func TestTaskGroupDiff(t *testing.T) {
 					{
 						Name:              "foo",
 						Namespace:         "team1",
+						Cluster:           "default",
 						TaskName:          "task1",
 						EnableTagOverride: false,
 						Checks: []*ServiceCheck{
@@ -2680,6 +3373,7 @@ func TestTaskGroupDiff(t *testing.T) {
 								Timeout:                1 * time.Second,
 								SuccessBeforePassing:   3,
 								FailuresBeforeCritical: 4,
+								FailuresBeforeWarning:  2,
 							},
 						},
 						Connect: &ConsulConnect{
@@ -2696,7 +3390,7 @@ func TestTaskGroupDiff(t *testing.T) {
 							},
 							Gateway: &ConsulGateway{
 								Proxy: &ConsulGatewayProxy{
-									ConnectTimeout:                  helper.TimeToPtr(1 * time.Second),
+									ConnectTimeout:                  pointer.Of(1 * time.Second),
 									EnvoyGatewayBindTaggedAddresses: false,
 									EnvoyGatewayBindAddresses: map[string]*ConsulGatewayBindAddress{
 										"service1": {
@@ -2745,6 +3439,7 @@ func TestTaskGroupDiff(t *testing.T) {
 					{
 						Name:              "foo",
 						Namespace:         "team1",
+						Cluster:           "default",
 						TaskName:          "task2",
 						EnableTagOverride: true,
 						Checks: []*ServiceCheck{
@@ -2762,6 +3457,7 @@ func TestTaskGroupDiff(t *testing.T) {
 								},
 								SuccessBeforePassing:   5,
 								FailuresBeforeCritical: 6,
+								FailuresBeforeWarning:  4,
 							},
 						},
 						Connect: &ConsulConnect{
@@ -2773,23 +3469,41 @@ func TestTaskGroupDiff(t *testing.T) {
 									LocalServicePort:    8080,
 									Upstreams: []ConsulUpstream{
 										{
-											DestinationName:  "foo",
-											LocalBindPort:    8000,
-											Datacenter:       "dc2",
-											LocalBindAddress: "127.0.0.2",
-											MeshGateway: &ConsulMeshGateway{
+											DestinationName:      "foo",
+											DestinationNamespace: "ns2",
+											LocalBindPort:        8000,
+											Datacenter:           "dc2",
+											LocalBindAddress:     "127.0.0.2",
+											MeshGateway: ConsulMeshGateway{
 												Mode: "remote",
 											},
 										},
 									},
+									Expose: &ConsulExposeConfig{
+										Paths: []ConsulExposePath{{
+											Path:          "/health",
+											Protocol:      "http",
+											LocalPathPort: 9001,
+											ListenerPort:  "api_expose_healthcheck",
+										}},
+									},
 									Config: map[string]interface{}{
 										"foo": "qux",
+									},
+									TransparentProxy: &ConsulTransparentProxy{
+										UID:                  "101",
+										OutboundPort:         15001,
+										ExcludeInboundPorts:  []string{"www", "9000"},
+										ExcludeOutboundPorts: []uint16{4443},
+										ExcludeOutboundCIDRs: []string{"10.0.0.0/8"},
+										ExcludeUIDs:          []string{"1", "10"},
+										NoDNS:                true,
 									},
 								},
 							},
 							Gateway: &ConsulGateway{
 								Proxy: &ConsulGatewayProxy{
-									ConnectTimeout:                  helper.TimeToPtr(2 * time.Second),
+									ConnectTimeout:                  pointer.Of(2 * time.Second),
 									EnvoyGatewayBindTaggedAddresses: true,
 									EnvoyGatewayBindAddresses: map[string]*ConsulGatewayBindAddress{
 										"service1": {
@@ -2843,9 +3557,21 @@ func TestTaskGroupDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeNone,
+								Name: "Address",
+								Old:  "",
+								New:  "",
+							},
+							{
+								Type: DiffTypeNone,
 								Name: "AddressMode",
 								Old:  "",
 								New:  "",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Cluster",
+								Old:  "default",
+								New:  "default",
 							},
 							{
 								Type: DiffTypeEdited,
@@ -2874,6 +3600,12 @@ func TestTaskGroupDiff(t *testing.T) {
 							{
 								Type: DiffTypeNone,
 								Name: "PortLabel",
+								Old:  "",
+								New:  "",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Provider",
 								Old:  "",
 								New:  "",
 							},
@@ -2918,6 +3650,12 @@ func TestTaskGroupDiff(t *testing.T) {
 										Name: "FailuresBeforeCritical",
 										Old:  "4",
 										New:  "6",
+									},
+									{
+										Type: DiffTypeEdited,
+										Name: "FailuresBeforeWarning",
+										Old:  "2",
+										New:  "4",
 									},
 									{
 										Type: DiffTypeNone,
@@ -2984,6 +3722,12 @@ func TestTaskGroupDiff(t *testing.T) {
 										Name: "SuccessBeforePassing",
 										Old:  "3",
 										New:  "5",
+									},
+									{
+										Type: DiffTypeNone,
+										Name: "TLSServerName",
+										Old:  "",
+										New:  "",
 									},
 									{
 										Type: DiffTypeNone,
@@ -3091,6 +3835,30 @@ func TestTaskGroupDiff(t *testing.T) {
 															},
 															{
 																Type: DiffTypeAdded,
+																Name: "DestinationNamespace",
+																Old:  "",
+																New:  "ns2",
+															},
+															{
+																Type: DiffTypeNone,
+																Name: "DestinationPartition",
+																Old:  "",
+																New:  "",
+															},
+															{
+																Type: DiffTypeNone,
+																Name: "DestinationPeer",
+																Old:  "",
+																New:  "",
+															},
+															{
+																Type: DiffTypeNone,
+																Name: "DestinationType",
+																Old:  "",
+																New:  "",
+															},
+															{
+																Type: DiffTypeAdded,
 																Name: "LocalBindAddress",
 																Old:  "",
 																New:  "127.0.0.2",
@@ -3100,6 +3868,18 @@ func TestTaskGroupDiff(t *testing.T) {
 																Name: "LocalBindPort",
 																Old:  "",
 																New:  "8000",
+															},
+															{
+																Type: DiffTypeNone,
+																Name: "LocalBindSocketMode",
+																Old:  "",
+																New:  "",
+															},
+															{
+																Type: DiffTypeNone,
+																Name: "LocalBindSocketPath",
+																Old:  "",
+																New:  "",
 															},
 														},
 														Objects: []*ObjectDiff{
@@ -3114,6 +3894,128 @@ func TestTaskGroupDiff(t *testing.T) {
 																		New:  "remote",
 																	},
 																},
+															},
+														},
+													},
+													{
+														Type: DiffTypeAdded,
+														Name: "Expose",
+														Objects: []*ObjectDiff{
+															{
+																Type: DiffTypeAdded,
+																Name: "Paths",
+																Fields: []*FieldDiff{
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "ListenerPort",
+																		Old:  "",
+																		New:  "api_expose_healthcheck",
+																	},
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "LocalPathPort",
+																		Old:  "",
+																		New:  "9001",
+																	},
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "Path",
+																		Old:  "",
+																		New:  "/health",
+																	},
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "Protocol",
+																		Old:  "",
+																		New:  "http",
+																	},
+																},
+															},
+														},
+													},
+													{
+														Type: DiffTypeAdded,
+														Name: "TransparentProxy",
+														Objects: []*ObjectDiff{
+															{
+																Type: DiffTypeAdded,
+																Name: "ExcludeInboundPorts",
+																Fields: []*FieldDiff{
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "ExcludeInboundPorts",
+																		Old:  "",
+																		New:  "9000",
+																	},
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "ExcludeInboundPorts",
+																		Old:  "",
+																		New:  "www",
+																	},
+																},
+															},
+															{
+																Type: DiffTypeAdded,
+																Name: "ExcludeOutboundPorts",
+																Fields: []*FieldDiff{
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "ExcludeOutboundPorts",
+																		Old:  "",
+																		New:  "4443",
+																	},
+																},
+															},
+															{
+																Type: DiffTypeAdded,
+																Name: "ExcludeOutboundCIDRs",
+																Fields: []*FieldDiff{
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "ExcludeOutboundCIDRs",
+																		Old:  "",
+																		New:  "10.0.0.0/8",
+																	},
+																},
+															},
+															{
+																Type: DiffTypeAdded,
+																Name: "ExcludeUIDs",
+																Fields: []*FieldDiff{
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "ExcludeUIDs",
+																		Old:  "",
+																		New:  "1",
+																	},
+																	{
+																		Type: DiffTypeAdded,
+																		Name: "ExcludeUIDs",
+																		Old:  "",
+																		New:  "10",
+																	},
+																},
+															},
+														},
+														Fields: []*FieldDiff{
+															{
+																Type: DiffTypeAdded,
+																Name: "NoDNS",
+																Old:  "",
+																New:  "true",
+															},
+															{
+																Type: DiffTypeAdded,
+																Name: "OutboundPort",
+																Old:  "",
+																New:  "15001",
+															},
+															{
+																Type: DiffTypeAdded,
+																Name: "UID",
+																Old:  "",
+																New:  "101",
 															},
 														},
 													},
@@ -3245,6 +4147,18 @@ func TestTaskGroupDiff(t *testing.T) {
 																Name: "Enabled",
 																Old:  "false",
 																New:  "true",
+															},
+															{
+																Type: DiffTypeNone,
+																Name: "TLSMaxVersion",
+																Old:  "",
+																New:  "",
+															},
+															{
+																Type: DiffTypeNone,
+																Name: "TLSMinVersion",
+																Old:  "",
+																New:  "",
 															},
 														},
 													},
@@ -3705,10 +4619,10 @@ func TestTaskGroupDiff(t *testing.T) {
 		{
 			TestCase: "TaskGroup shutdown_delay edited",
 			Old: &TaskGroup{
-				ShutdownDelay: helper.TimeToPtr(30 * time.Second),
+				ShutdownDelay: pointer.Of(30 * time.Second),
 			},
 			New: &TaskGroup{
-				ShutdownDelay: helper.TimeToPtr(5 * time.Second),
+				ShutdownDelay: pointer.Of(5 * time.Second),
 			},
 			Expected: &TaskGroupDiff{
 				Type: DiffTypeEdited,
@@ -3725,7 +4639,7 @@ func TestTaskGroupDiff(t *testing.T) {
 		{
 			TestCase: "TaskGroup shutdown_delay removed",
 			Old: &TaskGroup{
-				ShutdownDelay: helper.TimeToPtr(30 * time.Second),
+				ShutdownDelay: pointer.Of(30 * time.Second),
 			},
 			New: &TaskGroup{},
 			Expected: &TaskGroupDiff{
@@ -3744,7 +4658,7 @@ func TestTaskGroupDiff(t *testing.T) {
 			TestCase: "TaskGroup shutdown_delay added",
 			Old:      &TaskGroup{},
 			New: &TaskGroup{
-				ShutdownDelay: helper.TimeToPtr(30 * time.Second),
+				ShutdownDelay: pointer.Of(30 * time.Second),
 			},
 			Expected: &TaskGroupDiff{
 				Type: DiffTypeEdited,
@@ -3904,12 +4818,277 @@ func TestTaskGroupDiff(t *testing.T) {
 				},
 			},
 		},
+		{
+			TestCase: "MaxClientDisconnect added",
+			Old: &TaskGroup{
+				Name:                "foo",
+				MaxClientDisconnect: nil,
+			},
+			New: &TaskGroup{
+				Name:                "foo",
+				MaxClientDisconnect: pointer.Of(20 * time.Second),
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Name: "foo",
+				Fields: []*FieldDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "MaxClientDisconnect",
+						Old:  "",
+						New:  "20000000000",
+					},
+				},
+			},
+		},
+		{
+			TestCase: "MaxClientDisconnect updated",
+			Old: &TaskGroup{
+				Name:                "foo",
+				MaxClientDisconnect: pointer.Of(10 * time.Second),
+			},
+			New: &TaskGroup{
+				Name:                "foo",
+				MaxClientDisconnect: pointer.Of(20 * time.Second),
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Name: "foo",
+				Fields: []*FieldDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "MaxClientDisconnect",
+						Old:  "10000000000",
+						New:  "20000000000",
+					},
+				},
+			},
+		},
+		{
+			TestCase: "MaxClientDisconnect deleted",
+			Old: &TaskGroup{
+				Name:                "foo",
+				MaxClientDisconnect: pointer.Of(10 * time.Second),
+			},
+			New: &TaskGroup{
+				Name:                "foo",
+				MaxClientDisconnect: nil,
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Name: "foo",
+				Fields: []*FieldDiff{
+					{
+						Type: DiffTypeDeleted,
+						Name: "MaxClientDisconnect",
+						Old:  "10000000000",
+						New:  "",
+					},
+				},
+			},
+		},
+		{
+			TestCase: "Scaling added",
+			Old:      &TaskGroup{},
+			New: &TaskGroup{
+				Scaling: &ScalingPolicy{
+					Enabled: true,
+					Max:     10,
+					Min:     1,
+					Policy: map[string]interface{}{
+						"cooldown":            "1m",
+						"evaluation_interval": "5s",
+					},
+				},
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Scaling",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Enabled",
+								Old:  "",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Max",
+								Old:  "",
+								New:  "10",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Min",
+								Old:  "",
+								New:  "1",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Policy",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "cooldown",
+										Old:  "",
+										New:  "1m",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "evaluation_interval",
+										Old:  "",
+										New:  "5s",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			TestCase: "Scaling deleted",
+			Old: &TaskGroup{
+				Scaling: &ScalingPolicy{
+					Enabled: true,
+					Max:     10,
+					Min:     1,
+					Policy: map[string]interface{}{
+						"cooldown":            "1m",
+						"evaluation_interval": "5s",
+					},
+				},
+			},
+			New: &TaskGroup{},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeDeleted,
+						Name: "Scaling",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Enabled",
+								Old:  "true",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Max",
+								Old:  "10",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Min",
+								Old:  "1",
+								New:  "",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Policy",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "cooldown",
+										Old:  "1m",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "evaluation_interval",
+										Old:  "5s",
+										New:  "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			TestCase: "Scaling edited",
+			Old: &TaskGroup{
+				Scaling: &ScalingPolicy{
+					Enabled: true,
+					Max:     10,
+					Min:     1,
+					Policy: map[string]interface{}{
+						"cooldown":            "1m",
+						"evaluation_interval": "5s",
+					},
+				},
+			},
+			New: &TaskGroup{
+				Scaling: &ScalingPolicy{
+					Enabled: true,
+					Max:     15,
+					Min:     5,
+					Policy: map[string]interface{}{
+						"cooldown":            "2m",
+						"evaluation_interval": "10s",
+					},
+				},
+			},
+			Expected: &TaskGroupDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Scaling",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Max",
+								Old:  "10",
+								New:  "15",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "Min",
+								Old:  "1",
+								New:  "5",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Policy",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeEdited,
+										Name: "cooldown",
+										Old:  "1m",
+										New:  "2m",
+									}, {
+										Type: DiffTypeEdited,
+										Name: "evaluation_interval",
+										Old:  "5s",
+										New:  "10s",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for i, c := range cases {
 		require.NotEmpty(t, c.TestCase, "case #%d needs a name", i+1)
 
 		t.Run(c.TestCase, func(t *testing.T) {
+
 			result, err := c.Old.Diff(c.New, c.Contextual)
 			switch c.ExpErr {
 			case true:
@@ -4303,6 +5482,7 @@ func TestTaskDiff(t *testing.T) {
 				LogConfig: &LogConfig{
 					MaxFiles:      1,
 					MaxFileSizeMB: 10,
+					Disabled:      true,
 				},
 			},
 			Expected: &TaskDiff{
@@ -4312,6 +5492,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeAdded,
 						Name: "LogConfig",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Disabled",
+								Old:  "",
+								New:  "true",
+							},
 							{
 								Type: DiffTypeAdded,
 								Name: "MaxFileSizeMB",
@@ -4335,6 +5521,7 @@ func TestTaskDiff(t *testing.T) {
 				LogConfig: &LogConfig{
 					MaxFiles:      1,
 					MaxFileSizeMB: 10,
+					Disabled:      true,
 				},
 			},
 			New: &Task{},
@@ -4345,6 +5532,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeDeleted,
 						Name: "LogConfig",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Disabled",
+								Old:  "true",
+								New:  "",
+							},
 							{
 								Type: DiffTypeDeleted,
 								Name: "MaxFileSizeMB",
@@ -4368,12 +5561,14 @@ func TestTaskDiff(t *testing.T) {
 				LogConfig: &LogConfig{
 					MaxFiles:      1,
 					MaxFileSizeMB: 10,
+					Disabled:      false,
 				},
 			},
 			New: &Task{
 				LogConfig: &LogConfig{
 					MaxFiles:      2,
 					MaxFileSizeMB: 20,
+					Disabled:      true,
 				},
 			},
 			Expected: &TaskDiff{
@@ -4383,6 +5578,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeEdited,
 						Name: "LogConfig",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Disabled",
+								Old:  "false",
+								New:  "true",
+							},
 							{
 								Type: DiffTypeEdited,
 								Name: "MaxFileSizeMB",
@@ -4407,12 +5608,14 @@ func TestTaskDiff(t *testing.T) {
 				LogConfig: &LogConfig{
 					MaxFiles:      1,
 					MaxFileSizeMB: 10,
+					Disabled:      false,
 				},
 			},
 			New: &Task{
 				LogConfig: &LogConfig{
 					MaxFiles:      1,
 					MaxFileSizeMB: 20,
+					Disabled:      true,
 				},
 			},
 			Expected: &TaskDiff{
@@ -4422,6 +5625,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeEdited,
 						Name: "LogConfig",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Disabled",
+								Old:  "false",
+								New:  "true",
+							},
 							{
 								Type: DiffTypeEdited,
 								Name: "MaxFileSizeMB",
@@ -4519,6 +5728,12 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeAdded,
+								Name: "GetterInsecure",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
 								Name: "GetterMode",
 								Old:  "",
 								New:  "file",
@@ -4551,6 +5766,13 @@ func TestTaskDiff(t *testing.T) {
 								Type: DiffTypeDeleted,
 								Name: "GetterHeaders[User]",
 								Old:  "user1",
+								New:  "",
+							},
+
+							{
+								Type: DiffTypeDeleted,
+								Name: "GetterInsecure",
+								Old:  "false",
 								New:  "",
 							},
 							{
@@ -5561,6 +6783,7 @@ func TestTaskDiff(t *testing.T) {
 						Name:        "foo",
 						PortLabel:   "bar",
 						AddressMode: "driver",
+						Address:     "a.example.com",
 						TaskName:    "task1",
 					},
 				},
@@ -5574,9 +6797,21 @@ func TestTaskDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeAdded,
+								Name: "Address",
+								Old:  "",
+								New:  "a.example.com",
+							},
+							{
+								Type: DiffTypeAdded,
 								Name: "AddressMode",
 								Old:  "",
 								New:  "driver",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Cluster",
+								Old:  "",
+								New:  "",
 							},
 							{
 								Type: DiffTypeNone,
@@ -5607,6 +6842,10 @@ func TestTaskDiff(t *testing.T) {
 								Name: "PortLabel",
 								Old:  "foo",
 								New:  "bar",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Provider",
 							},
 							{
 								Type: DiffTypeAdded,
@@ -5728,7 +6967,17 @@ func TestTaskDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeNone,
+								Name: "Address",
+							},
+							{
+								Type: DiffTypeNone,
 								Name: "AddressMode",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Cluster",
+								Old:  "",
+								New:  "",
 							},
 							{
 								Type: DiffTypeNone,
@@ -5751,6 +7000,10 @@ func TestTaskDiff(t *testing.T) {
 							{
 								Type: DiffTypeNone,
 								Name: "PortLabel",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Provider",
 							},
 							{
 								Type: DiffTypeNone,
@@ -5894,6 +7147,7 @@ func TestTaskDiff(t *testing.T) {
 								},
 								SuccessBeforePassing:   1,
 								FailuresBeforeCritical: 1,
+								FailuresBeforeWarning:  1,
 							},
 							{
 								Name:                   "bar",
@@ -5906,6 +7160,7 @@ func TestTaskDiff(t *testing.T) {
 								Timeout:                1 * time.Second,
 								SuccessBeforePassing:   7,
 								FailuresBeforeCritical: 7,
+								FailuresBeforeWarning:  5,
 							},
 							{
 								Name:     "baz",
@@ -5937,6 +7192,7 @@ func TestTaskDiff(t *testing.T) {
 								Timeout:                1 * time.Second,
 								SuccessBeforePassing:   7,
 								FailuresBeforeCritical: 7,
+								FailuresBeforeWarning:  5,
 							},
 							{
 								Name:     "baz",
@@ -5962,6 +7218,7 @@ func TestTaskDiff(t *testing.T) {
 								Timeout:                1 * time.Second,
 								SuccessBeforePassing:   2,
 								FailuresBeforeCritical: 2,
+								FailuresBeforeWarning:  1,
 							},
 						},
 					},
@@ -6021,6 +7278,12 @@ func TestTaskDiff(t *testing.T) {
 										Name: "FailuresBeforeCritical",
 										Old:  "",
 										New:  "2",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "FailuresBeforeWarning",
+										Old:  "",
+										New:  "1",
 									},
 									{
 										Type: DiffTypeAdded,
@@ -6097,6 +7360,12 @@ func TestTaskDiff(t *testing.T) {
 									{
 										Type: DiffTypeDeleted,
 										Name: "FailuresBeforeCritical",
+										Old:  "1",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "FailuresBeforeWarning",
 										Old:  "1",
 										New:  "",
 									},
@@ -6180,7 +7449,8 @@ func TestTaskDiff(t *testing.T) {
 			Old: &Task{
 				Services: []*Service{
 					{
-						Name: "foo",
+						Name:    "foo",
+						Cluster: "default",
 						Checks: []*ServiceCheck{
 							{
 								Name:          "foo",
@@ -6197,6 +7467,7 @@ func TestTaskDiff(t *testing.T) {
 								},
 								SuccessBeforePassing:   4,
 								FailuresBeforeCritical: 5,
+								FailuresBeforeWarning:  4,
 								OnUpdate:               "require_healthy",
 							},
 						},
@@ -6206,7 +7477,8 @@ func TestTaskDiff(t *testing.T) {
 			New: &Task{
 				Services: []*Service{
 					{
-						Name: "foo",
+						Name:    "foo",
+						Cluster: "default",
 						Checks: []*ServiceCheck{
 							{
 								Name:          "foo",
@@ -6239,9 +7511,21 @@ func TestTaskDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeNone,
+								Name: "Address",
+								Old:  "",
+								New:  "",
+							},
+							{
+								Type: DiffTypeNone,
 								Name: "AddressMode",
 								Old:  "",
 								New:  "",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Cluster",
+								Old:  "default",
+								New:  "default",
 							},
 							{
 								Type: DiffTypeNone,
@@ -6270,6 +7554,10 @@ func TestTaskDiff(t *testing.T) {
 								Name: "PortLabel",
 								Old:  "",
 								New:  "",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Provider",
 							},
 							{
 								Type: DiffTypeNone,
@@ -6311,6 +7599,12 @@ func TestTaskDiff(t *testing.T) {
 										Type: DiffTypeEdited,
 										Name: "FailuresBeforeCritical",
 										Old:  "5",
+										New:  "0",
+									},
+									{
+										Type: DiffTypeEdited,
+										Name: "FailuresBeforeWarning",
+										Old:  "4",
 										New:  "0",
 									},
 									{
@@ -6378,6 +7672,12 @@ func TestTaskDiff(t *testing.T) {
 										Name: "SuccessBeforePassing",
 										Old:  "4",
 										New:  "4",
+									},
+									{
+										Type: DiffTypeNone,
+										Name: "TLSServerName",
+										Old:  "",
+										New:  "",
 									},
 									{
 										Type: DiffTypeNone,
@@ -6627,8 +7927,10 @@ func TestTaskDiff(t *testing.T) {
 			Old:  &Task{},
 			New: &Task{
 				Vault: &Vault{
+					Role:         "nomad-task",
 					Policies:     []string{"foo", "bar"},
 					Env:          true,
+					DisableFile:  true,
 					ChangeMode:   "signal",
 					ChangeSignal: "SIGUSR1",
 				},
@@ -6640,6 +7942,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeAdded,
 						Name: "Vault",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "AllowTokenExpiration",
+								Old:  "",
+								New:  "false",
+							},
 							{
 								Type: DiffTypeAdded,
 								Name: "ChangeMode",
@@ -6654,9 +7962,21 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeAdded,
+								Name: "DisableFile",
+								Old:  "",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
 								Name: "Env",
 								Old:  "",
 								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Role",
+								Old:  "",
+								New:  "nomad-task",
 							},
 						},
 						Objects: []*ObjectDiff{
@@ -6689,6 +8009,7 @@ func TestTaskDiff(t *testing.T) {
 				Vault: &Vault{
 					Policies:     []string{"foo", "bar"},
 					Env:          true,
+					DisableFile:  true,
 					ChangeMode:   "signal",
 					ChangeSignal: "SIGUSR1",
 				},
@@ -6703,6 +8024,12 @@ func TestTaskDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeDeleted,
+								Name: "AllowTokenExpiration",
+								Old:  "false",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
 								Name: "ChangeMode",
 								Old:  "signal",
 								New:  "",
@@ -6711,6 +8038,12 @@ func TestTaskDiff(t *testing.T) {
 								Type: DiffTypeDeleted,
 								Name: "ChangeSignal",
 								Old:  "SIGUSR1",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "DisableFile",
+								Old:  "true",
 								New:  "",
 							},
 							{
@@ -6748,20 +8081,26 @@ func TestTaskDiff(t *testing.T) {
 			Name: "Vault edited",
 			Old: &Task{
 				Vault: &Vault{
-					Namespace:    "ns1",
-					Policies:     []string{"foo", "bar"},
-					Env:          true,
-					ChangeMode:   "signal",
-					ChangeSignal: "SIGUSR1",
+					Role:                 "nomad-task",
+					Namespace:            "ns1",
+					Policies:             []string{"foo", "bar"},
+					Env:                  true,
+					DisableFile:          true,
+					ChangeMode:           "signal",
+					ChangeSignal:         "SIGUSR1",
+					AllowTokenExpiration: false,
 				},
 			},
 			New: &Task{
 				Vault: &Vault{
-					Namespace:    "ns2",
-					Policies:     []string{"bar", "baz"},
-					Env:          false,
-					ChangeMode:   "restart",
-					ChangeSignal: "foo",
+					Role:                 "nomad-task-2",
+					Namespace:            "ns2",
+					Policies:             []string{"bar", "baz"},
+					Env:                  false,
+					DisableFile:          false,
+					ChangeMode:           "restart",
+					ChangeSignal:         "foo",
+					AllowTokenExpiration: true,
 				},
 			},
 			Expected: &TaskDiff{
@@ -6771,6 +8110,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeEdited,
 						Name: "Vault",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "AllowTokenExpiration",
+								Old:  "false",
+								New:  "true",
+							},
 							{
 								Type: DiffTypeEdited,
 								Name: "ChangeMode",
@@ -6785,6 +8130,12 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeEdited,
+								Name: "DisableFile",
+								Old:  "true",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeEdited,
 								Name: "Env",
 								Old:  "true",
 								New:  "false",
@@ -6794,6 +8145,12 @@ func TestTaskDiff(t *testing.T) {
 								Name: "Namespace",
 								Old:  "ns1",
 								New:  "ns2",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "Role",
+								Old:  "nomad-task",
+								New:  "nomad-task-2",
 							},
 						},
 						Objects: []*ObjectDiff{
@@ -6825,20 +8182,28 @@ func TestTaskDiff(t *testing.T) {
 			Contextual: true,
 			Old: &Task{
 				Vault: &Vault{
-					Namespace:    "ns1",
-					Policies:     []string{"foo", "bar"},
-					Env:          true,
-					ChangeMode:   "signal",
-					ChangeSignal: "SIGUSR1",
+					Role:                 "nomad-task",
+					Namespace:            "ns1",
+					Cluster:              VaultDefaultCluster,
+					Policies:             []string{"foo", "bar"},
+					Env:                  true,
+					DisableFile:          true,
+					ChangeMode:           "signal",
+					ChangeSignal:         "SIGUSR1",
+					AllowTokenExpiration: true,
 				},
 			},
 			New: &Task{
 				Vault: &Vault{
-					Namespace:    "ns1",
-					Policies:     []string{"bar", "baz"},
-					Env:          true,
-					ChangeMode:   "signal",
-					ChangeSignal: "SIGUSR1",
+					Role:                 "nomad-task",
+					Namespace:            "ns1",
+					Cluster:              VaultDefaultCluster,
+					Policies:             []string{"bar", "baz"},
+					Env:                  true,
+					DisableFile:          true,
+					ChangeMode:           "signal",
+					ChangeSignal:         "SIGUSR1",
+					AllowTokenExpiration: true,
 				},
 			},
 			Expected: &TaskDiff{
@@ -6848,6 +8213,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeEdited,
 						Name: "Vault",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeNone,
+								Name: "AllowTokenExpiration",
+								Old:  "true",
+								New:  "true",
+							},
 							{
 								Type: DiffTypeNone,
 								Name: "ChangeMode",
@@ -6862,6 +8233,18 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeNone,
+								Name: "Cluster",
+								Old:  VaultDefaultCluster,
+								New:  VaultDefaultCluster,
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "DisableFile",
+								Old:  "true",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeNone,
 								Name: "Env",
 								Old:  "true",
 								New:  "true",
@@ -6871,6 +8254,12 @@ func TestTaskDiff(t *testing.T) {
 								Name: "Namespace",
 								Old:  "ns1",
 								New:  "ns1",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "Role",
+								Old:  "nomad-task",
+								New:  "nomad-task",
 							},
 						},
 						Objects: []*ObjectDiff{
@@ -6913,12 +8302,21 @@ func TestTaskDiff(t *testing.T) {
 						EmbeddedTmpl: "baz",
 						ChangeMode:   "bam",
 						ChangeSignal: "SIGHUP",
-						Splay:        1,
-						Perms:        "0644",
-						Wait: &WaitConfig{
-							Min: helper.TimeToPtr(5 * time.Second),
-							Max: helper.TimeToPtr(5 * time.Second),
+						ChangeScript: &ChangeScript{
+							Command:     "/bin/foo",
+							Args:        []string{"-debug"},
+							Timeout:     5,
+							FailOnError: false,
 						},
+						Splay: 1,
+						Perms: "0644",
+						Uid:   pointer.Of(1001),
+						Gid:   pointer.Of(21),
+						Wait: &WaitConfig{
+							Min: pointer.Of(5 * time.Second),
+							Max: pointer.Of(5 * time.Second),
+						},
+						ErrMissingKey: false,
 					},
 					{
 						SourcePath:   "foo2",
@@ -6926,9 +8324,17 @@ func TestTaskDiff(t *testing.T) {
 						EmbeddedTmpl: "baz2",
 						ChangeMode:   "bam2",
 						ChangeSignal: "SIGHUP2",
-						Splay:        2,
-						Perms:        "0666",
-						Envvars:      true,
+						ChangeScript: &ChangeScript{
+							Command:     "/bin/foo2",
+							Args:        []string{"-debugs"},
+							Timeout:     6,
+							FailOnError: false,
+						},
+						Splay:   2,
+						Perms:   "0666",
+						Uid:     pointer.Of(1000),
+						Gid:     pointer.Of(20),
+						Envvars: true,
 					},
 				},
 			},
@@ -6940,12 +8346,21 @@ func TestTaskDiff(t *testing.T) {
 						EmbeddedTmpl: "baz new",
 						ChangeMode:   "bam",
 						ChangeSignal: "SIGHUP",
-						Splay:        1,
-						Perms:        "0644",
-						Wait: &WaitConfig{
-							Min: helper.TimeToPtr(5 * time.Second),
-							Max: helper.TimeToPtr(10 * time.Second),
+						ChangeScript: &ChangeScript{
+							Command:     "/bin/foo",
+							Args:        []string{"-debug"},
+							Timeout:     5,
+							FailOnError: false,
 						},
+						Splay: 1,
+						Perms: "0644",
+						Uid:   pointer.Of(1001),
+						Gid:   pointer.Of(21),
+						Wait: &WaitConfig{
+							Min: pointer.Of(5 * time.Second),
+							Max: pointer.Of(10 * time.Second),
+						},
+						ErrMissingKey: true,
 					},
 					{
 						SourcePath:   "foo3",
@@ -6953,12 +8368,21 @@ func TestTaskDiff(t *testing.T) {
 						EmbeddedTmpl: "baz3",
 						ChangeMode:   "bam3",
 						ChangeSignal: "SIGHUP3",
-						Splay:        3,
-						Perms:        "0776",
-						Wait: &WaitConfig{
-							Min: helper.TimeToPtr(5 * time.Second),
-							Max: helper.TimeToPtr(10 * time.Second),
+						ChangeScript: &ChangeScript{
+							Command:     "/bin/foo3",
+							Args:        []string{"-debugss"},
+							Timeout:     7,
+							FailOnError: false,
 						},
+						Splay: 3,
+						Perms: "0776",
+						Uid:   pointer.Of(1002),
+						Gid:   pointer.Of(22),
+						Wait: &WaitConfig{
+							Min: pointer.Of(5 * time.Second),
+							Max: pointer.Of(10 * time.Second),
+						},
+						ErrMissingKey: true,
 					},
 				},
 			},
@@ -6974,6 +8398,12 @@ func TestTaskDiff(t *testing.T) {
 								Name: "EmbeddedTmpl",
 								Old:  "baz",
 								New:  "baz new",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "ErrMissingKey",
+								Old:  "false",
+								New:  "true",
 							},
 						},
 						Objects: []*ObjectDiff{
@@ -7027,6 +8457,18 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeAdded,
+								Name: "ErrMissingKey",
+								Old:  "",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Gid",
+								Old:  "",
+								New:  "22",
+							},
+							{
+								Type: DiffTypeAdded,
 								Name: "Perms",
 								Old:  "",
 								New:  "0776",
@@ -7042,6 +8484,12 @@ func TestTaskDiff(t *testing.T) {
 								Name: "Splay",
 								Old:  "",
 								New:  "3",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Uid",
+								Old:  "",
+								New:  "1002",
 							},
 							{
 								Type: DiffTypeAdded,
@@ -7066,6 +8514,44 @@ func TestTaskDiff(t *testing.T) {
 										Name: "Min",
 										Old:  "",
 										New:  "5000000000",
+									},
+								},
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "ChangeScript",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Command",
+										Old:  "",
+										New:  "/bin/foo3",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "FailOnError",
+										Old:  "",
+										New:  "false",
+									},
+									{
+										Type: DiffTypeAdded,
+										Name: "Timeout",
+										Old:  "",
+										New:  "7",
+									},
+								},
+								Objects: []*ObjectDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Args",
+										Fields: []*FieldDiff{
+											{
+												Type: DiffTypeAdded,
+												Name: "Args",
+												Old:  "",
+												New:  "-debugss",
+											},
+										},
 									},
 								},
 							},
@@ -7107,6 +8593,18 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeDeleted,
+								Name: "ErrMissingKey",
+								Old:  "false",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Gid",
+								Old:  "20",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
 								Name: "Perms",
 								Old:  "0666",
 								New:  "",
@@ -7125,9 +8623,55 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeDeleted,
+								Name: "Uid",
+								Old:  "1000",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
 								Name: "VaultGrace",
 								Old:  "0",
 								New:  "",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "ChangeScript",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "Command",
+										Old:  "/bin/foo2",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "FailOnError",
+										Old:  "false",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Timeout",
+										Old:  "6",
+										New:  "",
+									},
+								},
+								Objects: []*ObjectDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "Args",
+										Fields: []*FieldDiff{
+											{
+												Type: DiffTypeDeleted,
+												Name: "Args",
+												Old:  "-debugs",
+												New:  "",
+											},
+										},
+									},
+								},
 							},
 						},
 					},
@@ -7248,6 +8792,551 @@ func TestTaskDiff(t *testing.T) {
 				},
 			},
 		},
+		{
+			Name: "Identity added",
+			Old:  &Task{},
+			New: &Task{
+				Identity: &WorkloadIdentity{
+					Env: true,
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Identity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Env",
+								Old:  "",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "File",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "TTL",
+								Old:  "",
+								New:  "0",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Identity removed",
+			Old: &Task{
+				Identity: &WorkloadIdentity{
+					Env: true,
+				},
+			},
+			New: &Task{},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeDeleted,
+						Name: "Identity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Env",
+								Old:  "true",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "File",
+								Old:  "false",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "TTL",
+								Old:  "0",
+								New:  "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Identity modified",
+			Old: &Task{
+				Identity: &WorkloadIdentity{
+					Env: true,
+				},
+			},
+			New: &Task{
+				Identity: &WorkloadIdentity{
+					Env:  true,
+					File: true,
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Identity",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "File",
+								Old:  "false",
+								New:  "true",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Alternate identities added",
+			Old: &Task{
+				Identities: []*WorkloadIdentity{
+					{
+						Name:     "consul",
+						Audience: []string{"consul.io"},
+						Env:      true,
+					},
+				},
+			},
+			New: &Task{
+				Identities: []*WorkloadIdentity{
+					{
+						Name:     "consul",
+						Audience: []string{"consul.io"},
+						Env:      true,
+					},
+					{
+						Name:     "vault",
+						Audience: []string{"vault.io"},
+						File:     true,
+						TTL:      time.Hour,
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Identity",
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Audience",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Audience",
+										Old:  "",
+										New:  "vault.io",
+									},
+								},
+							},
+						},
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Env",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "File",
+								Old:  "",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Name",
+								Old:  "",
+								New:  "vault",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "TTL",
+								Old:  "",
+								New:  "3600000000000",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Alternate identities edited",
+			Old: &Task{
+				Identities: []*WorkloadIdentity{
+					{
+						Name:     "consul",
+						Audience: []string{"consul.io"},
+						Env:      true,
+						File:     false,
+						TTL:      time.Hour,
+					},
+					{
+						Name:     "vault",
+						Audience: []string{"vault.io"},
+						File:     true,
+					},
+				},
+			},
+			New: &Task{
+				Identities: []*WorkloadIdentity{
+					{
+						Name:     "consul",
+						Audience: []string{"consul-prod.io"},
+						Env:      false,
+						File:     true,
+						TTL:      2 * time.Hour,
+					},
+					{
+						// Modifying the previous block to be deleted and a new
+						// one to be created.
+						Name:     "vault-dev",
+						Audience: []string{"vault.io"},
+						File:     true,
+						TTL:      time.Hour,
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Identity",
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Audience",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Audience",
+										Old:  "",
+										New:  "consul-prod.io",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Audience",
+										Old:  "consul.io",
+										New:  "",
+									},
+								},
+							},
+						},
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Env",
+								Old:  "true",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "File",
+								Old:  "false",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "TTL",
+								Old:  "3600000000000",
+								New:  "7200000000000",
+							},
+						},
+					},
+					{
+						Type: DiffTypeAdded,
+						Name: "Identity",
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Audience",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Audience",
+										Old:  "",
+										New:  "vault.io",
+									},
+								},
+							},
+						},
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Env",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "File",
+								Old:  "",
+								New:  "true",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Name",
+								Old:  "",
+								New:  "vault-dev",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "TTL",
+								Old:  "",
+								New:  "3600000000000",
+							},
+						},
+					},
+					{
+						Type: DiffTypeDeleted,
+						Name: "Identity",
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Audience",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "Audience",
+										Old:  "vault.io",
+										New:  "",
+									},
+								},
+							},
+						},
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Env",
+								Old:  "false",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "File",
+								Old:  "true",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Name",
+								Old:  "vault",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "TTL",
+								Old:  "0",
+								New:  "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Actions added",
+			Old:  &Task{},
+			New: &Task{
+				Actions: []*Action{
+					{
+						Name:    "foo",
+						Command: "echo",
+						Args:    []string{"bar"},
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeAdded,
+						Name: "Action",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Command",
+								Old:  "",
+								New:  "echo",
+							},
+							{
+								Type: DiffTypeAdded,
+								Name: "Name",
+								Old:  "",
+								New:  "foo",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Args",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Args",
+										Old:  "",
+										New:  "bar",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Actions removed",
+			Old: &Task{
+				Actions: []*Action{
+					{
+						Name:    "foo",
+						Command: "echo",
+						Args:    []string{"bar"},
+					},
+				},
+			},
+			New: &Task{},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeDeleted,
+						Name: "Action",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Command",
+								Old:  "echo",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "Name",
+								Old:  "foo",
+								New:  "",
+							},
+						},
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeDeleted,
+								Name: "Args",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeDeleted,
+										Name: "Args",
+										Old:  "bar",
+										New:  "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Actions edited",
+			Old: &Task{
+				Actions: []*Action{
+					{
+						Name:    "foo",
+						Command: "bar",
+						Args:    []string{"hello world"},
+					},
+				},
+			},
+			New: &Task{
+				Actions: []*Action{
+					{
+						Name:    "foo",
+						Command: "baz",
+						Args:    []string{"hello world"},
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Action",
+						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Command",
+								Old:  "bar",
+								New:  "baz",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "Action Args edited",
+			Old: &Task{
+				Actions: []*Action{
+					{
+						Name:    "foo",
+						Command: "echo",
+						// Multiple strings of "foo" and "bar"
+						Args: []string{"bar"},
+					},
+				},
+			},
+			New: &Task{
+				Actions: []*Action{
+					{
+						Name:    "foo",
+						Command: "echo",
+						Args:    []string{"baz"},
+					},
+				},
+			},
+			Expected: &TaskDiff{
+				Type: DiffTypeEdited,
+				Objects: []*ObjectDiff{
+					{
+						Type: DiffTypeEdited,
+						Name: "Action",
+						Objects: []*ObjectDiff{
+							{
+								Type: DiffTypeEdited,
+								Name: "Args",
+								Fields: []*FieldDiff{
+									{
+										Type: DiffTypeAdded,
+										Name: "Args",
+										Old:  "",
+										New:  "baz",
+									},
+									{
+										Type: DiffTypeDeleted,
+										Name: "Args",
+										Old:  "bar",
+										New:  "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -7304,6 +9393,7 @@ func TestServicesDiff(t *testing.T) {
 					Name:              "webapp",
 					PortLabel:         "http",
 					AddressMode:       "host",
+					Address:           "a.example.com",
 					EnableTagOverride: true,
 					Tags:              []string{"prod"},
 					CanaryTags:        []string{"canary"},
@@ -7314,6 +9404,7 @@ func TestServicesDiff(t *testing.T) {
 					Name:              "webapp-2",
 					PortLabel:         "https",
 					AddressMode:       "alloc",
+					Address:           "b.example.com",
 					EnableTagOverride: false,
 					Tags:              []string{"prod", "dev"},
 					CanaryTags:        []string{"qa"},
@@ -7326,9 +9417,21 @@ func TestServicesDiff(t *testing.T) {
 					Fields: []*FieldDiff{
 						{
 							Type: DiffTypeEdited,
+							Name: "Address",
+							Old:  "a.example.com",
+							New:  "b.example.com",
+						},
+						{
+							Type: DiffTypeEdited,
 							Name: "AddressMode",
 							Old:  "host",
 							New:  "alloc",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Cluster",
+							Old:  "",
+							New:  "",
 						},
 						{
 							Type: DiffTypeEdited,
@@ -7355,6 +9458,10 @@ func TestServicesDiff(t *testing.T) {
 							Name: "PortLabel",
 							Old:  "http",
 							New:  "https",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Provider",
 						},
 						{
 							Type: DiffTypeNone,
@@ -7416,7 +9523,17 @@ func TestServicesDiff(t *testing.T) {
 					Fields: []*FieldDiff{
 						{
 							Type: DiffTypeNone,
+							Name: "Address",
+						},
+						{
+							Type: DiffTypeNone,
 							Name: "AddressMode",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Cluster",
+							Old:  "",
+							New:  "",
 						},
 						{
 							Type: DiffTypeAdded,
@@ -7440,6 +9557,10 @@ func TestServicesDiff(t *testing.T) {
 							Type: DiffTypeAdded,
 							Name: "PortLabel",
 							New:  "http",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Provider",
 						},
 						{
 							Type: DiffTypeNone,
@@ -7475,7 +9596,17 @@ func TestServicesDiff(t *testing.T) {
 					Fields: []*FieldDiff{
 						{
 							Type: DiffTypeNone,
+							Name: "Address",
+						},
+						{
+							Type: DiffTypeNone,
 							Name: "AddressMode",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Cluster",
+							Old:  "",
+							New:  "",
 						},
 						{
 							Type: DiffTypeAdded,
@@ -7499,6 +9630,10 @@ func TestServicesDiff(t *testing.T) {
 							Type: DiffTypeAdded,
 							Name: "PortLabel",
 							New:  "https",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Provider",
 						},
 						{
 							Type: DiffTypeNone,
@@ -7538,7 +9673,17 @@ func TestServicesDiff(t *testing.T) {
 					Fields: []*FieldDiff{
 						{
 							Type: DiffTypeNone,
+							Name: "Address",
+						},
+						{
+							Type: DiffTypeNone,
 							Name: "AddressMode",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Cluster",
+							Old:  "",
+							New:  "",
 						},
 						{
 							Type: DiffTypeNone,
@@ -7565,6 +9710,9 @@ func TestServicesDiff(t *testing.T) {
 							Name: "PortLabel",
 							Old:  "http",
 							New:  "https-redirect",
+						}, {
+							Type: DiffTypeNone,
+							Name: "Provider",
 						},
 						{
 							Type: DiffTypeNone,
@@ -7608,7 +9756,17 @@ func TestServicesDiff(t *testing.T) {
 					Fields: []*FieldDiff{
 						{
 							Type: DiffTypeNone,
+							Name: "Address",
+						},
+						{
+							Type: DiffTypeNone,
 							Name: "AddressMode",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Cluster",
+							Old:  "",
+							New:  "",
 						},
 						{
 							Type: DiffTypeNone,
@@ -7638,6 +9796,10 @@ func TestServicesDiff(t *testing.T) {
 						},
 						{
 							Type: DiffTypeNone,
+							Name: "Provider",
+						},
+						{
+							Type: DiffTypeNone,
 							Name: "TaskName",
 						},
 					},
@@ -7656,6 +9818,471 @@ func TestServicesDiff(t *testing.T) {
 									Name: "Tags",
 									Old:  "prod",
 									New:  "prod",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:       "Service with different provider",
+			Contextual: true,
+			Old: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "nomad",
+					Cluster:   "default",
+					PortLabel: "http",
+				},
+			},
+			New: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "consul",
+					Cluster:   "default",
+					PortLabel: "http",
+				},
+			},
+			Expected: []*ObjectDiff{
+				{
+					Type: DiffTypeEdited,
+					Name: "Service",
+					Fields: []*FieldDiff{
+						{
+							Type: DiffTypeNone,
+							Name: "Address",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "AddressMode",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Cluster",
+							Old:  "default",
+							New:  "default",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "EnableTagOverride",
+							Old:  "false",
+							New:  "false",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Name",
+							Old:  "webapp",
+							New:  "webapp",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "Namespace",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "OnUpdate",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "PortLabel",
+							Old:  "http",
+							New:  "http",
+						},
+						{
+							Type: DiffTypeEdited,
+							Name: "Provider",
+							Old:  "nomad",
+							New:  "consul",
+						},
+						{
+							Type: DiffTypeNone,
+							Name: "TaskName",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:       "Service with different ingress tls",
+			Contextual: false,
+			Old: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "consul",
+					PortLabel: "http",
+					Connect: &ConsulConnect{
+						Gateway: &ConsulGateway{
+							Ingress: &ConsulIngressConfigEntry{},
+						},
+					},
+				},
+			},
+			New: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "consul",
+					PortLabel: "http",
+					Connect: &ConsulConnect{
+						Gateway: &ConsulGateway{
+							Ingress: &ConsulIngressConfigEntry{
+								TLS: &ConsulGatewayTLSConfig{
+									Enabled:       true,
+									TLSMinVersion: "TLSv1_2",
+									CipherSuites:  []string{"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"},
+								},
+							},
+						},
+					},
+				},
+			},
+			Expected: []*ObjectDiff{
+				{
+					Type: DiffTypeEdited,
+					Name: "Service",
+					Objects: []*ObjectDiff{
+						{
+							Type: DiffTypeEdited,
+							Name: "ConsulConnect",
+							Objects: []*ObjectDiff{
+								{
+									Type: DiffTypeEdited,
+									Name: "Gateway",
+									Objects: []*ObjectDiff{
+										{
+											Type: DiffTypeEdited,
+											Name: "Ingress",
+											Objects: []*ObjectDiff{
+												{
+													Type: DiffTypeAdded,
+													Name: "TLS",
+													Fields: []*FieldDiff{
+														{
+															Type: DiffTypeAdded,
+															Name: "Enabled",
+															New:  "true",
+														},
+														{
+															Type: DiffTypeAdded,
+															Name: "TLSMinVersion",
+															New:  "TLSv1_2",
+														},
+													},
+													Objects: []*ObjectDiff{
+														{
+															Type: DiffTypeAdded,
+															Name: "CipherSuites",
+															Fields: []*FieldDiff{
+																{
+																	Type: DiffTypeAdded,
+																	Name: "CipherSuites",
+																	New:  "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+																},
+																{
+																	Type: DiffTypeAdded,
+																	Name: "CipherSuites",
+																	New:  "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+																},
+															},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:       "ConsulUpstream with different Upstreams",
+			Contextual: false,
+			Old: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "consul",
+					PortLabel: "http",
+					Connect: &ConsulConnect{
+						SidecarService: &ConsulSidecarService{
+							Port: "http",
+							Proxy: &ConsulProxy{
+								LocalServiceAddress: "127.0.0.1",
+								LocalServicePort:    8080,
+								Upstreams: []ConsulUpstream{
+									{
+										DestinationName:  "count-api",
+										LocalBindPort:    8080,
+										Datacenter:       "dc2",
+										LocalBindAddress: "127.0.0.1",
+										DestinationType:  "prepared_query",
+										MeshGateway: ConsulMeshGateway{
+											Mode: "remote",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			New: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "consul",
+					PortLabel: "http",
+					Connect: &ConsulConnect{
+						SidecarService: &ConsulSidecarService{
+							Port: "http",
+							Proxy: &ConsulProxy{
+								LocalServiceAddress: "127.0.0.1",
+								LocalServicePort:    8080,
+								Upstreams: []ConsulUpstream{
+									{
+										DestinationName:      "count-api",
+										LocalBindPort:        8080,
+										Datacenter:           "dc2",
+										LocalBindAddress:     "127.0.0.1",
+										LocalBindSocketMode:  "0700",
+										LocalBindSocketPath:  "/tmp/redis_5678.sock",
+										DestinationPeer:      "cloud-services",
+										DestinationPartition: "infra",
+										DestinationType:      "service",
+										MeshGateway: ConsulMeshGateway{
+											Mode: "remote",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Expected: []*ObjectDiff{
+				{
+					Type: DiffTypeEdited,
+					Name: "Service",
+					Objects: []*ObjectDiff{
+						{
+							Type: DiffTypeEdited,
+							Name: "ConsulConnect",
+							Objects: []*ObjectDiff{
+								{
+									Type: DiffTypeEdited,
+									Name: "SidecarService",
+									Objects: []*ObjectDiff{
+										{
+											Type: DiffTypeEdited,
+											Name: "ConsulProxy",
+											Objects: []*ObjectDiff{
+												{
+													Type: DiffTypeEdited,
+													Name: "ConsulUpstreams",
+													Fields: []*FieldDiff{
+														{
+															Type:        DiffTypeAdded,
+															Name:        "DestinationPartition",
+															Old:         "",
+															New:         "infra",
+															Annotations: nil,
+														},
+														{
+															Type:        DiffTypeAdded,
+															Name:        "DestinationPeer",
+															Old:         "",
+															New:         "cloud-services",
+															Annotations: nil,
+														},
+														{
+															Type:        DiffTypeEdited,
+															Name:        "DestinationType",
+															Old:         "prepared_query",
+															New:         "service",
+															Annotations: nil,
+														},
+														{
+															Type:        DiffTypeAdded,
+															Name:        "LocalBindSocketMode",
+															Old:         "",
+															New:         "0700",
+															Annotations: nil,
+														},
+														{
+															Type:        DiffTypeAdded,
+															Name:        "LocalBindSocketPath",
+															Old:         "",
+															New:         "/tmp/redis_5678.sock",
+															Annotations: nil,
+														},
+													},
+													Objects: nil,
+												},
+												{
+													Type: DiffTypeNone,
+													Name: "TransparentProxy",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:       "SidecarService with different meta",
+			Contextual: false,
+			Old: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "consul",
+					PortLabel: "http",
+					Connect: &ConsulConnect{
+						SidecarService: &ConsulSidecarService{
+							Port:  "http",
+							Proxy: &ConsulProxy{},
+							Meta: map[string]string{
+								"foo": "qux",
+							},
+						},
+						Gateway: &ConsulGateway{
+							Ingress: &ConsulIngressConfigEntry{},
+						},
+					},
+				},
+			},
+			New: []*Service{
+				{
+					Name:      "webapp",
+					Provider:  "consul",
+					PortLabel: "http",
+					Connect: &ConsulConnect{
+						SidecarService: &ConsulSidecarService{
+							Port:  "http",
+							Proxy: &ConsulProxy{},
+							Meta: map[string]string{
+								"foo":     "var",
+								"testKey": "testValue",
+							},
+						},
+						Gateway: &ConsulGateway{
+							Ingress: &ConsulIngressConfigEntry{},
+						},
+					},
+				},
+			},
+			Expected: []*ObjectDiff{
+				{
+					Type: DiffTypeEdited,
+					Name: "Service",
+					Objects: []*ObjectDiff{
+						{
+							Type:   "Edited",
+							Name:   "ConsulConnect",
+							Fields: nil,
+							Objects: []*ObjectDiff{
+								{
+									Type: "Edited",
+									Name: "SidecarService",
+									Fields: []*FieldDiff{
+										{
+											Type:        "Edited",
+											Name:        "Meta[foo]",
+											Old:         "qux",
+											New:         "var",
+											Annotations: nil,
+										},
+										{
+											Type:        "Added",
+											Name:        "Meta[testKey]",
+											Old:         "",
+											New:         "testValue",
+											Annotations: nil,
+										},
+									},
+									Objects: nil,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:       "Service with different identity name and aud",
+			Contextual: false,
+			Old: []*Service{
+				{
+					Name:      "test",
+					Provider:  "consul",
+					PortLabel: "http",
+					Identity: &WorkloadIdentity{
+						Name:     "test",
+						Audience: []string{"consul.io"},
+						File:     true,
+					},
+				},
+			},
+			New: []*Service{
+				{
+					Name:      "test2",
+					Provider:  "consul",
+					PortLabel: "http",
+					Identity: &WorkloadIdentity{
+						Name:     "test2",
+						Audience: []string{"consul.io", "nomad.dev"},
+						File:     false,
+					},
+				},
+			},
+			Expected: []*ObjectDiff{
+				{
+					Type: DiffTypeEdited,
+					Name: "Service",
+					Fields: []*FieldDiff{
+						{
+							Type:        DiffTypeEdited,
+							Name:        "Name",
+							Old:         "test",
+							New:         "test2",
+							Annotations: nil,
+						},
+					},
+					Objects: []*ObjectDiff{
+						{
+							Type: DiffTypeEdited,
+							Name: "Identity",
+							Fields: []*FieldDiff{
+								{
+									Type:        DiffTypeEdited,
+									Name:        "File",
+									Old:         "true",
+									New:         "false",
+									Annotations: nil,
+								},
+								{
+									Type:        DiffTypeEdited,
+									Name:        "Name",
+									Old:         "test",
+									New:         "test2",
+									Annotations: nil,
+								},
+							},
+							Objects: []*ObjectDiff{
+								{
+									Type: DiffTypeAdded,
+									Name: "Audience",
+									Fields: []*FieldDiff{
+										{
+											Type: DiffTypeAdded,
+											Name: "Audience",
+											New:  "nomad.dev",
+										},
+									},
 								},
 							},
 						},

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package taskrunner
 
 import (
@@ -8,15 +11,19 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/api"
-	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/allocrunner/taskrunner/interfaces"
-	"github.com/hashicorp/nomad/client/consul"
+	"github.com/hashicorp/nomad/client/serviceregistration"
+	regMock "github.com/hashicorp/nomad/client/serviceregistration/mock"
+	"github.com/hashicorp/nomad/client/serviceregistration/wrapper"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/client/taskenv"
 	agentconsul "github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -233,7 +240,8 @@ func TestScript_TaskEnvInterpolation(t *testing.T) {
 	ci.Parallel(t)
 
 	logger := testlog.HCLogger(t)
-	consulClient := consul.NewMockConsulServiceClient(t, logger)
+	consulClient := regMock.NewServiceRegistrationHandler(logger)
+	regWrap := wrapper.NewHandlerWrapper(logger, consulClient, nil)
 	exec, cancel := newBlockingScriptExec()
 	defer cancel()
 
@@ -249,10 +257,11 @@ func TestScript_TaskEnvInterpolation(t *testing.T) {
 		map[string]string{"SVC_NAME": "frontend"}).Build()
 
 	svcHook := newServiceHook(serviceHookConfig{
-		alloc:          alloc,
-		task:           task,
-		consulServices: consulClient,
-		logger:         logger,
+		alloc:             alloc,
+		task:              task,
+		serviceRegWrapper: regWrap,
+		logger:            logger,
+		hookResources:     cstructs.NewAllocHookResources(),
 	})
 	// emulate prestart having been fired
 	svcHook.taskEnv = env
@@ -268,14 +277,17 @@ func TestScript_TaskEnvInterpolation(t *testing.T) {
 	scHook.taskEnv = env
 	scHook.driverExec = exec
 
-	expectedSvc := svcHook.getWorkloadServices().Services[0]
-	expected := agentconsul.MakeCheckID(agentconsul.MakeAllocServiceID(
+	workload := svcHook.getWorkloadServices()
+	must.Eq(t, "web", workload.AllocInfo.Group)
+
+	expectedSvc := workload.Services[0]
+	expected := agentconsul.MakeCheckID(serviceregistration.MakeAllocServiceID(
 		alloc.ID, task.Name, expectedSvc), expectedSvc.Checks[0])
 
 	actual := scHook.newScriptChecks()
 	check, ok := actual[expected]
-	require.True(t, ok)
-	require.Equal(t, "my-job-frontend-check", check.check.Name)
+	must.True(t, ok)
+	must.Eq(t, "my-job-frontend-check", check.check.Name)
 
 	// emulate an update
 	env = taskenv.NewBuilder(mock.Node(), alloc, task, "global").SetHookEnv(
@@ -285,13 +297,13 @@ func TestScript_TaskEnvInterpolation(t *testing.T) {
 	svcHook.taskEnv = env
 
 	expectedSvc = svcHook.getWorkloadServices().Services[0]
-	expected = agentconsul.MakeCheckID(agentconsul.MakeAllocServiceID(
+	expected = agentconsul.MakeCheckID(serviceregistration.MakeAllocServiceID(
 		alloc.ID, task.Name, expectedSvc), expectedSvc.Checks[0])
 
 	actual = scHook.newScriptChecks()
 	check, ok = actual[expected]
-	require.True(t, ok)
-	require.Equal(t, "my-job-backend-check", check.check.Name)
+	must.True(t, ok)
+	must.Eq(t, "my-job-backend-check", check.check.Name)
 }
 
 func TestScript_associated(t *testing.T) {

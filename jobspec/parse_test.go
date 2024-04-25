@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package jobspec
 
 import (
@@ -9,7 +12,8 @@ import (
 	capi "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/stretchr/testify/require"
+	"github.com/hashicorp/nomad/helper/pointer"
+	"github.com/shoenig/test/must"
 )
 
 // consts copied from nomad/structs package to keep jobspec isolated from rest of nomad
@@ -22,7 +26,22 @@ const (
 
 	// templateChangeModeRestart marks that the task should be restarted if the
 	templateChangeModeRestart = "restart"
+
+	// templateChangeModeScript marks that ac script should be executed on
+	// template re-render
+	templateChangeModeScript = "script"
 )
+
+// Helper functions below are only used by this test suite
+func int8ToPtr(i int8) *int8 {
+	return &i
+}
+func uint64ToPtr(u uint64) *uint64 {
+	return &u
+}
+func int64ToPtr(i int64) *int64 {
+	return &i
+}
 
 func TestParse(t *testing.T) {
 	ci.Parallel(t)
@@ -43,6 +62,7 @@ func TestParse(t *testing.T) {
 				Datacenters: []string{"us2", "eu1"},
 				Region:      stringToPtr("fooregion"),
 				Namespace:   stringToPtr("foonamespace"),
+				NodePool:    stringToPtr("dev"),
 				ConsulToken: stringToPtr("abc"),
 				VaultToken:  stringToPtr("foo"),
 
@@ -120,8 +140,10 @@ func TestParse(t *testing.T) {
 					},
 
 					{
-						Name:  stringToPtr("binsl"),
-						Count: intToPtr(5),
+						Name:                      stringToPtr("binsl"),
+						Count:                     intToPtr(5),
+						StopAfterClientDisconnect: timeToPtr(120 * time.Second),
+						MaxClientDisconnect:       timeToPtr(120 * time.Hour),
 						Constraints: []*api.Constraint{
 							{
 								LTarget: "kernel.os",
@@ -175,10 +197,11 @@ func TestParse(t *testing.T) {
 							"elb_checks":   "3",
 						},
 						RestartPolicy: &api.RestartPolicy{
-							Interval: timeToPtr(10 * time.Minute),
-							Attempts: intToPtr(5),
-							Delay:    timeToPtr(15 * time.Second),
-							Mode:     stringToPtr("delay"),
+							Interval:        timeToPtr(10 * time.Minute),
+							Attempts:        intToPtr(5),
+							Delay:           timeToPtr(15 * time.Second),
+							Mode:            stringToPtr("delay"),
+							RenderTemplates: boolToPtr(false),
 						},
 						Spreads: []*api.Spread{
 							{
@@ -200,7 +223,12 @@ func TestParse(t *testing.T) {
 								},
 							},
 						},
-						StopAfterClientDisconnect: timeToPtr(120 * time.Second),
+						Disconnect: &api.DisconnectStrategy{
+							StopOnClientAfter: timeToPtr(120 * time.Second),
+							LostAfter:         timeToPtr(120 * time.Hour),
+							Replace:           boolToPtr(true),
+							Reconcile:         stringToPtr("best_score"),
+						},
 						ReschedulePolicy: &api.ReschedulePolicy{
 							Interval: timeToPtr(12 * time.Hour),
 							Attempts: intToPtr(5),
@@ -331,6 +359,7 @@ func TestParse(t *testing.T) {
 								LogConfig: &api.LogConfig{
 									MaxFiles:      intToPtr(14),
 									MaxFileSizeMB: intToPtr(101),
+									Disabled:      boolToPtr(false),
 								},
 								Artifacts: []*api.TaskArtifact{
 									{
@@ -349,30 +378,41 @@ func TestParse(t *testing.T) {
 									},
 								},
 								Vault: &api.Vault{
-									Namespace:  stringToPtr("ns1"),
-									Policies:   []string{"foo", "bar"},
-									Env:        boolToPtr(true),
-									ChangeMode: stringToPtr(vaultChangeModeRestart),
+									Namespace:   stringToPtr("ns1"),
+									Policies:    []string{"foo", "bar"},
+									Env:         boolToPtr(true),
+									DisableFile: boolToPtr(false),
+									ChangeMode:  stringToPtr(vaultChangeModeRestart),
 								},
 								Templates: []*api.Template{
 									{
-										SourcePath:   stringToPtr("foo"),
-										DestPath:     stringToPtr("foo"),
-										ChangeMode:   stringToPtr("foo"),
-										ChangeSignal: stringToPtr("foo"),
-										Splay:        timeToPtr(10 * time.Second),
-										Perms:        stringToPtr("0644"),
-										Envvars:      boolToPtr(true),
-										VaultGrace:   timeToPtr(33 * time.Second),
+										SourcePath:    stringToPtr("foo"),
+										DestPath:      stringToPtr("foo"),
+										ChangeMode:    stringToPtr("foo"),
+										ChangeSignal:  stringToPtr("foo"),
+										Splay:         timeToPtr(10 * time.Second),
+										Perms:         stringToPtr("0644"),
+										Envvars:       boolToPtr(true),
+										VaultGrace:    timeToPtr(33 * time.Second),
+										ErrMissingKey: boolToPtr(true),
 									},
 									{
 										SourcePath: stringToPtr("bar"),
 										DestPath:   stringToPtr("bar"),
-										ChangeMode: stringToPtr(templateChangeModeRestart),
-										Splay:      timeToPtr(5 * time.Second),
-										Perms:      stringToPtr("777"),
-										LeftDelim:  stringToPtr("--"),
-										RightDelim: stringToPtr("__"),
+										ChangeMode: stringToPtr(templateChangeModeScript),
+										ChangeScript: &api.ChangeScript{
+											Args:        []string{"-debug", "-verbose"},
+											Command:     stringToPtr("/bin/foo"),
+											Timeout:     timeToPtr(5 * time.Second),
+											FailOnError: boolToPtr(false),
+										},
+										Splay:         timeToPtr(5 * time.Second),
+										Perms:         stringToPtr("777"),
+										Uid:           intToPtr(1001),
+										Gid:           intToPtr(20),
+										LeftDelim:     stringToPtr("--"),
+										RightDelim:    stringToPtr("__"),
+										ErrMissingKey: boolToPtr(false),
 									},
 								},
 								Leader:     true,
@@ -403,6 +443,7 @@ func TestParse(t *testing.T) {
 								Vault: &api.Vault{
 									Policies:     []string{"foo", "bar"},
 									Env:          boolToPtr(false),
+									DisableFile:  boolToPtr(false),
 									ChangeMode:   stringToPtr(vaultChangeModeSignal),
 									ChangeSignal: stringToPtr("SIGUSR1"),
 								},
@@ -497,6 +538,7 @@ func TestParse(t *testing.T) {
 				Constraints: []*api.Constraint{
 					{
 						Operand: api.ConstraintDistinctHosts,
+						RTarget: "true",
 					},
 				},
 			},
@@ -526,6 +568,21 @@ func TestParse(t *testing.T) {
 				Periodic: &api.PeriodicConfig{
 					SpecType:        stringToPtr(api.PeriodicSpecCron),
 					Spec:            stringToPtr("*/5 * * *"),
+					ProhibitOverlap: boolToPtr(true),
+					TimeZone:        stringToPtr("Europe/Minsk"),
+				},
+			},
+			false,
+		},
+
+		{
+			"periodic-crons.hcl",
+			&api.Job{
+				ID:   stringToPtr("foo"),
+				Name: stringToPtr("foo"),
+				Periodic: &api.PeriodicConfig{
+					SpecType:        stringToPtr(api.PeriodicSpecCron),
+					Specs:           []string{"*/5 * * *", "*/7 * * *"},
 					ProhibitOverlap: boolToPtr(true),
 					TimeZone:        stringToPtr("Europe/Minsk"),
 				},
@@ -604,6 +661,13 @@ func TestParse(t *testing.T) {
 										GetterOptions: nil,
 										RelativeDest:  stringToPtr("var/foo"),
 									},
+									{
+										GetterSource: stringToPtr("https://example.com/file.txt"),
+										GetterHeaders: map[string]string{
+											"User-Agent":    "nomad",
+											"X-Nomad-Alloc": "alloc",
+										},
+									},
 								},
 							},
 						},
@@ -625,9 +689,10 @@ func TestParse(t *testing.T) {
 								Name:   "binstore",
 								Driver: "docker",
 								CSIPluginConfig: &api.TaskCSIPluginConfig{
-									ID:       "org.hashicorp.csi",
-									Type:     api.CSIPluginTypeMonolith,
-									MountDir: "/csi/test",
+									ID:            "org.hashicorp.csi",
+									Type:          api.CSIPluginTypeMonolith,
+									MountDir:      "/csi/test",
+									HealthTimeout: 1 * time.Minute,
 								},
 							},
 						},
@@ -700,6 +765,7 @@ func TestParse(t *testing.T) {
 								Method:                 "POST",
 								SuccessBeforePassing:   3,
 								FailuresBeforeCritical: 4,
+								FailuresBeforeWarning:  2,
 							}},
 						}},
 					}},
@@ -731,6 +797,7 @@ func TestParse(t *testing.T) {
 								Method:                 "POST",
 								SuccessBeforePassing:   3,
 								FailuresBeforeCritical: 4,
+								FailuresBeforeWarning:  2,
 							}},
 						}},
 					}},
@@ -761,17 +828,19 @@ func TestParse(t *testing.T) {
 							{
 								Name: "redis",
 								Vault: &api.Vault{
-									Policies:   []string{"group"},
-									Env:        boolToPtr(true),
-									ChangeMode: stringToPtr(vaultChangeModeRestart),
+									Policies:    []string{"group"},
+									Env:         boolToPtr(true),
+									DisableFile: boolToPtr(false),
+									ChangeMode:  stringToPtr(vaultChangeModeRestart),
 								},
 							},
 							{
 								Name: "redis2",
 								Vault: &api.Vault{
-									Policies:   []string{"task"},
-									Env:        boolToPtr(false),
-									ChangeMode: stringToPtr(vaultChangeModeRestart),
+									Policies:    []string{"task"},
+									Env:         boolToPtr(false),
+									DisableFile: boolToPtr(true),
+									ChangeMode:  stringToPtr(vaultChangeModeRestart),
 								},
 							},
 						},
@@ -782,9 +851,10 @@ func TestParse(t *testing.T) {
 							{
 								Name: "redis",
 								Vault: &api.Vault{
-									Policies:   []string{"job"},
-									Env:        boolToPtr(true),
-									ChangeMode: stringToPtr(vaultChangeModeRestart),
+									Policies:    []string{"job"},
+									Env:         boolToPtr(true),
+									DisableFile: boolToPtr(false),
+									ChangeMode:  stringToPtr(vaultChangeModeRestart),
 								},
 							},
 						},
@@ -837,6 +907,28 @@ func TestParse(t *testing.T) {
 								KillSignal: "SIGQUIT",
 								Config: map[string]interface{}{
 									"image": "hashicorp/image",
+								},
+							},
+						},
+					},
+				},
+			},
+			false,
+		},
+		{
+			"service-tagged-address.hcl",
+			&api.Job{
+				ID:   stringToPtr("service_tagged_address"),
+				Name: stringToPtr("service_tagged_address"),
+				Type: stringToPtr("service"),
+				TaskGroups: []*api.TaskGroup{
+					{
+						Name: stringToPtr("group"),
+						Services: []*api.Service{
+							{
+								Name: "service1",
+								TaggedAddresses: map[string]string{
+									"public_wan": "1.2.3.4",
 								},
 							},
 						},
@@ -1118,10 +1210,15 @@ func TestParse(t *testing.T) {
 											LocalServicePort: 8080,
 											Upstreams: []*api.ConsulUpstream{
 												{
-													DestinationName:  "other-service",
-													LocalBindPort:    4567,
-													LocalBindAddress: "0.0.0.0",
-													Datacenter:       "dc1",
+													DestinationName:      "other-service",
+													DestinationPeer:      "10.0.0.1:6379",
+													DestinationPartition: "infra",
+													DestinationType:      "tcp",
+													LocalBindPort:        4567,
+													LocalBindAddress:     "0.0.0.0",
+													LocalBindSocketPath:  "/var/run/testsocket.sock",
+													LocalBindSocketMode:  "0666",
+													Datacenter:           "dc1",
 
 													MeshGateway: &api.ConsulMeshGateway{
 														Mode: "local",
@@ -1224,8 +1321,8 @@ func TestParse(t *testing.T) {
 						Connect: &api.ConsulConnect{
 							SidecarService: &api.ConsulSidecarService{
 								Proxy: &api.ConsulProxy{
-									ExposeConfig: &api.ConsulExposeConfig{
-										Path: []*api.ConsulExposePath{{
+									Expose: &api.ConsulExposeConfig{
+										Paths: []*api.ConsulExposePath{{
 											Path:          "/health",
 											Protocol:      "http",
 											LocalPathPort: 2222,
@@ -1289,6 +1386,31 @@ func TestParse(t *testing.T) {
 			false,
 		},
 		{
+			"tg-service-connect-sidecar_meta.hcl",
+			&api.Job{
+				ID:   stringToPtr("sidecar_meta"),
+				Name: stringToPtr("sidecar_meta"),
+				Type: stringToPtr("service"),
+				TaskGroups: []*api.TaskGroup{{
+					Name: stringToPtr("group"),
+					Services: []*api.Service{{
+						Name: "example",
+						Connect: &api.ConsulConnect{
+							Native: false,
+							SidecarService: &api.ConsulSidecarService{
+								Meta: map[string]string{
+									"test-key":  "test-value",
+									"test-key1": "test-value1",
+									"test-key2": "test-value2",
+								},
+							},
+						},
+					}},
+				}},
+			},
+			false,
+		},
+		{
 			"tg-service-connect-resources.hcl",
 			&api.Job{
 				ID:   stringToPtr("sidecar_task_resources"),
@@ -1328,8 +1450,8 @@ func TestParse(t *testing.T) {
 								Proxy: &api.ConsulProxy{
 									LocalServiceAddress: "10.0.1.2",
 									LocalServicePort:    8080,
-									ExposeConfig: &api.ConsulExposeConfig{
-										Path: []*api.ConsulExposePath{{
+									Expose: &api.ConsulExposeConfig{
+										Paths: []*api.ConsulExposePath{{
 											Path:          "/metrics",
 											Protocol:      "http",
 											LocalPathPort: 9001,
@@ -1348,6 +1470,15 @@ func TestParse(t *testing.T) {
 										DestinationName: "upstream2",
 										LocalBindPort:   2002,
 									}},
+									TransparentProxy: &api.ConsulTransparentProxy{
+										UID:                  "101",
+										OutboundPort:         15001,
+										ExcludeInboundPorts:  []string{"www", "9000"},
+										ExcludeOutboundPorts: []uint16{443, 80},
+										ExcludeOutboundCIDRs: []string{"10.0.0.0/8"},
+										ExcludeUIDs:          []string{"10", "1001"},
+										NoDNS:                true,
+									},
 									Config: map[string]interface{}{
 										"foo": "bar",
 									},
@@ -1537,7 +1668,9 @@ func TestParse(t *testing.T) {
 								},
 								Ingress: &api.ConsulIngressConfigEntry{
 									TLS: &api.ConsulGatewayTLSConfig{
-										Enabled: true,
+										Enabled:       true,
+										TLSMinVersion: "TLSv1_2",
+										CipherSuites:  []string{"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"},
 									},
 									Listeners: []*api.ConsulIngressListener{{
 										Port:     8001,
@@ -1560,6 +1693,23 @@ func TestParse(t *testing.T) {
 											Hosts: []string{
 												"2.2.2.2:8080",
 											},
+											TLS: &api.ConsulGatewayTLSConfig{
+												SDS: &api.ConsulGatewayTLSSDSConfig{
+													ClusterName:  "foo",
+													CertResource: "bar",
+												},
+											},
+											RequestHeaders: &api.ConsulHTTPHeaderModifiers{
+												Add: map[string]string{
+													"test": "testvalue",
+												},
+											},
+											ResponseHeaders: &api.ConsulHTTPHeaderModifiers{
+												Remove: []string{"test2"},
+											},
+											MaxConnections:        pointer.Of(uint32(5120)),
+											MaxPendingRequests:    pointer.Of(uint32(512)),
+											MaxConcurrentRequests: pointer.Of(uint32(2048)),
 										}},
 									},
 									},
@@ -1766,6 +1916,32 @@ func TestParse(t *testing.T) {
 			},
 			false,
 		},
+		{
+			"service-provider.hcl",
+			&api.Job{
+				ID:   stringToPtr("service-provider"),
+				Name: stringToPtr("service-provider"),
+				TaskGroups: []*api.TaskGroup{
+					{
+						Count: intToPtr(5),
+						Name:  stringToPtr("group"),
+						Tasks: []*api.Task{
+							{
+								Name:   "task",
+								Driver: "docker",
+								Services: []*api.Service{
+									{
+										Name:     "service-provider",
+										Provider: "nomad",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -1773,14 +1949,14 @@ func TestParse(t *testing.T) {
 			t.Logf("Testing parse: %s", tc.File)
 
 			path, err := filepath.Abs(filepath.Join("./test-fixtures", tc.File))
-			require.NoError(t, err)
+			must.NoError(t, err)
 
 			actual, err := ParseFile(path)
 			if tc.Err {
-				require.Error(t, err)
+				must.Error(t, err)
 			} else {
-				require.NoError(t, err)
-				require.Equal(t, tc.Result, actual)
+				must.NoError(t, err)
+				must.Eq(t, tc.Result, actual)
 			}
 		})
 	}
@@ -1837,4 +2013,29 @@ func TestIncorrectKey(t *testing.T) {
 	if !strings.Contains(err.Error(), "* group: 'binsl', task: 'binstore', service (0): 'foo', check -> invalid key: nterval") {
 		t.Fatalf("Expected key error; got %v", err)
 	}
+}
+
+// TestPortParsing validates that the removal of the mapstructure tags on the
+// Port struct don't cause issues with HCL 1 parsing.
+//
+// TODO: in the future, see if we need `mapstructure` tags on any of the API
+func TestPortParsing(t *testing.T) {
+	ci.Parallel(t)
+
+	var err error
+	var path string
+	var job *api.Job
+
+	path, err = filepath.Abs(filepath.Join("./test-fixtures", "parse-ports.hcl"))
+	must.NoError(t, err, must.Sprint("Can't get absolute path for file: parse-ports.hcl"))
+
+	job, err = ParseFile(path)
+	must.NoError(t, err)
+	must.NotNil(t, job)
+	must.Len(t, 1, job.TaskGroups)
+	must.Len(t, 1, job.TaskGroups[0].Networks)
+	must.Len(t, 1, job.TaskGroups[0].Networks[0].ReservedPorts)
+	must.Len(t, 1, job.TaskGroups[0].Networks[0].DynamicPorts)
+	must.Eq(t, 9000, job.TaskGroups[0].Networks[0].ReservedPorts[0].Value)
+	must.Eq(t, 0, job.TaskGroups[0].Networks[0].DynamicPorts[0].Value)
 }

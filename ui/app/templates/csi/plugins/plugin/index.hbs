@@ -1,10 +1,10 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 {{page-title "CSI Plugin " this.model.plainId}}
-<div data-test-subnav="plugins" class="tabs is-subnav">
-  <ul>
-    <li data-test-tab="overview"><LinkTo @route="csi.plugins.plugin.index" @model={{this.model}} @activeClass="is-active">Overview</LinkTo></li>
-    <li data-test-tab="allocations"><LinkTo @route="csi.plugins.plugin.allocations" @model={{this.model}} @activeClass="is-active">Allocations</LinkTo></li>
-  </ul>
-</div>
+<PluginSubnav @plugin={{this.model}} />
 <section class="section">
   <h1 class="title" data-test-title>{{this.model.plainId}}</h1>
 
@@ -100,7 +100,7 @@
             @source={{take 10 this.sortedControllers}}
             @class="with-foot" as |t|>
             <t.head>
-              <th class="is-narrow"></th>
+              <th class="is-narrow"><span class="visually-hidden">Driver Health, Scheduling, and Preemption</span></th>
               <td>ID</td>
               <th>Created</th>
               <th>Modified</th>
@@ -151,7 +151,7 @@
           @source={{take 10 this.sortedNodes}}
           @class="with-foot" as |t|>
           <t.head>
-            <th class="is-narrow"></th>
+            <th class="is-narrow"><span class="visually-hidden">Driver Health, Scheduling, and Preemption</span></th>
             <td>ID</td>
             <th>Created</th>
             <th>Modified</th>

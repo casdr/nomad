@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -5,13 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/nomad/ci"
 	"github.com/mitchellh/cli"
-	"github.com/stretchr/testify/require"
+	"github.com/shoenig/test/must"
 )
 
 func TestCommand_Ui(t *testing.T) {
-	ci.Parallel(t)
 
 	type testCaseSetupFn func(*testing.T)
 
@@ -43,38 +44,38 @@ func TestCommand_Ui(t *testing.T) {
 		{
 			Name: "set namespace via env var",
 			SetupFn: func(t *testing.T) {
-				setEnv(t, "NOMAD_NAMESPACE", "dev")
+				t.Setenv("NOMAD_NAMESPACE", "dev")
 			},
 			ExpectedURL: "http://127.0.0.1:4646?namespace=dev",
 		},
 		{
 			Name: "set region via env var",
 			SetupFn: func(t *testing.T) {
-				setEnv(t, "NOMAD_REGION", "earth")
+				t.Setenv("NOMAD_REGION", "earth")
 			},
 			ExpectedURL: "http://127.0.0.1:4646?region=earth",
 		},
 		{
 			Name: "set region and namespace via env var",
 			SetupFn: func(t *testing.T) {
-				setEnv(t, "NOMAD_REGION", "earth")
-				setEnv(t, "NOMAD_NAMESPACE", "dev")
+				t.Setenv("NOMAD_REGION", "earth")
+				t.Setenv("NOMAD_NAMESPACE", "dev")
 			},
 			ExpectedURL: "http://127.0.0.1:4646?namespace=dev&region=earth",
 		},
 		{
 			Name: "set region and namespace via env var",
 			SetupFn: func(t *testing.T) {
-				setEnv(t, "NOMAD_REGION", "earth")
-				setEnv(t, "NOMAD_NAMESPACE", "dev")
+				t.Setenv("NOMAD_REGION", "earth")
+				t.Setenv("NOMAD_NAMESPACE", "dev")
 			},
 			ExpectedURL: "http://127.0.0.1:4646?namespace=dev&region=earth",
 		},
 		{
 			Name: "flags have higher precedence",
 			SetupFn: func(t *testing.T) {
-				setEnv(t, "NOMAD_REGION", "earth")
-				setEnv(t, "NOMAD_NAMESPACE", "dev")
+				t.Setenv("NOMAD_REGION", "earth")
+				t.Setenv("NOMAD_NAMESPACE", "dev")
 			},
 			Args: []string{
 				"-region=mars",
@@ -87,8 +88,8 @@ func TestCommand_Ui(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.Name, func(t *testing.T) {
 			// Make sure environment variables are clean.
-			setEnv(t, "NOMAD_NAMESPACE", "")
-			setEnv(t, "NOMAD_REGION", "")
+			t.Setenv("NOMAD_NAMESPACE", "")
+			t.Setenv("NOMAD_REGION", "")
 
 			// Setup fake CLI UI and test case
 			ui := cli.NewMockUi()
@@ -101,13 +102,12 @@ func TestCommand_Ui(t *testing.T) {
 			// Don't try to open a browser.
 			args := append(tc.Args, "-show-url")
 
-			if code := cmd.Run(args); code != 0 {
-				require.Equal(t, 0, code, "expected exit code 0, got %d", code)
-			}
+			code := cmd.Run(args)
+			must.Zero(t, code)
 
 			got := ui.OutputWriter.String()
 			expected := fmt.Sprintf("URL for web UI: %s", tc.ExpectedURL)
-			require.Equal(t, expected, strings.TrimSpace(got))
+			must.Eq(t, expected, strings.TrimSpace(got))
 		})
 	}
 }

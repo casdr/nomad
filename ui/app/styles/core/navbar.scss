@@ -1,16 +1,28 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+$secondaryNavbarHeight: 4.5rem;
+
 .navbar {
   display: flex;
   align-items: center;
 
   &.is-primary {
-    background: linear-gradient(to right, $nomad-green-darker, $nomad-green-dark);
+    background: linear-gradient(
+      to right,
+      $nomad-green-darker,
+      $nomad-green-dark
+    );
     height: 3.5rem;
     color: $primary-invert;
     padding-left: 20px;
     padding-right: 20px;
-    overflow: hidden;
+    overflow: visible;
     align-items: center;
     justify-content: space-between;
+    z-index: $z-gutter;
 
     .navbar-item {
       color: rgba($primary-invert, 0.8);
@@ -72,7 +84,7 @@
   &.is-secondary {
     background-color: $nomad-green-dark;
     padding: 1.25rem 20px 1.25rem 0;
-    height: 4.5rem;
+    height: $secondaryNavbarHeight;
     font-weight: $weight-semibold;
     color: $primary-invert;
 
@@ -146,5 +158,29 @@
         display: none;
       }
     }
+  }
+
+  .profile-dropdown {
+    padding: 0.5rem 1rem 0.5rem 0.75rem;
+    z-index: $z-gutter;
+    button.hds-dropdown-toggle-icon {
+      border-color: var(--token-color-palette-neutral-200);
+      background-color: transparent;
+      color: var(--token-color-surface-primary);
+
+      &.hds-dropdown-toggle-icon--is-open {
+        background-color: var(--token-color-surface-primary);
+        color: var(--token-color-foreground-primary);
+      }
+    }
+  }
+
+  .custom-label {
+    border-radius: 1rem;
+    padding: 0.25rem 1rem;
+    background: black;
+    color: white;
+    display: grid;
+    align-self: center;
   }
 }

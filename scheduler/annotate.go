@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package scheduler
 
 import (
@@ -30,11 +33,12 @@ const (
 //
 // Currently the things that are annotated are:
 // * Task group changes will be annotated with:
-//    * Count up and count down changes
-//    * Update counts (creates, destroys, migrates, etc)
+//   - Count up and count down changes
+//   - Update counts (creates, destroys, migrates, etc)
+//
 // * Task changes will be annotated with:
-//    * forces create/destroy update
-//    * forces in-place update
+//   - forces create/destroy update
+//   - forces in-place update
 func Annotate(diff *structs.JobDiff, annotations *structs.PlanAnnotations) error {
 	tgDiffs := diff.TaskGroups
 	if len(tgDiffs) == 0 {
@@ -184,7 +188,17 @@ FieldsLoop:
 	ObjectsLoop:
 		for _, oDiff := range diff.Objects {
 			switch oDiff.Name {
-			case "LogConfig", "Service", "Constraint":
+			case "Service", "Constraint":
+				continue
+			case "LogConfig":
+				for _, fDiff := range oDiff.Fields {
+					switch fDiff.Name {
+					// force a destructive update if logger was enabled or disabled
+					case "Disabled":
+						destructive = true
+						break ObjectsLoop
+					}
+				}
 				continue
 			default:
 				destructive = true

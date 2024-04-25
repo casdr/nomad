@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -42,13 +45,13 @@ Status Options:
     queried, and drops verbose information about allocations.
 
   -verbose
-    Display full allocation information.
+    Display full volumes information.
 
   -json
-    Output the allocation in its JSON format.
+    Output the volumes in JSON format.
 
   -t
-    Format and display allocation using a Go template.
+    Format and display volumes using a Go template.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -114,7 +117,6 @@ func (c *VolumeStatusCommand) Run(args []string) int {
 	if c.verbose {
 		c.length = fullId
 	}
-	c.length = fullId
 
 	// Get the HTTP client
 	client, err := c.Meta.Client()

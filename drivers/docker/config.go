@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package docker
 
 import (
@@ -15,6 +18,7 @@ import (
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 )
 
@@ -112,21 +116,19 @@ func PluginLoader(opts map[string]string) (map[string]interface{}, error) {
 }
 
 var (
-	// PluginID is the rawexec plugin metadata registered in the plugin
-	// catalog.
+	// PluginID is the docker plugin metadata registered in the plugin catalog.
 	PluginID = loader.PluginID{
 		Name:       pluginName,
 		PluginType: base.PluginTypeDriver,
 	}
 
-	// PluginConfig is the rawexec factory function registered in the
-	// plugin catalog.
+	// PluginConfig is the docker config factory function registered in the plugin catalog.
 	PluginConfig = &loader.InternalPluginConfig{
 		Config:  map[string]interface{}{},
 		Factory: func(ctx context.Context, l hclog.Logger) interface{} { return NewDockerDriver(ctx, l) },
 	}
 
-	// pluginInfo is the response returned for the PluginInfo RPC
+	// pluginInfo is the response returned for the PluginInfo RPC.
 	pluginInfo = &base.PluginInfoResponse{
 		Type:              base.PluginTypeDriver,
 		PluginApiVersions: []string{drivers.ApiVersion010},
@@ -206,7 +208,7 @@ var (
 			"type":   hclspec.NewAttr("type", "string", false),
 			"config": hclspec.NewBlockAttrs("config", "string", false),
 		})), hclspec.NewLiteral(`{
-			type = "json-file" 
+			type = "json-file"
 			config = {
 				max-file = "2"
 				max-size = "2m"
@@ -321,6 +323,11 @@ var (
 		})),
 	})
 
+	// healthchecksBodySpec is the hcl specification for the `healthchecks` block
+	healthchecksBodySpec = hclspec.NewObject(map[string]*hclspec.Spec{
+		"disable": hclspec.NewAttr("disable", "bool", false),
+	})
+
 	// taskConfigSpec is the hcl specification for the driver config section of
 	// a task within a job. It is returned in the TaskConfigSchema RPC
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
@@ -354,12 +361,15 @@ var (
 		"entrypoint":         hclspec.NewAttr("entrypoint", "list(string)", false),
 		"extra_hosts":        hclspec.NewAttr("extra_hosts", "list(string)", false),
 		"force_pull":         hclspec.NewAttr("force_pull", "bool", false),
+		"group_add":          hclspec.NewAttr("group_add", "list(string)", false),
+		"healthchecks":       hclspec.NewBlock("healthchecks", false, healthchecksBodySpec),
 		"hostname":           hclspec.NewAttr("hostname", "string", false),
 		"init":               hclspec.NewAttr("init", "bool", false),
 		"interactive":        hclspec.NewAttr("interactive", "bool", false),
 		"ipc_mode":           hclspec.NewAttr("ipc_mode", "string", false),
 		"ipv4_address":       hclspec.NewAttr("ipv4_address", "string", false),
 		"ipv6_address":       hclspec.NewAttr("ipv6_address", "string", false),
+		"isolation":          hclspec.NewAttr("isolation", "string", false),
 		"labels":             hclspec.NewAttr("labels", "list(map(string))", false),
 		"load":               hclspec.NewAttr("load", "string", false),
 		"logging": hclspec.NewBlock("logging", false, hclspec.NewObject(map[string]*hclspec.Spec{
@@ -405,7 +415,7 @@ var (
 	driverCapabilities = &drivers.Capabilities{
 		SendSignals: true,
 		Exec:        true,
-		FSIsolation: drivers.FSIsolationImage,
+		FSIsolation: fsisolation.Image,
 		NetIsolationModes: []drivers.NetIsolationMode{
 			drivers.NetIsolationModeHost,
 			drivers.NetIsolationModeGroup,
@@ -435,12 +445,15 @@ type TaskConfig struct {
 	Entrypoint        []string           `codec:"entrypoint"`
 	ExtraHosts        []string           `codec:"extra_hosts"`
 	ForcePull         bool               `codec:"force_pull"`
+	GroupAdd          []string           `codec:"group_add"`
+	Healthchecks      DockerHealthchecks `codec:"healthchecks"`
 	Hostname          string             `codec:"hostname"`
 	Init              bool               `codec:"init"`
 	Interactive       bool               `codec:"interactive"`
 	IPCMode           string             `codec:"ipc_mode"`
 	IPv4Address       string             `codec:"ipv4_address"`
 	IPv6Address       string             `codec:"ipv6_address"`
+	Isolation         string             `codec:"isolation"`
 	Labels            hclutils.MapStrStr `codec:"labels"`
 	LoadImage         string             `codec:"load"`
 	Logging           DockerLogging      `codec:"logging"`
@@ -497,6 +510,11 @@ func (d DockerDevice) toDockerDevice() (docker.Device, error) {
 		return dd, fmt.Errorf("host path must be set in configuration for devices")
 	}
 
+	// Docker's CLI defaults to HostPath in this case. See #16754
+	if dd.PathInContainer == "" {
+		dd.PathInContainer = d.HostPath
+	}
+
 	if dd.CgroupPermissions == "" {
 		dd.CgroupPermissions = "rwm"
 	}
@@ -512,6 +530,14 @@ type DockerLogging struct {
 	Type   string             `codec:"type"`
 	Driver string             `codec:"driver"`
 	Config hclutils.MapStrStr `codec:"config"`
+}
+
+type DockerHealthchecks struct {
+	Disable bool `codec:"disable"`
+}
+
+func (dh *DockerHealthchecks) Disabled() bool {
+	return dh == nil || dh.Disable
 }
 
 type DockerMount struct {
@@ -682,6 +708,7 @@ func (d *Driver) SetConfig(c *base.Config) error {
 		}
 	}
 
+	d.compute = c.AgentConfig.Compute()
 	d.config = &config
 	d.config.InfraImage = strings.TrimPrefix(d.config.InfraImage, "https://")
 
@@ -715,7 +742,7 @@ func (d *Driver) SetConfig(c *base.Config) error {
 	if len(d.config.PullActivityTimeout) > 0 {
 		dur, err := time.ParseDuration(d.config.PullActivityTimeout)
 		if err != nil {
-			return fmt.Errorf("failed to parse 'pull_activity_timeout' duaration: %v", err)
+			return fmt.Errorf("failed to parse 'pull_activity_timeout' duration: %v", err)
 		}
 		if dur < pullActivityTimeoutMinimum {
 			return fmt.Errorf("pull_activity_timeout is less than minimum, %v", pullActivityTimeoutMinimum)
@@ -726,7 +753,7 @@ func (d *Driver) SetConfig(c *base.Config) error {
 	if d.config.InfraImagePullTimeout != "" {
 		dur, err := time.ParseDuration(d.config.InfraImagePullTimeout)
 		if err != nil {
-			return fmt.Errorf("failed to parse 'infra_image_pull_timeout' duaration: %v", err)
+			return fmt.Errorf("failed to parse 'infra_image_pull_timeout' duration: %v", err)
 		}
 		d.config.infraImagePullTimeoutDuration = dur
 	}
@@ -740,7 +767,7 @@ func (d *Driver) SetConfig(c *base.Config) error {
 		d.clientConfig = c.AgentConfig.Driver
 	}
 
-	dockerClient, _, err := d.dockerClients()
+	dockerClient, err := d.getDockerClient()
 	if err != nil {
 		return fmt.Errorf("failed to get docker client: %v", err)
 	}
@@ -754,7 +781,9 @@ func (d *Driver) SetConfig(c *base.Config) error {
 
 	d.coordinator = newDockerCoordinator(coordinatorConfig)
 
-	d.reconciler = newReconciler(d)
+	d.danglingReconciler = newReconciler(d)
+
+	go d.recoverPauseContainers(d.ctx)
 
 	return nil
 }
@@ -766,13 +795,6 @@ func (d *Driver) TaskConfigSchema() (*hclspec.Spec, error) {
 // Capabilities is returned by the Capabilities RPC and indicates what optional
 // features this driver supports.
 func (d *Driver) Capabilities() (*drivers.Capabilities, error) {
+	driverCapabilities.DisableLogCollection = d.config != nil && d.config.DisableLogCollection
 	return driverCapabilities, nil
-}
-
-var _ drivers.InternalCapabilitiesDriver = (*Driver)(nil)
-
-func (d *Driver) InternalCapabilities() drivers.InternalCapabilities {
-	return drivers.InternalCapabilities{
-		DisableLogCollection: d.config != nil && d.config.DisableLogCollection,
-	}
 }

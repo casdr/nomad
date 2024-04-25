@@ -1,3 +1,9 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+/* eslint-disable ember/no-incorrect-calls-with-inline-anonymous-functions */
 import Controller from '@ember/controller';
 import { computed, action } from '@ember/object';
 import { alias } from '@ember/object/computed';
@@ -5,6 +11,13 @@ import { inject as service } from '@ember/service';
 import { tracked } from '@glimmer/tracking';
 import classic from 'ember-classic-decorator';
 import { reduceBytes, reduceHertz } from 'nomad-ui/utils/units';
+import {
+  serialize,
+  deserializedQueryParam as selection,
+} from 'nomad-ui/utils/qp-serialize';
+import { scheduleOnce } from '@ember/runloop';
+import intersection from 'lodash.intersection';
+import Searchable from 'nomad-ui/mixins/searchable';
 
 const sumAggregator = (sum, value) => sum + (value || 0);
 const formatter = new Intl.NumberFormat(window.navigator.locale || 'en', {
@@ -12,12 +25,176 @@ const formatter = new Intl.NumberFormat(window.navigator.locale || 'en', {
 });
 
 @classic
-export default class TopologyControllers extends Controller {
+export default class TopologyControllers extends Controller.extend(Searchable) {
   @service userSettings;
+
+  queryParams = [
+    {
+      searchTerm: 'search',
+    },
+    {
+      qpState: 'status',
+    },
+    {
+      qpVersion: 'version',
+    },
+    {
+      qpClass: 'class',
+    },
+    {
+      qpDatacenter: 'dc',
+    },
+    {
+      qpNodePool: 'nodePool',
+    },
+  ];
+
+  @tracked searchTerm = '';
+  qpState = '';
+  qpVersion = '';
+  qpClass = '';
+  qpDatacenter = '';
+  qpNodePool = '';
+
+  setFacetQueryParam(queryParam, selection) {
+    this.set(queryParam, serialize(selection));
+  }
+
+  @selection('qpState') selectionState;
+  @selection('qpClass') selectionClass;
+  @selection('qpDatacenter') selectionDatacenter;
+  @selection('qpNodePool') selectionNodePool;
+  @selection('qpVersion') selectionVersion;
+
+  @computed
+  get optionsState() {
+    return [
+      { key: 'initializing', label: 'Initializing' },
+      { key: 'ready', label: 'Ready' },
+      { key: 'down', label: 'Down' },
+      { key: 'ineligible', label: 'Ineligible' },
+      { key: 'draining', label: 'Draining' },
+      { key: 'disconnected', label: 'Disconnected' },
+    ];
+  }
+
+  @computed('model.nodes', 'nodes.[]', 'selectionClass')
+  get optionsClass() {
+    const classes = Array.from(new Set(this.model.nodes.mapBy('nodeClass')))
+      .compact()
+      .without('');
+
+    // Remove any invalid node classes from the query param/selection
+    scheduleOnce('actions', () => {
+      // eslint-disable-next-line ember/no-side-effects
+      this.set(
+        'qpClass',
+        serialize(intersection(classes, this.selectionClass))
+      );
+    });
+
+    return classes.sort().map((dc) => ({ key: dc, label: dc }));
+  }
+
+  @computed('model.nodes', 'nodes.[]', 'selectionDatacenter')
+  get optionsDatacenter() {
+    const datacenters = Array.from(
+      new Set(this.model.nodes.mapBy('datacenter'))
+    ).compact();
+
+    // Remove any invalid datacenters from the query param/selection
+    scheduleOnce('actions', () => {
+      // eslint-disable-next-line ember/no-side-effects
+      this.set(
+        'qpDatacenter',
+        serialize(intersection(datacenters, this.selectionDatacenter))
+      );
+    });
+
+    return datacenters.sort().map((dc) => ({ key: dc, label: dc }));
+  }
+
+  @computed('model.nodePools.[]', 'selectionNodePool')
+  get optionsNodePool() {
+    const availableNodePools = this.model.nodePools;
+
+    scheduleOnce('actions', () => {
+      // eslint-disable-next-line ember/no-side-effects
+      this.set(
+        'qpNodePool',
+        serialize(
+          intersection(
+            availableNodePools.map(({ name }) => name),
+            this.selectionNodePool
+          )
+        )
+      );
+    });
+
+    return availableNodePools.sort().map((nodePool) => ({
+      key: nodePool.name,
+      label: nodePool.name,
+    }));
+  }
+
+  @computed('model.nodes', 'nodes.[]', 'selectionVersion')
+  get optionsVersion() {
+    const versions = Array.from(
+      new Set(this.model.nodes.mapBy('version'))
+    ).compact();
+
+    // Remove any invalid versions from the query param/selection
+    scheduleOnce('actions', () => {
+      // eslint-disable-next-line ember/no-side-effects
+      this.set(
+        'qpVersion',
+        serialize(intersection(versions, this.selectionVersion))
+      );
+    });
+
+    return versions.sort().map((v) => ({ key: v, label: v }));
+  }
 
   @alias('userSettings.showTopoVizPollingNotice') showPollingNotice;
 
-  @tracked filteredNodes = null;
+  @tracked pre09Nodes = null;
+
+  get filteredNodes() {
+    const { nodes } = this.model;
+    return nodes.filter((node) => {
+      const {
+        searchTerm,
+        selectionState,
+        selectionVersion,
+        selectionDatacenter,
+        selectionClass,
+        selectionNodePool,
+      } = this;
+      const matchState =
+        selectionState.includes(node.status) ||
+        (selectionState.includes('ineligible') && !node.isEligible) ||
+        (selectionState.includes('draining') && node.isDraining);
+
+      return (
+        (selectionState.length ? matchState : true) &&
+        (selectionVersion.length
+          ? selectionVersion.includes(node.version)
+          : true) &&
+        (selectionDatacenter.length
+          ? selectionDatacenter.includes(node.datacenter)
+          : true) &&
+        (selectionClass.length
+          ? selectionClass.includes(node.nodeClass)
+          : true) &&
+        (selectionNodePool.length
+          ? selectionNodePool.includes(node.nodePool)
+          : true) &&
+        (node.name.includes(searchTerm) ||
+          node.datacenter.includes(searchTerm) ||
+          node.nodeClass.includes(searchTerm))
+      );
+    });
+  }
 
   @computed('model.nodes.@each.datacenter')
   get datacenters() {
@@ -156,9 +333,9 @@ export default class TopologyControllers extends Controller {
 
   @action
   handleTopoVizDataError(errors) {
-    const filteredNodesError = errors.findBy('type', 'filtered-nodes');
-    if (filteredNodesError) {
-      this.filteredNodes = filteredNodesError.context;
+    const pre09NodesError = errors.findBy('type', 'filtered-nodes');
+    if (pre09NodesError) {
+      this.pre09Nodes = pre09NodesError.context;
     }
   }
 }

@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
 job "csi-plugin" {
   type        = "system"
   datacenters = ["dc1"]
@@ -8,12 +11,12 @@ job "csi-plugin" {
       driver = "docker"
 
       config {
-        image = "quay.io/k8scsi/hostpathplugin:v1.2.0"
+        image = "registry.k8s.io/sig-storage/hostpathplugin:v1.9.0"
 
         args = [
           "--drivername=csi-hostpath",
           "--v=5",
-          "--endpoint=unix://csi/csi.sock",
+          "--endpoint=${CSI_ENDPOINT}",
           "--nodeid=node-${NOMAD_ALLOC_INDEX}",
         ]
 

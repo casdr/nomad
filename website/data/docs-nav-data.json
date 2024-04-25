@@ -59,15 +59,33 @@
       },
       {
         "title": "Consul",
-        "path": "integrations/consul-integration"
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "integrations/consul"
+          },
+          {
+            "title": "ACL",
+            "path": "integrations/consul/acl"
+          },
+          {
+            "title": "Service Mesh",
+            "path": "integrations/consul/service-mesh"
+          }
+        ]
       },
       {
-        "title": "Consul Service Mesh",
-        "path": "integrations/consul-connect"
-      },
-      {
-        "title": "Vault Integration",
-        "path": "integrations/vault-integration"
+        "title": "Vault",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "integrations/vault"
+          },
+          {
+            "title": "ACL",
+            "path": "integrations/vault/acl"
+          }
+        ]
       }
     ]
   },
@@ -75,38 +93,50 @@
     "divider": true
   },
   {
-    "title": "Internals",
+    "title": "Concepts",
     "routes": [
       {
         "title": "Overview",
-        "path": "internals"
+        "path": "concepts"
+      },
+      {
+        "title": "ACL",
+        "path": "concepts/acl"
       },
       {
         "title": "Architecture",
-        "path": "internals/architecture"
+        "path": "concepts/architecture"
+      },
+      {
+        "title": "CPU",
+        "path": "concepts/cpu"
       },
       {
         "title": "Plugins",
         "routes": [
           {
             "title": "Overview",
-            "path": "internals/plugins"
+            "path": "concepts/plugins"
           },
           {
             "title": "Base",
-            "path": "internals/plugins/base"
+            "path": "concepts/plugins/base"
           },
           {
             "title": "Task Drivers",
-            "path": "internals/plugins/task-drivers"
+            "path": "concepts/plugins/task-drivers"
           },
           {
             "title": "Devices",
-            "path": "internals/plugins/devices"
+            "path": "concepts/plugins/devices"
           },
           {
             "title": "Storage",
-            "path": "internals/plugins/csi"
+            "path": "concepts/plugins/csi"
+          },
+          {
+            "title": "Networking",
+            "path": "concepts/plugins/cni"
           }
         ]
       },
@@ -115,33 +145,49 @@
         "routes": [
           {
             "title": "Overview",
-            "path": "internals/scheduling"
+            "path": "concepts/scheduling"
           },
           {
-            "title": "Internals",
-            "path": "internals/scheduling/scheduling"
+            "title": "Concepts",
+            "path": "concepts/scheduling/scheduling"
+          },
+          {
+            "title": "Placement",
+            "path": "concepts/scheduling/placement"
           },
           {
             "title": "Preemption",
-            "path": "internals/scheduling/preemption"
+            "path": "concepts/scheduling/preemption"
           }
         ]
       },
       {
         "title": "Consensus Protocol",
-        "path": "internals/consensus"
+        "path": "concepts/consensus"
       },
       {
         "title": "Filesystem",
-        "path": "internals/filesystem"
+        "path": "concepts/filesystem"
       },
       {
         "title": "Gossip Protocol",
-        "path": "internals/gossip"
+        "path": "concepts/gossip"
+      },
+      {
+        "title": "Node Pools",
+        "path": "concepts/node-pools"
       },
       {
         "title": "Security Model",
-        "path": "internals/security"
+        "path": "concepts/security"
+      },
+      {
+        "title": "Workload Identity",
+        "path": "concepts/workload-identity"
+      },
+      {
+        "title": "Variables",
+        "path": "concepts/variables"
       }
     ]
   },
@@ -175,6 +221,10 @@
       {
         "title": "plugin",
         "path": "configuration/plugin"
+      },
+      {
+        "title": "reporting",
+        "path": "configuration/reporting"
       },
       {
         "title": "sentinel",
@@ -229,44 +279,129 @@
             "path": "commands/acl/bootstrap"
           },
           {
-            "title": "policy apply",
-            "path": "commands/acl/policy-apply"
+            "title": "auth-method",
+            "routes": [
+              {
+                "title": "create",
+                "path": "commands/acl/auth-method/create"
+              },
+              {
+                "title": "delete",
+                "path": "commands/acl/auth-method/delete"
+              },
+              {
+                "title": "info",
+                "path": "commands/acl/auth-method/info"
+              },
+              {
+                "title": "list",
+                "path": "commands/acl/auth-method/list"
+              },
+              {
+                "title": "update",
+                "path": "commands/acl/auth-method/update"
+              }
+            ]
           },
           {
-            "title": "policy delete",
-            "path": "commands/acl/policy-delete"
+            "title": "binding-rule",
+            "routes": [
+              {
+                "title": "create",
+                "path": "commands/acl/binding-rule/create"
+              },
+              {
+                "title": "delete",
+                "path": "commands/acl/binding-rule/delete"
+              },
+              {
+                "title": "info",
+                "path": "commands/acl/binding-rule/info"
+              },
+              {
+                "title": "list",
+                "path": "commands/acl/binding-rule/list"
+              },
+              {
+                "title": "update",
+                "path": "commands/acl/binding-rule/update"
+              }
+            ]
           },
           {
-            "title": "policy info",
-            "path": "commands/acl/policy-info"
+            "title": "policy",
+            "routes": [
+              {
+                "title": "apply",
+                "path": "commands/acl/policy/apply"
+              },
+              {
+                "title": "delete",
+                "path": "commands/acl/policy/delete"
+              },
+              {
+                "title": "info",
+                "path": "commands/acl/policy/info"
+              },
+              {
+                "title": "list",
+                "path": "commands/acl/policy/list"
+              }
+            ]
           },
           {
-            "title": "policy list",
-            "path": "commands/acl/policy-list"
+            "title": "role",
+            "routes": [
+              {
+                "title": "create",
+                "path": "commands/acl/role/create"
+              },
+              {
+                "title": "delete",
+                "path": "commands/acl/role/delete"
+              },
+              {
+                "title": "info",
+                "path": "commands/acl/role/info"
+              },
+              {
+                "title": "list",
+                "path": "commands/acl/role/list"
+              },
+              {
+                "title": "update",
+                "path": "commands/acl/role/update"
+              }
+            ]
           },
           {
-            "title": "token create",
-            "path": "commands/acl/token-create"
-          },
-          {
-            "title": "token delete",
-            "path": "commands/acl/token-delete"
-          },
-          {
-            "title": "token info",
-            "path": "commands/acl/token-info"
-          },
-          {
-            "title": "token list",
-            "path": "commands/acl/token-list"
-          },
-          {
-            "title": "token self",
-            "path": "commands/acl/token-self"
-          },
-          {
-            "title": "token update",
-            "path": "commands/acl/token-update"
+            "title": "token",
+            "routes": [
+              {
+                "title": "create",
+                "path": "commands/acl/token/create"
+              },
+              {
+                "title": "delete",
+                "path": "commands/acl/token/delete"
+              },
+              {
+                "title": "info",
+                "path": "commands/acl/token/info"
+              },
+              {
+                "title": "list",
+                "path": "commands/acl/token/list"
+              },
+              {
+                "title": "self",
+                "path": "commands/acl/token/self"
+              },
+              {
+                "title": "update",
+                "path": "commands/acl/token/update"
+              }
+            ]
           }
         ]
       },
@@ -284,6 +419,10 @@
           {
             "title": "Overview",
             "path": "commands/alloc"
+          },
+          {
+            "title": "checks",
+            "path": "commands/alloc/checks"
           },
           {
             "title": "exec",
@@ -373,6 +512,10 @@
             "path": "commands/eval"
           },
           {
+            "title": "delete",
+            "path": "commands/eval/delete"
+          },
+          {
             "title": "list",
             "path": "commands/eval/list"
           },
@@ -383,11 +526,19 @@
         ]
       },
       {
+        "title": "fmt",
+        "path": "commands/fmt"
+      },
+      {
         "title": "job",
         "routes": [
           {
             "title": "Overview",
             "path": "commands/job"
+          },
+          {
+            "title": "action",
+            "path": "commands/job/action"
           },
           {
             "title": "allocs",
@@ -430,6 +581,10 @@
             "path": "commands/job/promote"
           },
           {
+            "title": "restart",
+            "path": "commands/job/restart"
+          },
+          {
             "title": "revert",
             "path": "commands/job/revert"
           },
@@ -469,8 +624,16 @@
           {
             "title": "get",
             "path": "commands/license/get"
+          },
+          {
+            "title": "inspect",
+            "path": "commands/license/inspect"
           }
         ]
+      },
+      {
+        "title": "login",
+        "path": "commands/login"
       },
       {
         "title": "monitor",
@@ -525,8 +688,62 @@
             "path": "commands/node/eligibility"
           },
           {
+            "title": "meta",
+            "routes": [
+              {
+                "title": "Overview",
+                "path": "commands/node/meta"
+              },
+              {
+                "title": "apply",
+                "path": "commands/node/meta/apply"
+              },
+              {
+                "title": "read",
+                "path": "commands/node/meta/read"
+              }
+            ]
+          },
+          {
             "title": "status",
             "path": "commands/node/status"
+          }
+        ]
+      },
+      {
+        "title": "node pool",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "commands/node-pool"
+          },
+          {
+            "title": "apply",
+            "path": "commands/node-pool/apply"
+          },
+          {
+            "title": "delete",
+            "path": "commands/node-pool/delete"
+          },
+          {
+            "title": "info",
+            "path": "commands/node-pool/info"
+          },
+          {
+            "title": "init",
+            "path": "commands/node-pool/init"
+          },
+          {
+            "title": "jobs",
+            "path": "commands/node-pool/jobs"
+          },
+          {
+            "title": "list",
+            "path": "commands/node-pool/list"
+          },
+          {
+            "title": "nodes",
+            "path": "commands/node-pool/nodes"
           }
         ]
       },
@@ -542,68 +759,142 @@
             "path": "commands/operator/api"
           },
           {
-            "title": "autopilot get-config",
-            "path": "commands/operator/autopilot-get-config"
+            "title": "autopilot",
+            "routes": [
+              {
+                "title": "get-config",
+                "path": "commands/operator/autopilot/get-config"
+              },
+              {
+                "title": "set-config",
+                "path": "commands/operator/autopilot/set-config"
+              },
+              {
+                "title": "health",
+                "path": "commands/operator/autopilot/health"
+              }
+            ]
           },
           {
-            "title": "autopilot set-config",
-            "path": "commands/operator/autopilot-set-config"
+            "title": "client-state",
+            "path": "commands/operator/client-state"
           },
           {
             "title": "debug",
             "path": "commands/operator/debug"
           },
           {
-            "title": "keygen",
-            "path": "commands/operator/keygen"
-          },
-          {
-            "title": "keyring",
-            "path": "commands/operator/keyring"
+            "title": "gossip",
+            "routes": [
+              {
+                "title": "keyring generate",
+                "path": "commands/operator/gossip/keyring-generate"
+              },
+              {
+                "title": "keyring install",
+                "path": "commands/operator/gossip/keyring-install"
+              },
+              {
+                "title": "keyring list",
+                "path": "commands/operator/gossip/keyring-list"
+              },
+              {
+                "title": "keyring remove",
+                "path": "commands/operator/gossip/keyring-remove"
+              },
+              {
+                "title": "keyring use",
+                "path": "commands/operator/gossip/keyring-use"
+              }
+            ]
           },
           {
             "title": "metrics",
             "path": "commands/operator/metrics"
           },
           {
-            "title": "raft info",
-            "path": "commands/operator/raft-info"
+            "title": "raft",
+            "routes": [
+              {
+                "title": "info",
+                "path": "commands/operator/raft/info"
+              },
+              {
+                "title": "list-peers",
+                "path": "commands/operator/raft/list-peers"
+              },
+              {
+                "title": "logs",
+                "path": "commands/operator/raft/logs"
+              },
+              {
+                "title": "remove-peer",
+                "path": "commands/operator/raft/remove-peer"
+              },
+              {
+                "title": "state",
+                "path": "commands/operator/raft/state"
+              },
+              {
+                "title": "transfer-leadership",
+                "path": "commands/operator/raft/transfer-leadership"
+              }
+            ]
           },
           {
-            "title": "raft list-peers",
-            "path": "commands/operator/raft-list-peers"
+            "title": "root",
+            "routes": [
+              {
+                "title": "keyring list",
+                "path": "commands/operator/root/keyring-list"
+              },
+              {
+                "title": "keyring remove",
+                "path": "commands/operator/root/keyring-remove"
+              },
+              {
+                "title": "keyring rotate",
+                "path": "commands/operator/root/keyring-rotate"
+              }
+            ]
           },
           {
-            "title": "raft logs",
-            "path": "commands/operator/raft-logs"
+            "title": "scheduler",
+            "routes": [
+              {
+                "title": "get-config",
+                "path": "commands/operator/scheduler/get-config"
+              },
+              {
+                "title": "set-config",
+                "path": "commands/operator/scheduler/set-config"
+              }
+            ]
           },
           {
-            "title": "raft remove-peer",
-            "path": "commands/operator/raft-remove-peer"
-          },
-          {
-            "title": "raft state",
-            "path": "commands/operator/raft-state"
-          },
-          {
-            "title": "snapshot agent",
-            "path": "commands/operator/snapshot-agent"
-          },
-          {
-            "title": "snapshot inspect",
-            "path": "commands/operator/snapshot-inspect"
-          },
-          {
-            "title": "snapshot restore",
-            "path": "commands/operator/snapshot-restore"
-          },
-          {
-            "title": "snapshot save",
-            "path": "commands/operator/snapshot-save"
-          },
-          {
-            "title": "snapshot state",
-            "path": "commands/operator/snapshot-state"
+            "title": "snapshot",
+            "routes": [
+              {
+                "title": "agent",
+                "path": "commands/operator/snapshot/agent"
+              },
+              {
+                "title": "inspect",
+                "path": "commands/operator/snapshot/inspect"
+              },
+              {
+                "title": "restore",
+                "path": "commands/operator/snapshot/restore"
+              },
+              {
+                "title": "save",
+                "path": "commands/operator/snapshot/save"
+              },
+              {
+                "title": "state",
+                "path": "commands/operator/snapshot/state"
+              }
+            ]
           }
         ]
       },
@@ -679,6 +970,23 @@
         ]
       },
       {
+        "title": "setup",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "commands/setup"
+          },
+          {
+            "title": "consul",
+            "path": "commands/setup/consul"
+          },
+          {
+            "title": "vault",
+            "path": "commands/setup/vault"
+          }
+        ]
+      },
+      {
         "title": "scaling",
         "routes": [
           {
@@ -742,6 +1050,27 @@
         ]
       },
       {
+        "title": "service",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "commands/service"
+          },
+          {
+            "title": "service delete",
+            "path": "commands/service/delete"
+          },
+          {
+            "title": "service info",
+            "path": "commands/service/info"
+          },
+          {
+            "title": "service list",
+            "path": "commands/service/list"
+          }
+        ]
+      },
+      {
         "title": "status",
         "path": "commands/status"
       },
@@ -763,8 +1092,66 @@
         ]
       },
       {
+        "title": "tls",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "commands/tls"
+          },
+          {
+            "title": "ca create",
+            "path": "commands/tls/ca-create"
+          },
+          {
+            "title": "ca info",
+            "path": "commands/tls/ca-info"
+          },
+          {
+            "title": "cert create",
+            "path": "commands/tls/cert-create"
+          },
+          {
+            "title": "cert info",
+            "path": "commands/tls/cert-info"
+          }
+        ]
+      },
+      {
         "title": "ui",
         "path": "commands/ui"
+      },
+      {
+        "title": "var",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "commands/var"
+          },
+          {
+            "title": "get",
+            "path": "commands/var/get"
+          },
+          {
+            "title": "init",
+            "path": "commands/var/init"
+          },
+          {
+            "title": "list",
+            "path": "commands/var/list"
+          },
+          {
+            "title": "put",
+            "path": "commands/var/put"
+          },
+          {
+            "title": "lock",
+            "path": "commands/var/lock"
+          },
+          {
+            "title": "purge",
+            "path": "commands/var/purge"
+          }
+        ]
       },
       {
         "title": "version",
@@ -820,6 +1207,10 @@
         ]
       }
     ]
+  },
+  {
+    "title": "Glossary",
+    "path": "glossary"
   },
   {
     "divider": true
@@ -976,7 +1367,12 @@
                   },
                   {
                     "title": "rsadecrypt",
-                    "path": "job-specification/hcl2/functions/crypto/rsadecrypt"
+                    "path": "job-specification/hcl2/functions/crypto/rsadecrypt",
+                    "badge": {
+                      "text": "Deprecated",
+                      "type": "outlined",
+                      "color": "neutral"
+                    }
                   },
                   {
                     "title": "sha1",
@@ -1060,6 +1456,10 @@
                   {
                     "title": "file",
                     "path": "job-specification/hcl2/functions/file/file"
+                  },
+                  {
+                    "title": "filebase64",
+                    "path": "job-specification/hcl2/functions/file/filebase64"
                   },
                   {
                     "title": "fileexists",
@@ -1177,6 +1577,10 @@
                     "path": "job-specification/hcl2/functions/string/split"
                   },
                   {
+                    "title": "strlen",
+                    "path": "job-specification/hcl2/functions/string/strlen"
+                  },
+                  {
                     "title": "strrev",
                     "path": "job-specification/hcl2/functions/string/strrev"
                   },
@@ -1240,12 +1644,24 @@
         ]
       },
       {
+        "title": "action",
+        "path": "job-specification/action"
+      },
+      {
         "title": "artifact",
         "path": "job-specification/artifact"
       },
       {
         "title": "affinity",
         "path": "job-specification/affinity"
+      },
+      {
+        "title": "change_script",
+        "path": "job-specification/change_script"
+      },
+      {
+        "title": "check",
+        "path": "job-specification/check"
       },
       {
         "title": "check_restart",
@@ -1256,11 +1672,15 @@
         "path": "job-specification/connect"
       },
       {
+        "title": "consul",
+        "path": "job-specification/consul"
+      },
+      {
         "title": "constraint",
         "path": "job-specification/constraint"
       },
       {
-        "title": "csi_plugin <sup>Beta</sup>",
+        "title": "csi_plugin",
         "path": "job-specification/csi_plugin"
       },
       {
@@ -1284,12 +1704,20 @@
         "path": "job-specification/expose"
       },
       {
+        "title": "disconnect",
+        "path": "job-specification/disconnect"
+      },
+      {
         "title": "gateway",
         "path": "job-specification/gateway"
       },
       {
         "title": "group",
         "path": "job-specification/group"
+      },
+      {
+        "title": "identity",
+        "path": "job-specification/identity"
       },
       {
         "title": "job",
@@ -1318,6 +1746,10 @@
       {
         "title": "network",
         "path": "job-specification/network"
+      },
+      {
+        "title": "numa",
+        "path": "job-specification/numa"
       },
       {
         "title": "parameterized",
@@ -1372,6 +1804,10 @@
         "path": "job-specification/template"
       },
       {
+        "title": "transparent_proxy",
+        "path": "job-specification/transparent_proxy"
+      },
+      {
         "title": "update",
         "path": "job-specification/update"
       },
@@ -1394,6 +1830,52 @@
     ]
   },
   {
+    "title": "Other Specifications",
+    "routes": [
+      {
+        "title": "Overview",
+        "path": "other-specifications"
+      },
+      {
+        "title": "ACL Policy",
+        "path": "other-specifications/acl-policy"
+      },
+      {
+        "title": "Namespace",
+        "path": "other-specifications/namespace"
+      },
+      {
+        "title": "Node Pool",
+        "path": "other-specifications/node-pool"
+      },
+      {
+        "title": "Variables",
+        "path": "other-specifications/variables"
+      },
+      {
+        "title": "Volume",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "other-specifications/volume"
+          },
+          {
+            "title": "capability",
+            "path": "other-specifications/volume/capability"
+          },
+          {
+            "title": "mount_options",
+            "path": "other-specifications/volume/mount_options"
+          },
+          {
+            "title": "topology_request",
+            "path": "other-specifications/volume/topology_request"
+          }
+        ]
+      }
+    ]
+  },
+  {
     "title": "Task Drivers",
     "routes": [
       {
@@ -1403,6 +1885,10 @@
       {
         "title": "Docker",
         "path": "drivers/docker"
+      },
+      {
+        "title": "Exec2",
+        "href": "/plugins/drivers/exec2"
       },
       {
         "title": "Isolated Fork/Exec",
@@ -1436,6 +1922,10 @@
             "href": "/plugins/drivers/community/containerd"
           },
           {
+            "title": "Pledge",
+            "href": "/plugins/drivers/community/pledge"
+          },
+          {
             "title": "Firecracker driver",
             "href": "/plugins/drivers/community/firecracker-task-driver"
           },
@@ -1456,7 +1946,12 @@
             "href": "/plugins/drivers/community/pot"
           },
           {
-            "title": "Rkt <sup>Deprecated</sup> ",
+            "title": "Rkt",
+            "badge": {
+              "text": "Deprecated",
+              "type": "outlined",
+              "color": "neutral"
+            },
             "href": "/plugins/drivers/community/rkt"
           },
           {
@@ -1474,6 +1969,10 @@
           {
             "title": "Windows IIS",
             "href": "/plugins/drivers/community/iis"
+          },
+          {
+            "title": "Windows IIS",
+            "href": "/plugins/drivers/community/nomad-iis"
           }
         ]
       },
@@ -1511,7 +2010,12 @@
             "href": "/plugins/devices/nvidia"
           },
           {
-            "title": "USB <sup>Beta</sup>",
+            "title": "USB",
+            "badge": {
+              "text": "Beta",
+              "type": "outlined",
+              "color": "neutral"
+            },
             "href": "/plugins/devices/community/usb"
           }
         ]
@@ -1536,6 +2040,27 @@
       {
         "title": "Variable Interpolation",
         "path": "runtime/interpolation"
+      }
+    ]
+  },
+  {
+    "title": "Networking",
+    "routes": [
+      {
+        "title": "Overview",
+        "path": "networking"
+      },
+      {
+        "title": "Service Discovery",
+        "path": "networking/service-discovery"
+      },
+      {
+        "title": "Service Mesh",
+        "path": "networking/service-mesh"
+      },
+      {
+        "title": "CNI",
+        "path": "networking/cni"
       }
     ]
   },
@@ -1785,6 +2310,14 @@
       {
         "title": "Access Control",
         "href": "https://learn.hashicorp.com/collections/nomad/access-control"
+      },
+      {
+        "title": "Key Management",
+        "path": "operations/key-management"
+      },
+      {
+        "title": "Considerations for Stateful Workloads",
+        "path": "operations/stateful-workloads"
       }
     ]
   },
@@ -1835,10 +2368,18 @@
             "path": "enterprise/license"
           },
           {
+            "title": "Automated license utilization reporting",
+            "path": "enterprise/license/utilization-reporting"
+          },
+          {
             "title": "FAQ",
             "path": "enterprise/license/faq"
           }
         ]
+      },
+      {
+        "title": "Sentinel",
+        "path": "enterprise/sentinel"
       }
     ]
   },

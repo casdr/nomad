@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -68,6 +71,6 @@ func (c *ACLTokenSelfCommand) Run(args []string) int {
 	}
 
 	// Format the output
-	c.Ui.Output(formatKVACLToken(token))
+	outputACLToken(c.Ui, token)
 	return 0
 }

@@ -1,10 +1,16 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state
 
 import (
+	arstate "github.com/hashicorp/nomad/client/allocrunner/state"
 	"github.com/hashicorp/nomad/client/allocrunner/taskrunner/state"
 	dmstate "github.com/hashicorp/nomad/client/devicemanager/state"
 	"github.com/hashicorp/nomad/client/dynamicplugins"
 	driverstate "github.com/hashicorp/nomad/client/pluginmanager/drivermanager/state"
+	"github.com/hashicorp/nomad/client/serviceregistration/checks"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -28,22 +34,47 @@ type StateDB interface {
 	// not be stored.
 	PutAllocation(*structs.Allocation, ...WriteOption) error
 
-	// Get/Put DeploymentStatus get and put the allocation's deployment
-	// status. It may be nil.
+	// GetDeploymentStatus gets the allocation's deployment status. It may be nil.
 	GetDeploymentStatus(allocID string) (*structs.AllocDeploymentStatus, error)
+
+	// PutDeploymentStatus sets the allocation's deployment status. It may be nil.
 	PutDeploymentStatus(allocID string, ds *structs.AllocDeploymentStatus) error
 
-	// Get/Put NetworkStatus get and put the allocation's network
-	// status. It may be nil.
+	// GetNetworkStatus gets the allocation's network status. It may be nil.
 	GetNetworkStatus(allocID string) (*structs.AllocNetworkStatus, error)
+
+	// PutNetworkStatus puts the allocation's network status. It may be nil.
 	PutNetworkStatus(allocID string, ns *structs.AllocNetworkStatus, opts ...WriteOption) error
+
+	// PutAcknowledgedState stores an allocation's last acknowledged state or
+	// returns an error if it could not be stored.
+	PutAcknowledgedState(string, *arstate.State, ...WriteOption) error
+
+	// GetAcknowledgedState retrieves an allocation's last acknowledged
+	// state. It may be nil even if there's no error
+	GetAcknowledgedState(string) (*arstate.State, error)
+
+	// PutAllocVolumes stores stubs of an allocation's dynamic volume mounts so
+	// they can be restored.
+	PutAllocVolumes(allocID string, state *arstate.AllocVolumes, opts ...WriteOption) error
+
+	// GetAllocVolumes retrieves stubs of an allocation's dynamic volume mounts
+	// so they can be restored.
+	GetAllocVolumes(allocID string) (*arstate.AllocVolumes, error)
+
+	// PutAllocIdentities stores signed workload identities for an allocation.
+	PutAllocIdentities(allocID string, identities []*structs.SignedWorkloadIdentity, opts ...WriteOption) error
+
+	// GetAllocIdentities returns the previously-signed workload identities for
+	// an allocation.
+	GetAllocIdentities(allocID string) ([]*structs.SignedWorkloadIdentity, error)
 
 	// GetTaskRunnerState returns the LocalState and TaskState for a
 	// TaskRunner. Either state may be nil if it is not found, but if an
 	// error is encountered only the error will be non-nil.
 	GetTaskRunnerState(allocID, taskName string) (*state.LocalState, *structs.TaskState, error)
 
-	// PutTaskRunnerLocalTask stores the LocalState for a TaskRunner or
+	// PutTaskRunnerLocalState stores the LocalState for a TaskRunner or
 	// returns an error.
 	PutTaskRunnerLocalState(allocID, taskName string, val *state.LocalState) error
 
@@ -80,6 +111,31 @@ type StateDB interface {
 
 	// PutDynamicPluginRegistryState is used to store the dynamic plugin manager's state.
 	PutDynamicPluginRegistryState(state *dynamicplugins.RegistryState) error
+
+	// PutCheckResult sets the query result for the check implied in qr.
+	PutCheckResult(allocID string, qr *structs.CheckQueryResult) error
+
+	// DeleteCheckResults removes the given set of check results.
+	DeleteCheckResults(allocID string, checkIDs []structs.CheckID) error
+
+	// PurgeCheckResults removes all check results of the given allocation.
+	PurgeCheckResults(allocID string) error
+
+	// GetCheckResults is used to restore the set of check results on this Client.
+	GetCheckResults() (checks.ClientResults, error)
+
+	// PutNodeMeta sets dynamic node metadata for merging with the copy from the
+	// Client's config.
+	//
+	// This overwrites existing dynamic node metadata entirely.
+	PutNodeMeta(map[string]*string) error
+
+	// GetNodeMeta retrieves node metadata for merging with the copy from
+	// the Client's config.
+	GetNodeMeta() (map[string]*string, error)
+
+	PutNodeRegistration(*cstructs.NodeRegistration) error
+	GetNodeRegistration() (*cstructs.NodeRegistration, error)
 
 	// Close the database. Unsafe for further use after calling regardless
 	// of return value.

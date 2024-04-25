@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package deploymentwatcher
 
 import (
@@ -177,8 +180,7 @@ func (w *Watcher) watchDeployments(ctx context.Context) {
 		// Update the latest index
 		dindex = idx
 
-		// Ensure we are tracking the things we should and not tracking what we
-		// shouldn't be
+		// Ensure we are tracking only active deployments
 		for _, d := range deployments {
 			if d.Active() {
 				if err := w.add(d); err != nil {
@@ -188,12 +190,20 @@ func (w *Watcher) watchDeployments(ctx context.Context) {
 				w.remove(d)
 			}
 		}
+
+		// Ensure we've removed deployments for purged jobs
+		w.removeDeletedDeployments(deployments)
 	}
 }
 
 // getDeploys retrieves all deployments blocking at the given index.
 func (w *Watcher) getDeploys(ctx context.Context, minIndex uint64) ([]*structs.Deployment, uint64, error) {
-	resp, index, err := w.state.BlockingQuery(w.getDeploysImpl, minIndex, ctx)
+	// state can be updated concurrently
+	w.l.Lock()
+	stateStore := w.state
+	w.l.Unlock()
+
+	resp, index, err := stateStore.BlockingQuery(w.getDeploysImpl, minIndex, ctx)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -226,6 +236,28 @@ func (w *Watcher) getDeploysImpl(ws memdb.WatchSet, store *state.StateStore) (in
 	}
 
 	return deploys, index, nil
+}
+
+// removeDeletedDeployments removes any watchers that aren't in the list of
+// deployments we got from state
+func (w *Watcher) removeDeletedDeployments(deployments []*structs.Deployment) {
+	w.l.Lock()
+	defer w.l.Unlock()
+
+	// note we can't optimize this by checking the lengths first because some
+	// deployments might not be active
+	for _, watcher := range w.watchers {
+		var found bool
+		for _, d := range deployments {
+			if watcher.deploymentID == d.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			w.removeByIDLocked(watcher.deploymentID)
+		}
+	}
 }
 
 // add adds a deployment to the watch list
@@ -279,15 +311,18 @@ func (w *Watcher) addLocked(d *structs.Deployment) (*deploymentWatcher, error) {
 func (w *Watcher) remove(d *structs.Deployment) {
 	w.l.Lock()
 	defer w.l.Unlock()
+	w.removeByIDLocked(d.ID)
+}
 
+func (w *Watcher) removeByIDLocked(id string) {
 	// Not enabled so no-op
 	if !w.enabled {
 		return
 	}
 
-	if watcher, ok := w.watchers[d.ID]; ok {
+	if watcher, ok := w.watchers[id]; ok {
 		watcher.StopWatch()
-		delete(w.watchers, d.ID)
+		delete(w.watchers, id)
 	}
 }
 

@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 # jobspec for running CSI plugin for AWS EBS, derived from
 # the kubernetes manifests found at
 # https://github.com/kubernetes-sigs/aws-ebs-csi-driver/tree/master/deploy/kubernetes
@@ -23,7 +26,7 @@ job "plugin-aws-ebs-nodes" {
 
         args = [
           "node",
-          "--endpoint=unix://csi/csi.sock",
+          "--endpoint=${CSI_ENDPOINT}",
           "--logtostderr",
           "--v=5",
         ]

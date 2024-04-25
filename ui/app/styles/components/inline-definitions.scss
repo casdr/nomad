@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 .inline-definitions {
   .label {
     text-transform: uppercase;
@@ -16,6 +21,14 @@
   .pair {
     margin-right: 2em;
     white-space: nowrap;
+
+    &.is-wrappable {
+      white-space: normal;
+      display: block;
+      .tag {
+        vertical-align: middle;
+      }
+    }
 
     .term {
       font-weight: $weight-semibold;

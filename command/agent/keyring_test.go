@@ -1,14 +1,17 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/helper/testlog"
 )
 
 func TestAgent_LoadKeyrings(t *testing.T) {
@@ -29,9 +32,10 @@ func TestAgent_LoadKeyrings(t *testing.T) {
 
 	// Server should auto-load WAN keyring files
 	agent2 := &TestAgent{
-		T:    t,
-		Name: t.Name() + "2",
-		Key:  key,
+		T:      t,
+		Name:   t.Name() + "2",
+		Key:    key,
+		logger: testlog.HCLogger(t),
 	}
 	agent2.Start()
 	defer agent2.Shutdown()
@@ -51,11 +55,7 @@ func TestAgent_InitKeyring(t *testing.T) {
 	key2 := "4leC33rgtXKIVUr9Nr0snQ=="
 	expected := fmt.Sprintf(`["%s"]`, key1)
 
-	dir, err := ioutil.TempDir("", "nomad")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	file := filepath.Join(dir, "keyring")
 
@@ -66,7 +66,7 @@ func TestAgent_InitKeyring(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	content, err := ioutil.ReadFile(file)
+	content, err := os.ReadFile(file)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -80,7 +80,7 @@ func TestAgent_InitKeyring(t *testing.T) {
 	}
 
 	// Content should still be the same
-	content, err = ioutil.ReadFile(file)
+	content, err = os.ReadFile(file)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}

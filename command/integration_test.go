@@ -1,27 +1,25 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/stretchr/testify/assert"
+	"github.com/hashicorp/nomad/client/testutil"
+	"github.com/shoenig/test/must"
 )
 
 func TestIntegration_Command_NomadInit(t *testing.T) {
 	ci.Parallel(t)
-	tmpDir, err := ioutil.TempDir("", "nomadtest-rootsecretdir")
-	if err != nil {
-		t.Fatalf("unable to create tempdir for test: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	{
 		cmd := exec.Command("nomad", "job", "init")
@@ -32,39 +30,38 @@ func TestIntegration_Command_NomadInit(t *testing.T) {
 	}
 
 	{
-		cmd := exec.Command("nomad", "job", "validate", "example.nomad")
+		cmd := exec.Command("nomad", "job", "validate", "example.nomad.hcl")
 		cmd.Dir = tmpDir
 		cmd.Env = []string{`NOMAD_ADDR=http://127.0.0.1:0`}
 		if err := cmd.Run(); err != nil {
-			t.Fatalf("error validating example.nomad: %v", err)
+			t.Fatalf("error validating example.nomad.hcl: %v", err)
 		}
 	}
 }
 
 func TestIntegration_Command_RoundTripJob(t *testing.T) {
 	ci.Parallel(t)
-	assert := assert.New(t)
-	tmpDir, err := ioutil.TempDir("", "nomadtest-rootsecretdir")
-	assert.Nil(err)
-	defer os.RemoveAll(tmpDir)
+	testutil.DockerCompatible(t)
+
+	tmpDir := t.TempDir()
 
 	// Start in dev mode so we get a node registration
 	srv, client, url := testServer(t, true, nil)
 	defer srv.Shutdown()
 
 	{
-		cmd := exec.Command("nomad", "job", "init")
+		cmd := exec.Command("nomad", "job", "init", "-short")
 		cmd.Dir = tmpDir
-		assert.Nil(cmd.Run())
+		must.NoError(t, cmd.Run())
 	}
 
 	{
-		cmd := exec.Command("nomad", "job", "run", "example.nomad")
+		cmd := exec.Command("nomad", "job", "run", "example.nomad.hcl")
 		cmd.Dir = tmpDir
 		cmd.Env = []string{fmt.Sprintf("NOMAD_ADDR=%s", url)}
 		err := cmd.Run()
 		if err != nil && !strings.Contains(err.Error(), "exit status 2") {
-			t.Fatalf("error running example.nomad: %v", err)
+			t.Fatalf("error running example.nomad.hcl: %v", err)
 		}
 	}
 
@@ -73,16 +70,16 @@ func TestIntegration_Command_RoundTripJob(t *testing.T) {
 		cmd.Dir = tmpDir
 		cmd.Env = []string{fmt.Sprintf("NOMAD_ADDR=%s", url)}
 		out, err := cmd.Output()
-		assert.Nil(err)
+		must.NoError(t, err)
 
 		var req api.JobRegisterRequest
 		dec := json.NewDecoder(bytes.NewReader(out))
-		assert.Nil(dec.Decode(&req))
+		must.NoError(t, dec.Decode(&req))
 
 		var resp api.JobRegisterResponse
 		_, err = client.Raw().Write("/v1/jobs", req, &resp, nil)
-		assert.Nil(err)
-		assert.NotZero(resp.EvalID)
+		must.NoError(t, err)
+		must.NotEq(t, "", resp.EvalID)
 	}
 
 	{
@@ -90,6 +87,6 @@ func TestIntegration_Command_RoundTripJob(t *testing.T) {
 		cmd.Dir = tmpDir
 		cmd.Env = []string{fmt.Sprintf("NOMAD_ADDR=%s", url)}
 		_, err := cmd.Output()
-		assert.Nil(err)
+		must.NoError(t, err)
 	}
 }

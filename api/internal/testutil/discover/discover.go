@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package discover
 
 import (
@@ -59,8 +62,17 @@ func NomadExecutable() (string, error) {
 }
 
 func isNomad(path, nomadExe string) bool {
-	if strings.HasSuffix(path, ".test") || strings.HasSuffix(path, ".test.exe") {
+	switch {
+	case strings.HasSuffix(path, ".test"):
 		return false
+	case strings.HasSuffix(path, ".test.exe"):
+		return false
+	// delve debug executable for debugging test
+	case strings.HasSuffix(path, "__debug_bin"):
+		return false
+	case strings.HasSuffix(path, "__debug_bin.exe"):
+		return false
+	default:
+		return true
 	}
-	return true
 }

@@ -1,11 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package taskrunner
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -17,12 +20,11 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/allocdir"
 	ifs "github.com/hashicorp/nomad/client/allocrunner/interfaces"
+	"github.com/hashicorp/nomad/client/serviceregistration"
 	"github.com/hashicorp/nomad/client/taskenv"
-	agentconsul "github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
-	"github.com/pkg/errors"
 	"oss.indeed.com/go/libtime/decay"
 )
 
@@ -43,28 +45,34 @@ const (
 	envoyBootstrapMaxJitter = 500 * time.Millisecond
 )
 
+var (
+	errEnvoyBootstrapError = errors.New("error creating bootstrap configuration for Connect proxy sidecar")
+)
+
 type consulTransportConfig struct {
-	HTTPAddr  string // required
-	Auth      string // optional, env CONSUL_HTTP_AUTH
-	SSL       string // optional, env CONSUL_HTTP_SSL
-	VerifySSL string // optional, env CONSUL_HTTP_SSL_VERIFY
-	CAFile    string // optional, arg -ca-file
-	CertFile  string // optional, arg -client-cert
-	KeyFile   string // optional, arg -client-key
-	Namespace string // optional, only consul Enterprise, env CONSUL_NAMESPACE
+	HTTPAddr   string // required
+	Auth       string // optional, env CONSUL_HTTP_AUTH
+	SSL        string // optional, env CONSUL_HTTP_SSL
+	VerifySSL  string // optional, env CONSUL_HTTP_SSL_VERIFY
+	GRPCCAFile string // optional, arg -grpc-ca-file
+	CAFile     string // optional, arg -ca-file
+	CertFile   string // optional, arg -client-cert
+	KeyFile    string // optional, arg -client-key
+	Namespace  string // optional, only consul Enterprise, env CONSUL_NAMESPACE
 	// CAPath (dir) not supported by Nomad's config object
 }
 
-func newConsulTransportConfig(consul *config.ConsulConfig) consulTransportConfig {
+func newConsulTransportConfig(cc *config.ConsulConfig) consulTransportConfig {
 	return consulTransportConfig{
-		HTTPAddr:  consul.Addr,
-		Auth:      consul.Auth,
-		SSL:       decodeTriState(consul.EnableSSL),
-		VerifySSL: decodeTriState(consul.VerifySSL),
-		CAFile:    consul.CAFile,
-		CertFile:  consul.CertFile,
-		KeyFile:   consul.KeyFile,
-		Namespace: consul.Namespace,
+		HTTPAddr:   cc.Addr,
+		Auth:       cc.Auth,
+		SSL:        decodeTriState(cc.EnableSSL),
+		VerifySSL:  decodeTriState(cc.VerifySSL),
+		GRPCCAFile: cc.GRPCCAFile,
+		CAFile:     cc.CAFile,
+		CertFile:   cc.CertFile,
+		KeyFile:    cc.KeyFile,
+		Namespace:  cc.Namespace,
 	}
 }
 
@@ -125,7 +133,7 @@ type envoyBootstrapHook struct {
 	// envoyBootstrapWaitTime is the total amount of time hook will wait for Consul
 	envoyBootstrapWaitTime time.Duration
 
-	// envoyBootstrapInitialGap is the initial wait gap when retyring
+	// envoyBootstrapInitialGap is the initial wait gap when retrying
 	envoyBoostrapInitialGap time.Duration
 
 	// envoyBootstrapMaxJitter is the maximum amount of jitter applied to retries
@@ -152,8 +160,8 @@ func newEnvoyBootstrapHook(c *envoyBootstrapHookConfig) *envoyBootstrapHook {
 }
 
 // getConsulNamespace will resolve the Consul namespace, choosing between
-//  - agent config (low precedence)
-//  - task group config (high precedence)
+//   - agent config (low precedence)
+//   - task group config (high precedence)
 func (h *envoyBootstrapHook) getConsulNamespace() string {
 	var namespace string
 	if h.consulConfig.Namespace != "" {
@@ -227,8 +235,6 @@ func (h *envoyBootstrapHook) lookupService(svcKind, svcName string, taskEnv *tas
 // Must be aware of both launching envoy as a sidecar proxy, as well as a connect gateway.
 func (h *envoyBootstrapHook) Prestart(ctx context.Context, req *ifs.TaskPrestartRequest, resp *ifs.TaskPrestartResponse) error {
 	if !req.Task.Kind.IsConnectProxy() && !req.Task.Kind.IsAnyConnectGateway() {
-		// Not a Connect proxy sidecar
-		resp.Done = true
 		return nil
 	}
 
@@ -271,7 +277,7 @@ func (h *envoyBootstrapHook) Prestart(ctx context.Context, req *ifs.TaskPrestart
 	siToken, err := h.maybeLoadSIToken(req.Task.Name, req.TaskDir.SecretsDir)
 	if err != nil {
 		h.logger.Error("failed to generate envoy bootstrap config", "sidecar_for", service.Name)
-		return errors.Wrap(err, "failed to generate envoy bootstrap config")
+		return fmt.Errorf("failed to generate envoy bootstrap config: %w", err)
 	}
 	h.logger.Debug("check for SI token for task", "task", req.Task.Name, "exists", siToken != "")
 
@@ -283,26 +289,28 @@ func (h *envoyBootstrapHook) Prestart(ctx context.Context, req *ifs.TaskPrestart
 	// Write args to file for debugging
 	argsFile, err := os.Create(bootstrapCmdPath)
 	if err != nil {
-		return errors.Wrap(err, "failed to write bootstrap command line")
+		return fmt.Errorf("failed to write bootstrap command line: %w", err)
 	}
 	defer argsFile.Close()
 	if _, err := io.WriteString(argsFile, strings.Join(bootstrapArgs, " ")+"\n"); err != nil {
-		return errors.Wrap(err, "failed to encode bootstrap command line")
+		return fmt.Errorf("failed to encode bootstrap command line: %w", err)
 	}
 
 	// Create environment
 	bootstrapEnv := bootstrap.env(os.Environ())
+	// append nomad environment variables to the bootstrap environment
+	bootstrapEnv = append(bootstrapEnv, h.groupEnv()...)
 
 	// Write env to file for debugging
 	envFile, err := os.Create(bootstrapEnvPath)
 	if err != nil {
-		return errors.Wrap(err, "failed to write bootstrap environment")
+		return fmt.Errorf("failed to write bootstrap environment: %w", err)
 	}
 	defer envFile.Close()
 	envEnc := json.NewEncoder(envFile)
 	envEnc.SetIndent("", "    ")
 	if err := envEnc.Encode(bootstrapEnv); err != nil {
-		return errors.Wrap(err, "failed to encode bootstrap environment")
+		return fmt.Errorf("failed to encode bootstrap environment: %w", err)
 	}
 
 	// keep track of latest error returned from exec-ing consul envoy bootstrap
@@ -348,8 +356,8 @@ func (h *envoyBootstrapHook) Prestart(ctx context.Context, req *ifs.TaskPrestart
 
 		// Command succeeded, exit.
 		if cmdErr == nil {
-			// Bootstrap written. Mark as done and move on.
-			resp.Done = true
+			// Bootstrap written. Move on without marking as Done as Prestart needs
+			// to rerun after node reboots.
 			return false, nil
 		}
 
@@ -369,12 +377,28 @@ func (h *envoyBootstrapHook) Prestart(ctx context.Context, req *ifs.TaskPrestart
 		// Wrap the last error from Consul and set that as our status.
 		_, recoverable := cmdErr.(*exec.ExitError)
 		return structs.NewRecoverableError(
-			fmt.Errorf("error creating bootstrap configuration for Connect proxy sidecar: %v", cmdErr),
+			fmt.Errorf("%w: %v; see: <https://developer.hashicorp.com/nomad/s/envoy-bootstrap-error>",
+				errEnvoyBootstrapError,
+				cmdErr,
+			),
 			recoverable,
 		)
 	}
 
 	return nil
+}
+
+func (h *envoyBootstrapHook) groupEnv() []string {
+	return []string{
+		fmt.Sprintf("%s=%s", taskenv.AllocID, h.alloc.ID),
+		fmt.Sprintf("%s=%s", taskenv.ShortAllocID, h.alloc.ID[:8]),
+		fmt.Sprintf("%s=%s", taskenv.AllocName, h.alloc.Name),
+		fmt.Sprintf("%s=%s", taskenv.GroupName, h.alloc.TaskGroup),
+		fmt.Sprintf("%s=%s", taskenv.JobName, h.alloc.Job.Name),
+		fmt.Sprintf("%s=%s", taskenv.JobID, h.alloc.Job.ID),
+		fmt.Sprintf("%s=%s", taskenv.Namespace, h.alloc.Namespace),
+		fmt.Sprintf("%s=%s", taskenv.Region, h.alloc.Job.Region),
+	}
 }
 
 // buildEnvoyAdminBind determines a unique port for use by the envoy admin listener.
@@ -424,7 +448,7 @@ func buildEnvoyBind(alloc *structs.Allocation, ifce, service, task string, taskE
 }
 
 func (h *envoyBootstrapHook) writeConfig(filename, config string) error {
-	if err := ioutil.WriteFile(filename, []byte(config), 0440); err != nil {
+	if err := os.WriteFile(filename, []byte(config), 0440); err != nil {
 		_ = os.Remove(filename)
 		return err
 	}
@@ -451,9 +475,9 @@ func (h *envoyBootstrapHook) grpcAddress(env map[string]string) string {
 }
 
 func (h *envoyBootstrapHook) proxyServiceID(group string, service *structs.Service) string {
-	// Note, it is critical the ID here matches what is actually registered in Consul.
-	// See: WorkloadServices.Name in structs.go
-	return agentconsul.MakeAllocServiceID(h.alloc.ID, "group-"+group, service)
+	// Note, it is critical the ID here matches what is actually registered in
+	// Consul. See: WorkloadServices.Name in serviceregistration/workload.go.
+	return serviceregistration.MakeAllocServiceID(h.alloc.ID, "group-"+group, service)
 }
 
 // newEnvoyBootstrapArgs is used to prepare for the invocation of the
@@ -527,29 +551,19 @@ func (e envoyBootstrapArgs) args() []string {
 		"-bootstrap",
 	}
 
-	if v := e.gateway; v != "" {
-		arguments = append(arguments, "-gateway", v)
+	appendIfSet := func(param, value string) {
+		if value != "" {
+			arguments = append(arguments, param, value)
+		}
 	}
 
-	if v := e.siToken; v != "" {
-		arguments = append(arguments, "-token", v)
-	}
-
-	if v := e.consulConfig.CAFile; v != "" {
-		arguments = append(arguments, "-ca-file", v)
-	}
-
-	if v := e.consulConfig.CertFile; v != "" {
-		arguments = append(arguments, "-client-cert", v)
-	}
-
-	if v := e.consulConfig.KeyFile; v != "" {
-		arguments = append(arguments, "-client-key", v)
-	}
-
-	if v := e.namespace; v != "" {
-		arguments = append(arguments, "-namespace", v)
-	}
+	appendIfSet("-gateway", e.gateway)
+	appendIfSet("-token", e.siToken)
+	appendIfSet("-grpc-ca-file", e.consulConfig.GRPCCAFile)
+	appendIfSet("-ca-file", e.consulConfig.CAFile)
+	appendIfSet("-client-cert", e.consulConfig.CertFile)
+	appendIfSet("-client-key", e.consulConfig.KeyFile)
+	appendIfSet("-namespace", e.namespace)
 
 	return arguments
 }
@@ -582,11 +596,11 @@ func (e envoyBootstrapArgs) env(env []string) []string {
 // Consul ACLs are enabled), it will be in place by the time we try to read it.
 func (h *envoyBootstrapHook) maybeLoadSIToken(task, dir string) (string, error) {
 	tokenPath := filepath.Join(dir, sidsTokenFile)
-	token, err := ioutil.ReadFile(tokenPath)
+	token, err := os.ReadFile(tokenPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			h.logger.Error("failed to load SI token", "task", task, "error", err)
-			return "", errors.Wrapf(err, "failed to load SI token for %s", task)
+			return "", fmt.Errorf("failed to load SI token for %s: %w", task, err)
 		}
 		h.logger.Trace("no SI token to load", "task", task)
 		return "", nil // token file does not exist

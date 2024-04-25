@@ -1,8 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +19,6 @@ import (
 	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
@@ -195,7 +200,7 @@ func (c *consulACLsAPI) readToken(ctx context.Context, secretID string) (*api.AC
 
 	// Ensure we are under our rate limit.
 	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, errors.Wrap(err, "unable to read consul token")
+		return nil, fmt.Errorf("unable to read consul token: %w", err)
 	}
 
 	consulToken, _, err := c.aclClient.TokenReadSelf(&api.QueryOptions{
@@ -203,7 +208,7 @@ func (c *consulACLsAPI) readToken(ctx context.Context, secretID string) (*api.AC
 		Token:      secretID,
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "unable to read consul token")
+		return nil, fmt.Errorf("unable to read consul token: %w", err)
 	}
 
 	return consulToken, nil
@@ -248,18 +253,7 @@ func (c *consulACLsAPI) CheckPermissions(ctx context.Context, namespace string, 
 		if err != nil {
 			return err
 		} else if !allowable {
-			return errors.Errorf("insufficient Consul ACL permissions to write service %q", service)
-		}
-	}
-
-	// verify token has service identity permission for connect services
-	for _, kind := range usage.Kinds {
-		service := kind.Value()
-		allowable, err := c.canWriteService(namespace, service, token)
-		if err != nil {
-			return err
-		} else if !allowable {
-			return errors.Errorf("insufficient Consul ACL permissions to write Connect service %q", service)
+			return fmt.Errorf("insufficient Consul ACL permissions to write service %q", service)
 		}
 	}
 
@@ -290,6 +284,7 @@ func (c *consulACLsAPI) CreateToken(ctx context.Context, sir ServiceIdentityRequ
 		Description:       sir.Description(),
 		ServiceIdentities: []*api.ACLServiceIdentity{{ServiceName: service}},
 		Namespace:         sir.ConsulNamespace,
+		Local:             true,
 	}
 
 	// Ensure we are under our rate limit.
@@ -389,9 +384,9 @@ func (c *consulACLsAPI) parallelRevoke(ctx context.Context, accessors []*structs
 						return nil
 					}
 					if err := c.singleRevoke(ctx, accessor); err != nil {
-						return errors.Wrapf(err,
-							"failed to revoke SI token accessor (alloc %q, node %q, task %q)",
-							accessor.AllocID, accessor.NodeID, accessor.TaskName,
+						return fmt.Errorf(
+							"failed to revoke SI token accessor (alloc %q, node %q, task %q): %w",
+							accessor.AllocID, accessor.NodeID, accessor.TaskName, err,
 						)
 					}
 				case <-pCtx.Done():
@@ -425,8 +420,10 @@ func (c *consulACLsAPI) singleRevoke(ctx context.Context, accessor *structs.SITo
 		return err
 	}
 
-	// Consul will no-op the deletion of a non-existent token (no error)
 	_, err := c.aclClient.TokenDelete(accessor.AccessorID, &api.WriteOptions{Namespace: accessor.ConsulNamespace})
+	if err != nil && strings.Contains(err.Error(), "Cannot find token to delete") {
+		return nil // Consul will error when deleting a non-existent token
+	}
 	return err
 }
 
@@ -513,11 +510,11 @@ func (s *Server) purgeSITokenAccessors(accessors []*structs.SITokenAccessor) err
 type ConsulConfigsAPI interface {
 	// SetIngressCE adds the given ConfigEntry to Consul, overwriting
 	// the previous entry if set.
-	SetIngressCE(ctx context.Context, namespace, service string, entry *structs.ConsulIngressConfigEntry) error
+	SetIngressCE(ctx context.Context, namespace, service, cluster string, entry *structs.ConsulIngressConfigEntry) error
 
 	// SetTerminatingCE adds the given ConfigEntry to Consul, overwriting
 	// the previous entry if set.
-	SetTerminatingCE(ctx context.Context, namespace, service string, entry *structs.ConsulTerminatingConfigEntry) error
+	SetTerminatingCE(ctx context.Context, namespace, service, cluster string, entry *structs.ConsulTerminatingConfigEntry) error
 
 	// Stop is used to stop additional creations of Configuration Entries. Intended to
 	// be used on Nomad Server shutdown.
@@ -525,9 +522,9 @@ type ConsulConfigsAPI interface {
 }
 
 type consulConfigsAPI struct {
-	// configsClient is the API subset of the real Consul client we need for
-	// managing Configuration Entries.
-	configsClient consul.ConfigAPI
+	// configsClientFunc returns an interface that is the API subset of the real
+	// Consul client we need for managing Configuration Entries.
+	configsClientFunc consul.ConfigAPIFunc
 
 	// limiter is used to rate limit requests to Consul
 	limiter *rate.Limiter
@@ -541,11 +538,11 @@ type consulConfigsAPI struct {
 	stopped bool
 }
 
-func NewConsulConfigsAPI(configsClient consul.ConfigAPI, logger hclog.Logger) *consulConfigsAPI {
+func NewConsulConfigsAPI(configsClientFunc consul.ConfigAPIFunc, logger hclog.Logger) *consulConfigsAPI {
 	return &consulConfigsAPI{
-		configsClient: configsClient,
-		limiter:       rate.NewLimiter(configEntriesRequestRateLimit, int(configEntriesRequestRateLimit)),
-		logger:        logger,
+		configsClientFunc: configsClientFunc,
+		limiter:           rate.NewLimiter(configEntriesRequestRateLimit, int(configEntriesRequestRateLimit)),
+		logger:            logger,
 	}
 }
 
@@ -555,16 +552,16 @@ func (c *consulConfigsAPI) Stop() {
 	c.stopped = true
 }
 
-func (c *consulConfigsAPI) SetIngressCE(ctx context.Context, namespace, service string, entry *structs.ConsulIngressConfigEntry) error {
-	return c.setCE(ctx, convertIngressCE(namespace, service, entry))
+func (c *consulConfigsAPI) SetIngressCE(ctx context.Context, namespace, service, cluster string, entry *structs.ConsulIngressConfigEntry) error {
+	return c.setCE(ctx, convertIngressCE(namespace, service, entry), cluster)
 }
 
-func (c *consulConfigsAPI) SetTerminatingCE(ctx context.Context, namespace, service string, entry *structs.ConsulTerminatingConfigEntry) error {
-	return c.setCE(ctx, convertTerminatingCE(namespace, service, entry))
+func (c *consulConfigsAPI) SetTerminatingCE(ctx context.Context, namespace, service, cluster string, entry *structs.ConsulTerminatingConfigEntry) error {
+	return c.setCE(ctx, convertTerminatingCE(namespace, service, entry), cluster)
 }
 
 // setCE will set the Configuration Entry of any type Consul supports.
-func (c *consulConfigsAPI) setCE(ctx context.Context, entry api.ConfigEntry) error {
+func (c *consulConfigsAPI) setCE(ctx context.Context, entry api.ConfigEntry, cluster string) error {
 	defer metrics.MeasureSince([]string{"nomad", "consul", "create_config_entry"}, time.Now())
 
 	// make sure the background deletion goroutine has not been stopped
@@ -581,7 +578,8 @@ func (c *consulConfigsAPI) setCE(ctx context.Context, entry api.ConfigEntry) err
 		return err
 	}
 
-	_, _, err := c.configsClient.Set(entry, &api.WriteOptions{Namespace: entry.GetNamespace()})
+	client := c.configsClientFunc(cluster)
+	_, _, err := client.Set(entry, &api.WriteOptions{Namespace: entry.GetNamespace()})
 	return err
 }
 
@@ -590,9 +588,21 @@ func convertIngressCE(namespace, service string, entry *structs.ConsulIngressCon
 	for _, listener := range entry.Listeners {
 		var services []api.IngressService = nil
 		for _, s := range listener.Services {
+			var sds *api.GatewayTLSSDSConfig = nil
+			if s.TLS != nil {
+				sds = convertGatewayTLSSDSConfig(s.TLS.SDS)
+			}
 			services = append(services, api.IngressService{
-				Name:  s.Name,
-				Hosts: helper.CopySliceString(s.Hosts),
+				Name:                  s.Name,
+				Hosts:                 slices.Clone(s.Hosts),
+				RequestHeaders:        convertHTTPHeaderModifiers(s.RequestHeaders),
+				ResponseHeaders:       convertHTTPHeaderModifiers(s.ResponseHeaders),
+				MaxConnections:        s.MaxConnections,
+				MaxPendingRequests:    s.MaxPendingRequests,
+				MaxConcurrentRequests: s.MaxConcurrentRequests,
+				TLS: &api.GatewayServiceTLSConfig{
+					SDS: sds,
+				},
 			})
 		}
 		listeners = append(listeners, api.IngressListener{
@@ -602,18 +612,58 @@ func convertIngressCE(namespace, service string, entry *structs.ConsulIngressCon
 		})
 	}
 
-	tlsEnabled := false
-	if entry.TLS != nil && entry.TLS.Enabled {
-		tlsEnabled = true
+	tls := api.GatewayTLSConfig{}
+	if entry.TLS != nil {
+		tls.Enabled = entry.TLS.Enabled
+		tls.TLSMinVersion = entry.TLS.TLSMinVersion
+		tls.TLSMaxVersion = entry.TLS.TLSMaxVersion
+		tls.CipherSuites = slices.Clone(entry.TLS.CipherSuites)
 	}
 
 	return &api.IngressGatewayConfigEntry{
 		Namespace: namespace,
 		Kind:      api.IngressGateway,
 		Name:      service,
-		TLS:       api.GatewayTLSConfig{Enabled: tlsEnabled},
+		TLS:       *convertGatewayTLSConfig(entry.TLS),
 		Listeners: listeners,
 	}
+}
+
+func convertHTTPHeaderModifiers(in *structs.ConsulHTTPHeaderModifiers) *api.HTTPHeaderModifiers {
+	if in != nil {
+		return &api.HTTPHeaderModifiers{
+			Add:    maps.Clone(in.Add),
+			Set:    maps.Clone(in.Set),
+			Remove: slices.Clone(in.Remove),
+		}
+	}
+
+	return &api.HTTPHeaderModifiers{}
+}
+
+func convertGatewayTLSConfig(in *structs.ConsulGatewayTLSConfig) *api.GatewayTLSConfig {
+	if in != nil {
+		return &api.GatewayTLSConfig{
+			Enabled:       in.Enabled,
+			TLSMinVersion: in.TLSMinVersion,
+			TLSMaxVersion: in.TLSMaxVersion,
+			CipherSuites:  slices.Clone(in.CipherSuites),
+			SDS:           convertGatewayTLSSDSConfig(in.SDS),
+		}
+	}
+
+	return &api.GatewayTLSConfig{}
+}
+
+func convertGatewayTLSSDSConfig(in *structs.ConsulGatewayTLSSDSConfig) *api.GatewayTLSSDSConfig {
+	if in != nil {
+		return &api.GatewayTLSSDSConfig{
+			ClusterName:  in.ClusterName,
+			CertResource: in.CertResource,
+		}
+	}
+
+	return &api.GatewayTLSSDSConfig{}
 }
 
 func convertTerminatingCE(namespace, service string, entry *structs.ConsulTerminatingConfigEntry) api.ConfigEntry {

@@ -1,11 +1,15 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,13 +18,20 @@ import (
 
 	gg "github.com/hashicorp/go-getter"
 	"github.com/hashicorp/nomad/api"
+	flaghelper "github.com/hashicorp/nomad/helper/flags"
 	"github.com/hashicorp/nomad/jobspec"
 	"github.com/hashicorp/nomad/jobspec2"
 	"github.com/kr/text"
 	"github.com/mitchellh/cli"
+	"github.com/moby/term"
 	"github.com/posener/complete"
-
 	"github.com/ryanuber/columnize"
+)
+
+const (
+	formatJSON = "json"
+	formatHCL1 = "hcl1"
+	formatHCL2 = "hcl2"
 )
 
 // maxLineLength is the maximum width of any line.
@@ -59,6 +70,13 @@ func limit(s string, length int) string {
 	}
 
 	return s[:length]
+}
+
+// indentString returns the string s padded with the given number of empty
+// spaces before each line except for the first one.
+func indentString(s string, pad int) string {
+	prefix := strings.Repeat(" ", pad)
+	return strings.Join(strings.Split(s, "\n"), fmt.Sprintf("\n%s", prefix))
 }
 
 // wrapAtLengthWithPadding wraps the given text at the maxLineLength, taking
@@ -379,19 +397,46 @@ READ:
 	return l.ReadCloser.Read(p)
 }
 
+// JobGetter provides helpers for retrieving and parsing a jobpsec.
 type JobGetter struct {
-	hcl1 bool
+	HCL1     bool
+	Vars     flaghelper.StringFlag
+	VarFiles flaghelper.StringFlag
+	Strict   bool
+	JSON     bool
 
 	// The fields below can be overwritten for tests
 	testStdin io.Reader
 }
 
-// ApiJob returns the Job struct from jobfile.
-func (j *JobGetter) ApiJob(jpath string) (*api.Job, error) {
-	return j.ApiJobWithArgs(jpath, nil, nil, true)
+func (j *JobGetter) Validate() error {
+	if j.HCL1 && j.Strict {
+		return fmt.Errorf("cannot parse job file as HCLv1 and HCLv2 strict.")
+	}
+	if j.HCL1 && j.JSON {
+		return fmt.Errorf("cannot parse job file as HCL and JSON.")
+	}
+	if len(j.Vars) > 0 && j.JSON {
+		return fmt.Errorf("cannot use variables with JSON files.")
+	}
+	if len(j.VarFiles) > 0 && j.JSON {
+		return fmt.Errorf("cannot use variables with JSON files.")
+	}
+	if len(j.Vars) > 0 && j.HCL1 {
+		return fmt.Errorf("cannot use variables with HCLv1.")
+	}
+	if len(j.VarFiles) > 0 && j.HCL1 {
+		return fmt.Errorf("cannot use variables with HCLv1.")
+	}
+	return nil
 }
 
-func (j *JobGetter) ApiJobWithArgs(jpath string, vars []string, varfiles []string, strict bool) (*api.Job, error) {
+// ApiJob returns the Job struct from jobfile.
+func (j *JobGetter) ApiJob(jpath string) (*api.JobSubmission, *api.Job, error) {
+	return j.Get(jpath)
+}
+
+func (j *JobGetter) Get(jpath string) (*api.JobSubmission, *api.Job, error) {
 	var jobfile io.Reader
 	pathName := filepath.Base(jpath)
 	switch jpath {
@@ -401,40 +446,43 @@ func (j *JobGetter) ApiJobWithArgs(jpath string, vars []string, varfiles []strin
 		} else {
 			jobfile = os.Stdin
 		}
-		pathName = "stdin.hcl"
+		pathName = "stdin"
 	default:
 		if len(jpath) == 0 {
-			return nil, fmt.Errorf("Error jobfile path has to be specified.")
+			return nil, nil, fmt.Errorf("Error jobfile path has to be specified.")
 		}
 
-		job, err := ioutil.TempFile("", "jobfile")
+		jobFile, err := os.CreateTemp("", "jobfile")
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		defer os.Remove(job.Name())
+		defer os.Remove(jobFile.Name())
 
-		if err := job.Close(); err != nil {
-			return nil, err
+		if err := jobFile.Close(); err != nil {
+			return nil, nil, err
 		}
 
 		// Get the pwd
 		pwd, err := os.Getwd()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		client := &gg.Client{
 			Src: jpath,
 			Pwd: pwd,
-			Dst: job.Name(),
+			Dst: jobFile.Name(),
+
+			// This will prevent copying or writing files through symlinks
+			DisableSymlinks: true,
 		}
 
 		if err := client.Get(); err != nil {
-			return nil, fmt.Errorf("Error getting jobfile from %q: %v", jpath, err)
+			return nil, nil, fmt.Errorf("Error getting jobfile from %q: %v", jpath, err)
 		} else {
-			file, err := os.Open(job.Name())
+			file, err := os.Open(jobFile.Name())
 			if err != nil {
-				return nil, fmt.Errorf("Error opening file %q: %v", jpath, err)
+				return nil, nil, fmt.Errorf("Error opening file %q: %v", jpath, err)
 			}
 			defer file.Close()
 			jobfile = file
@@ -442,38 +490,165 @@ func (j *JobGetter) ApiJobWithArgs(jpath string, vars []string, varfiles []strin
 	}
 
 	// Parse the JobFile
-	var jobStruct *api.Job
+	var jobStruct *api.Job               // deserialized destination
+	var source bytes.Buffer              // tee the original
+	var jobSubmission *api.JobSubmission // store the original and format
+	jobfile = io.TeeReader(jobfile, &source)
 	var err error
-	if j.hcl1 {
+	switch {
+	case j.HCL1:
 		jobStruct, err = jobspec.Parse(jobfile)
-	} else {
-		var buf bytes.Buffer
-		_, err = io.Copy(&buf, jobfile)
-		if err != nil {
-			return nil, fmt.Errorf("Error reading job file from %s: %v", jpath, err)
+
+		// include the hcl1 source as the submission
+		jobSubmission = &api.JobSubmission{
+			Source: source.String(),
+			Format: formatHCL1,
 		}
+	case j.JSON:
+
+		// Support JSON files with both a top-level Job key as well as
+		// ones without.
+		eitherJob := struct {
+			NestedJob *api.Job `json:"Job"`
+			api.Job
+		}{}
+
+		if err := json.NewDecoder(jobfile).Decode(&eitherJob); err != nil {
+			return nil, nil, fmt.Errorf("Failed to parse JSON job: %w", err)
+		}
+
+		if eitherJob.NestedJob != nil {
+			jobStruct = eitherJob.NestedJob
+		} else {
+			jobStruct = &eitherJob.Job
+		}
+
+		// include the json source as the submission
+		jobSubmission = &api.JobSubmission{
+			Source: source.String(),
+			Format: formatJSON,
+		}
+	default:
+		// we are parsing HCL2
+
+		// make a copy of the job file (or stdio)
+		if _, err = io.Copy(&source, jobfile); err != nil {
+			return nil, nil, fmt.Errorf("Failed to parse HCL job: %w", err)
+		}
+
+		// Perform the environment listing here as it is used twice beyond this
+		// point.
+		osEnv := os.Environ()
+
+		// we are parsing HCL2, whether from a file or stdio
 		jobStruct, err = jobspec2.ParseWithConfig(&jobspec2.ParseConfig{
 			Path:     pathName,
-			Body:     buf.Bytes(),
-			ArgVars:  vars,
+			Body:     source.Bytes(),
+			ArgVars:  j.Vars,
 			AllowFS:  true,
-			VarFiles: varfiles,
-			Envs:     os.Environ(),
-			Strict:   strict,
+			VarFiles: j.VarFiles,
+			Envs:     osEnv,
+			Strict:   j.Strict,
 		})
 
+		var varFileCat string
+		var readVarFileErr error
+		if err == nil {
+			// combine any -var-file data into one big blob
+			varFileCat, readVarFileErr = extractVarFiles(j.VarFiles)
+			if readVarFileErr != nil {
+				return nil, nil, fmt.Errorf("Failed to read var file(s): %w", readVarFileErr)
+			}
+		}
+
+		// Extract variables declared by the -var flag and as environment
+		// variables.
+		extractedVarFlags := extractVarFlags(j.Vars)
+		extractedEnvVars := extractJobSpecEnvVars(osEnv)
+
+		// Merge the two maps ensuring that variables defined by -var flags
+		// take precedence.
+		maps.Copy(extractedEnvVars, extractedVarFlags)
+
+		// submit the job with the submission with content from -var flags
+		jobSubmission = &api.JobSubmission{
+			VariableFlags: extractedEnvVars,
+			Variables:     varFileCat,
+			Source:        source.String(),
+			Format:        formatHCL2,
+		}
 		if err != nil {
-			if _, merr := jobspec.Parse(&buf); merr == nil {
-				return nil, fmt.Errorf("Failed to parse using HCL 2. Use the HCL 1 parser with `nomad run -hcl1`, or address the following issues:\n%v", err)
+			if _, merr := jobspec.Parse(&source); merr == nil {
+				return nil, nil, fmt.Errorf("Failed to parse using HCL 2. Use the HCL 1 parser with `nomad run -hcl1`, or address the following issues:\n%v", err)
 			}
 		}
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("Error parsing job file from %s:\n%v", jpath, err)
+		return nil, nil, fmt.Errorf("Error parsing job file from %s:\n%v", jpath, err)
 	}
 
-	return jobStruct, nil
+	return jobSubmission, jobStruct, nil
+}
+
+// extractVarFiles concatenates the content of each file in filenames and
+// returns it all as one big content blob
+func extractVarFiles(filenames []string) (string, error) {
+	var sb strings.Builder
+	for _, filename := range filenames {
+		b, err := os.ReadFile(filename)
+		if err != nil {
+			return "", err
+		}
+		sb.WriteString(string(b))
+		sb.WriteString("\n")
+	}
+	return sb.String(), nil
+}
+
+// extractVarFlags is used to parse the values of -var command line arguments
+// and turn them into a map to be used for submission. The result is never
+// nil for convenience.
+func extractVarFlags(slice []string) map[string]string {
+	m := make(map[string]string, len(slice))
+	for _, s := range slice {
+		if tokens := strings.SplitN(s, "=", 2); len(tokens) == 1 {
+			m[tokens[0]] = ""
+		} else {
+			m[tokens[0]] = tokens[1]
+		}
+	}
+	return m
+}
+
+// extractJobSpecEnvVars is used to extract Nomad specific HCL variables from
+// the OS environment. The input envVars parameter is expected to be generated
+// from the os.Environment function call. The result is never nil for
+// convenience.
+func extractJobSpecEnvVars(envVars []string) map[string]string {
+
+	m := make(map[string]string)
+
+	for _, raw := range envVars {
+		if !strings.HasPrefix(raw, jobspec2.VarEnvPrefix) {
+			continue
+		}
+
+		// Trim the prefix, so we just have the raw key=value variable
+		// remaining.
+		raw = raw[len(jobspec2.VarEnvPrefix):]
+
+		// Identify the index of the equals sign which is where we split the
+		// variable k/v pair. -1 indicates the equals sign is not found and
+		// therefore the var is not valid.
+		if eq := strings.Index(raw, "="); eq == -1 {
+			continue
+		} else if raw[:eq] != "" {
+			m[raw[:eq]] = raw[eq+1:]
+		}
+	}
+
+	return m
 }
 
 // mergeAutocompleteFlags is used to join multiple flag completion sets.
@@ -497,7 +672,7 @@ func sanitizeUUIDPrefix(prefix string) string {
 	return prefix[:len(prefix)-remainder]
 }
 
-// commandErrorText is used to easily render the same messaging across commads
+// commandErrorText is used to easily render the same messaging across commands
 // when an error is printed.
 func commandErrorText(cmd NamedCommand) string {
 	return fmt.Sprintf("For additional help try 'nomad %s -help'", cmd.Name())
@@ -542,4 +717,51 @@ func (w *uiErrorWriter) Close() error {
 		w.buf.Reset()
 	}
 	return nil
+}
+
+func loadDataSource(data string, testStdin io.Reader) (string, error) {
+	// Handle empty quoted shell parameters
+	if len(data) == 0 {
+		return "", nil
+	}
+
+	switch data[0] {
+	case '@':
+		return loadFromFile(data[1:])
+	case '-':
+		if len(data) > 1 {
+			return data, nil
+		}
+		return loadFromStdin(testStdin)
+	default:
+		return data, nil
+	}
+}
+
+func loadFromFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("Failed to read file: %v", err)
+	}
+	return string(data), nil
+}
+
+func loadFromStdin(testStdin io.Reader) (string, error) {
+	var stdin io.Reader = os.Stdin
+	if testStdin != nil {
+		stdin = testStdin
+	}
+
+	var b bytes.Buffer
+	if _, err := io.Copy(&b, stdin); err != nil {
+		return "", fmt.Errorf("Failed to read stdin: %v", err)
+	}
+	return b.String(), nil
+}
+
+// isTty returns true if both stdin and stdout are a TTY
+func isTty() bool {
+	_, isStdinTerminal := term.GetFdInfo(os.Stdin)
+	_, isStdoutTerminal := term.GetFdInfo(os.Stdout)
+	return isStdinTerminal && isStdoutTerminal
 }

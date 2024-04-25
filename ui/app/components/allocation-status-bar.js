@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { computed } from '@ember/object';
 import DistributionBar from './distribution-bar';
 import { attributeBindings } from '@ember-decorators/component';
@@ -25,7 +30,7 @@ export default class AllocationStatusBar extends DistributionBar {
   }
 
   @computed(
-    'allocationContainer.{queuedAllocs,completeAllocs,failedAllocs,runningAllocs,startingAllocs}',
+    'allocationContainer.{queuedAllocs,completeAllocs,failedAllocs,runningAllocs,startingAllocs,lostAllocs,unknownAllocs}',
     'job.namespace'
   )
   get data() {
@@ -39,7 +44,8 @@ export default class AllocationStatusBar extends DistributionBar {
       'failedAllocs',
       'runningAllocs',
       'startingAllocs',
-      'lostAllocs'
+      'lostAllocs',
+      'unknownAllocs'
     );
     return [
       {
@@ -53,7 +59,7 @@ export default class AllocationStatusBar extends DistributionBar {
         value: allocs.startingAllocs,
         className: 'starting',
         layers: 2,
-        legendLink: this.generateLegendLink(this.job, 'starting'),
+        legendLink: this.generateLegendLink(this.job, 'pending'),
       },
       {
         label: 'Running',
@@ -66,6 +72,13 @@ export default class AllocationStatusBar extends DistributionBar {
         value: allocs.completeAllocs,
         className: 'complete',
         legendLink: this.generateLegendLink(this.job, 'complete'),
+      },
+      {
+        label: 'Unknown',
+        value: allocs.unknownAllocs,
+        className: 'unknown',
+        legendLink: this.generateLegendLink(this.job, 'unknown'),
+        help: 'Allocation is unknown since its node is disconnected.',
       },
       {
         label: 'Failed',

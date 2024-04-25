@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -6,6 +9,7 @@ import (
 
 	"github.com/hashicorp/nomad/ci"
 	"github.com/mitchellh/cli"
+	"github.com/shoenig/test/must"
 )
 
 func TestAgentCheckCommand_ServerHealth(t *testing.T) {
@@ -18,13 +22,9 @@ func TestAgentCheckCommand_ServerHealth(t *testing.T) {
 	address := fmt.Sprintf("-address=%s", url)
 
 	code := cmd.Run([]string{address})
-	if code != HealthPass {
-		t.Fatalf("expected exit: %v, actual: %d", HealthPass, code)
-	}
+	must.Eq(t, HealthPass, code)
 
 	minPeers := fmt.Sprintf("-min-peers=%v", 3)
 	code = cmd.Run([]string{address, minPeers})
-	if code != HealthCritical {
-		t.Fatalf("expected exitcode: %v, actual: %v", HealthCritical, code)
-	}
+	must.Eq(t, HealthCritical, code)
 }

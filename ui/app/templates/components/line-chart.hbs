@@ -1,8 +1,15 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 <div
   class="chart line-chart"
   ...attributes
   {{did-insert this.onInsert}}
   {{did-update this.renderChart}}
+  {{did-update this.recomputeXAxis this.xScale}}
+  {{did-update this.recomputeYAxis this.yScale}}
   {{window-resize this.updateDimensions}}>
   <svg data-test-line-chart aria-labelledby="{{this.titleId}}" aria-describedby="{{this.descriptionId}}">
     <title id="{{this.titleId}}">{{this.title}}</title>

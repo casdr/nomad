@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -7,7 +10,7 @@ import (
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/mitchellh/cli"
 )
@@ -64,9 +67,9 @@ func TestScalingPolicyInfoCommand_Run(t *testing.T) {
 
 	// Generate an example scaling policy.
 	job.TaskGroups[0].Scaling = &api.ScalingPolicy{
-		Enabled: helper.BoolToPtr(true),
-		Min:     helper.Int64ToPtr(1),
-		Max:     helper.Int64ToPtr(1),
+		Enabled: pointer.Of(true),
+		Min:     pointer.Of(int64(1)),
+		Max:     pointer.Of(int64(1)),
 	}
 
 	// Register the job.

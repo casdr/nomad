@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package fingerprint
 
 import (
@@ -52,6 +55,7 @@ func TestEnvAWSFingerprint_aws(t *testing.T) {
 		"platform.aws.ami-id",
 		"unique.platform.aws.hostname",
 		"unique.platform.aws.instance-id",
+		"platform.aws.instance-life-cycle",
 		"platform.aws.instance-type",
 		"unique.platform.aws.local-hostname",
 		"unique.platform.aws.local-ipv4",
@@ -231,36 +235,6 @@ func TestCPUFingerprint_AWS_InstanceFound(t *testing.T) {
 	err := f.Fingerprint(request, &response)
 	require.NoError(t, err)
 	require.True(t, response.Detected)
-	require.Equal(t, "2200", response.Attributes["cpu.frequency"])
-	require.Equal(t, "8", response.Attributes["cpu.numcores"])
-	require.Equal(t, "17600", response.Attributes["cpu.totalcompute"])
-	require.Equal(t, 17600, response.Resources.CPU)
-	require.Equal(t, int64(17600), response.NodeResources.Cpu.CpuShares)
-}
-
-func TestCPUFingerprint_AWS_OverrideCompute(t *testing.T) {
-	ci.Parallel(t)
-
-	endpoint, cleanup := startFakeEC2Metadata(t, awsStubs)
-	defer cleanup()
-
-	f := NewEnvAWSFingerprint(testlog.HCLogger(t))
-	f.(*EnvAWSFingerprint).endpoint = endpoint
-
-	node := &structs.Node{Attributes: make(map[string]string)}
-
-	request := &FingerprintRequest{Config: &config.Config{
-		CpuCompute: 99999,
-	}, Node: node}
-	var response FingerprintResponse
-	err := f.Fingerprint(request, &response)
-	require.NoError(t, err)
-	require.True(t, response.Detected)
-	require.Equal(t, "2200", response.Attributes["cpu.frequency"])
-	require.Equal(t, "8", response.Attributes["cpu.numcores"])
-	require.Equal(t, "99999", response.Attributes["cpu.totalcompute"])
-	require.Nil(t, response.Resources)          // defaults in cpu fingerprinter
-	require.Zero(t, response.NodeResources.Cpu) // defaults in cpu fingerprinter
 }
 
 func TestCPUFingerprint_AWS_InstanceNotFound(t *testing.T) {
@@ -279,12 +253,6 @@ func TestCPUFingerprint_AWS_InstanceNotFound(t *testing.T) {
 	err := f.Fingerprint(request, &response)
 	require.NoError(t, err)
 	require.True(t, response.Detected)
-	require.NotContains(t, response.Attributes, "cpu.modelname")
-	require.NotContains(t, response.Attributes, "cpu.frequency")
-	require.NotContains(t, response.Attributes, "cpu.numcores")
-	require.NotContains(t, response.Attributes, "cpu.totalcompute")
-	require.Nil(t, response.Resources)
-	require.Nil(t, response.NodeResources)
 }
 
 /// Utility functions for tests
@@ -333,6 +301,11 @@ var awsStubs = []endpoint{
 		Uri:         "/latest/meta-data/instance-id",
 		ContentType: "text/plain",
 		Body:        "i-b3ba3875",
+	},
+	{
+		Uri:         "/latest/meta-data/instance-life-cycle",
+		ContentType: "text/plain",
+		Body:        "on-demand",
 	},
 	{
 		Uri:         "/latest/meta-data/instance-type",
@@ -388,6 +361,11 @@ var unknownInstanceType = []endpoint{
 		Body:        "i-b3ba3875",
 	},
 	{
+		Uri:         "/latest/meta-data/instance-life-cycle",
+		ContentType: "text/plain",
+		Body:        "on-demand",
+	},
+	{
 		Uri:         "/latest/meta-data/instance-type",
 		ContentType: "text/plain",
 		Body:        "xyz123.uber",
@@ -416,6 +394,11 @@ var noNetworkAWSStubs = []endpoint{
 		Uri:         "/latest/meta-data/instance-id",
 		ContentType: "text/plain",
 		Body:        "i-b3ba3875",
+	},
+	{
+		Uri:         "/latest/meta-data/instance-life-cycle",
+		ContentType: "text/plain",
+		Body:        "on-demand",
 	},
 	{
 		Uri:         "/latest/meta-data/instance-type",

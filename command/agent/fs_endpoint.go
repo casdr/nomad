@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
@@ -11,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/pkg/ioutils"
-	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -197,11 +200,11 @@ func (s *HTTPServer) FileCatRequest(resp http.ResponseWriter, req *http.Request)
 
 // Stream streams the content of a file blocking on EOF.
 // The parameters are:
-// * path: path to file to stream.
-// * follow: A boolean of whether to follow the file, defaults to true.
-// * offset: The offset to start streaming data at, defaults to zero.
-// * origin: Either "start" or "end" and defines from where the offset is
-//           applied. Defaults to "start".
+//   - path: path to file to stream.
+//   - follow: A boolean of whether to follow the file, defaults to true.
+//   - offset: The offset to start streaming data at, defaults to zero.
+//   - origin: Either "start" or "end" and defines from where the offset is
+//     applied. Defaults to "start".
 func (s *HTTPServer) Stream(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	var allocID, path string
 	var err error
@@ -255,12 +258,12 @@ func (s *HTTPServer) Stream(resp http.ResponseWriter, req *http.Request) (interf
 }
 
 // Logs streams the content of a log blocking on EOF. The parameters are:
-// * task: task name to stream logs for.
-// * type: stdout/stderr to stream.
-// * follow: A boolean of whether to follow the logs.
-// * offset: The offset to start streaming data at, defaults to zero.
-// * origin: Either "start" or "end" and defines from where the offset is
-//           applied. Defaults to "start".
+//   - task: task name to stream logs for.
+//   - type: stdout/stderr to stream.
+//   - follow: A boolean of whether to follow the logs.
+//   - offset: The offset to start streaming data at, defaults to zero.
+//   - origin: Either "start" or "end" and defines from where the offset is
+//     applied. Defaults to "start".
 func (s *HTTPServer) Logs(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	var allocID, task, logType string
 	var plain, follow bool

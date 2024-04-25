@@ -1,18 +1,10 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 {{page-title "CSI Volumes"}}
-<div class="tabs is-subnav">
-  <ul>
-    <li data-test-tab="volumes">
-      <LinkTo @route="csi.volumes.index" @activeClass="is-active">
-        Volumes
-      </LinkTo>
-    </li>
-    <li data-test-tab="plugins">
-      <LinkTo @route="csi.plugins.index" @activeClass="is-active">
-        Plugins
-      </LinkTo>
-    </li>
-  </ul>
-</div>
+<StorageSubnav />
 <section class="section">
   <div class="toolbar">
     <div class="toolbar-item">
@@ -33,9 +25,7 @@
             @label="Namespace"
             @options={{this.optionsNamespaces}}
             @selection={{this.qpNamespace}}
-            @onSelect={{action
-              (queue (action this.cacheNamespace) (action this.setFacetQueryParam "qpNamespace"))
-            }}
+            @onSelect={{action this.setFacetQueryParam "qpNamespace"}}
           />
         </div>
       </div>
@@ -86,14 +76,21 @@
             data-test-volume-row
             {{on "click" (action "gotoVolume" row.model)}}
           >
-            <td data-test-volume-name>
-              <LinkTo
-                @route="csi.volumes.volume"
-                @model={{row.model.idWithNamespace}}
-                class="is-primary"
-              >
-                {{row.model.name}}
-              </LinkTo>
+            <td data-test-volume-name
+              {{keyboard-shortcut 
+                enumerated=true
+                action=(action "gotoVolume" row.model)
+              }}
+            >
+              <Tooltip @text={{row.model.plainId}}>
+                <LinkTo
+                  @route="csi.volumes.volume"
+                  @model={{row.model.idWithNamespace}}
+                  class="is-primary"
+                >
+                  {{row.model.name}}
+                </LinkTo>
+              </Tooltip>
             </td>
             {{#if this.system.shouldShowNamespaces}}
               <td data-test-volume-namespace>

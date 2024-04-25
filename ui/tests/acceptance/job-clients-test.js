@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable qunit/require-expect */
 import { currentURL } from '@ember/test-helpers';
 import { module, test } from 'qunit';
@@ -38,6 +43,7 @@ module('Acceptance | job clients', function (hooks) {
       },
     });
 
+    server.createList('node-pool', 5);
     clients = server.createList('node', 12, {
       datacenter: 'dc1',
       status: 'ready',
@@ -200,6 +206,7 @@ module('Acceptance | job clients', function (hooks) {
       'Degraded',
       'Failed',
       'Lost',
+      'Unknown',
     ],
     async beforeEach() {
       await Clients.visit({ id: job.id });

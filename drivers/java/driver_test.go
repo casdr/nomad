@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package java
 
 import (
@@ -5,21 +8,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/nomad/ci"
-	dtestutil "github.com/hashicorp/nomad/plugins/drivers/testutils"
-
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
+	"github.com/hashicorp/nomad/client/lib/numalib"
 	ctestutil "github.com/hashicorp/nomad/client/testutil"
 	"github.com/hashicorp/nomad/helper/pluginutils/hclutils"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	dtestutil "github.com/hashicorp/nomad/plugins/drivers/testutils"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -33,6 +37,13 @@ func javaCompatible(t *testing.T) {
 	}
 }
 
+func newJavaDriverTest(t *testing.T, ctx context.Context) drivers.DriverPlugin {
+	topology := numalib.Scan(numalib.PlatformScanners())
+	d := NewDriver(ctx, testlog.HCLogger(t))
+	d.(*Driver).nomadConfig = &base.ClientDriverConfig{Topology: topology}
+	return d
+}
+
 func TestJavaDriver_Fingerprint(t *testing.T) {
 	ci.Parallel(t)
 	javaCompatible(t)
@@ -40,7 +51,7 @@ func TestJavaDriver_Fingerprint(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewDriver(ctx, testlog.HCLogger(t))
+	d := newJavaDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	fpCh, err := harness.Fingerprint(context.Background())
@@ -60,11 +71,11 @@ func TestJavaDriver_Jar_Start_Wait(t *testing.T) {
 	ci.Parallel(t)
 	javaCompatible(t)
 
-	require := require.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewDriver(ctx, testlog.HCLogger(t))
+	d := newJavaDriverTest(t, ctx)
+
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	tc := &TaskConfig{
@@ -72,6 +83,7 @@ func TestJavaDriver_Jar_Start_Wait(t *testing.T) {
 		Args:    []string{"1"},
 		JvmOpts: []string{"-Xmx64m", "-Xms32m"},
 	}
+
 	task := basicTask(t, "demo-app", tc)
 
 	cleanup := harness.MkAllocDir(task, true)
@@ -80,32 +92,31 @@ func TestJavaDriver_Jar_Start_Wait(t *testing.T) {
 	copyFile("./test-resources/demoapp.jar", filepath.Join(task.TaskDir().Dir, "demoapp.jar"), t)
 
 	handle, _, err := harness.StartTask(task)
-	require.NoError(err)
+	require.NoError(t, err)
 
 	ch, err := harness.WaitTask(context.Background(), handle.Config.ID)
-	require.NoError(err)
+	require.NoError(t, err)
 	result := <-ch
-	require.Nil(result.Err)
+	require.Nil(t, result.Err)
 
-	require.Zero(result.ExitCode)
+	require.Zero(t, result.ExitCode)
 
 	// Get the stdout of the process and assert that it's not empty
-	stdout, err := ioutil.ReadFile(filepath.Join(task.TaskDir().LogDir, "demo-app.stdout.0"))
-	require.NoError(err)
-	require.Contains(string(stdout), "Hello")
+	stdout, err := os.ReadFile(filepath.Join(task.TaskDir().LogDir, "demo-app.stdout.0"))
+	require.NoError(t, err)
+	require.Contains(t, string(stdout), "Hello")
 
-	require.NoError(harness.DestroyTask(task.ID, true))
+	require.NoError(t, harness.DestroyTask(task.ID, true))
 }
 
 func TestJavaDriver_Jar_Stop_Wait(t *testing.T) {
 	ci.Parallel(t)
 	javaCompatible(t)
 
-	require := require.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewDriver(ctx, testlog.HCLogger(t))
+	d := newJavaDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	tc := &TaskConfig{
@@ -121,12 +132,12 @@ func TestJavaDriver_Jar_Stop_Wait(t *testing.T) {
 	copyFile("./test-resources/demoapp.jar", filepath.Join(task.TaskDir().Dir, "demoapp.jar"), t)
 
 	handle, _, err := harness.StartTask(task)
-	require.NoError(err)
+	require.NoError(t, err)
 
 	ch, err := harness.WaitTask(context.Background(), handle.Config.ID)
-	require.NoError(err)
+	require.NoError(t, err)
 
-	require.NoError(harness.WaitUntilStarted(task.ID, 1*time.Second))
+	require.NoError(t, harness.WaitUntilStarted(task.ID, 1*time.Second))
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
@@ -135,9 +146,9 @@ func TestJavaDriver_Jar_Stop_Wait(t *testing.T) {
 
 	select {
 	case result := <-ch:
-		require.False(result.Successful())
+		require.False(t, result.Successful())
 	case <-time.After(10 * time.Second):
-		require.Fail("timeout waiting for task to shutdown")
+		require.Fail(t, "timeout waiting for task to shutdown")
 	}
 
 	// Ensure that the task is marked as dead, but account
@@ -153,21 +164,20 @@ func TestJavaDriver_Jar_Stop_Wait(t *testing.T) {
 
 		return true, nil
 	}, func(err error) {
-		require.NoError(err)
+		require.NoError(t, err)
 	})
 
-	require.NoError(harness.DestroyTask(task.ID, true))
+	require.NoError(t, harness.DestroyTask(task.ID, true))
 }
 
 func TestJavaDriver_Class_Start_Wait(t *testing.T) {
 	ci.Parallel(t)
 	javaCompatible(t)
 
-	require := require.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewDriver(ctx, testlog.HCLogger(t))
+	d := newJavaDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 
 	tc := &TaskConfig{
@@ -182,21 +192,21 @@ func TestJavaDriver_Class_Start_Wait(t *testing.T) {
 	copyFile("./test-resources/Hello.class", filepath.Join(task.TaskDir().Dir, "Hello.class"), t)
 
 	handle, _, err := harness.StartTask(task)
-	require.NoError(err)
+	require.NoError(t, err)
 
 	ch, err := harness.WaitTask(context.Background(), handle.Config.ID)
-	require.NoError(err)
+	require.NoError(t, err)
 	result := <-ch
-	require.Nil(result.Err)
+	require.Nil(t, result.Err)
 
-	require.Zero(result.ExitCode)
+	require.Zero(t, result.ExitCode)
 
 	// Get the stdout of the process and assert that it's not empty
-	stdout, err := ioutil.ReadFile(filepath.Join(task.TaskDir().LogDir, "demo-app.stdout.0"))
-	require.NoError(err)
-	require.Contains(string(stdout), "Hello")
+	stdout, err := os.ReadFile(filepath.Join(task.TaskDir().LogDir, "demo-app.stdout.0"))
+	require.NoError(t, err)
+	require.Contains(t, string(stdout), "Hello")
 
-	require.NoError(harness.DestroyTask(task.ID, true))
+	require.NoError(t, harness.DestroyTask(task.ID, true))
 }
 
 func TestJavaCmdArgs(t *testing.T) {
@@ -254,11 +264,10 @@ func TestJavaDriver_ExecTaskStreaming(t *testing.T) {
 	ci.Parallel(t)
 	javaCompatible(t)
 
-	require := require.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewDriver(ctx, testlog.HCLogger(t))
+	d := newJavaDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	defer harness.Kill()
 
@@ -274,7 +283,7 @@ func TestJavaDriver_ExecTaskStreaming(t *testing.T) {
 	copyFile("./test-resources/Hello.class", filepath.Join(task.TaskDir().Dir, "Hello.class"), t)
 
 	_, _, err := harness.StartTask(task)
-	require.NoError(err)
+	require.NoError(t, err)
 	defer d.DestroyTask(task.ID, true)
 
 	dtestutil.ExecTaskStreamingConformanceTests(t, harness, task.ID)
@@ -283,9 +292,11 @@ func TestJavaDriver_ExecTaskStreaming(t *testing.T) {
 func basicTask(t *testing.T, name string, taskConfig *TaskConfig) *drivers.TaskConfig {
 	t.Helper()
 
+	allocID := uuid.Generate()
 	task := &drivers.TaskConfig{
-		ID:   uuid.Generate(),
-		Name: name,
+		AllocID: allocID,
+		ID:      uuid.Generate(),
+		Name:    name,
 		Resources: &drivers.Resources{
 			NomadResources: &structs.AllocatedTaskResources{
 				Memory: structs.AllocatedMemoryResources{
@@ -298,6 +309,7 @@ func basicTask(t *testing.T, name string, taskConfig *TaskConfig) *drivers.TaskC
 			LinuxResources: &drivers.LinuxResources{
 				MemoryLimitBytes: 134217728,
 				CPUShares:        100,
+				CpusetCgroupPath: cgroupslib.LinuxResourcesPath(allocID, name, false),
 			},
 		},
 	}
@@ -362,7 +374,7 @@ func Test_dnsConfig(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d := NewDriver(ctx, testlog.HCLogger(t))
+	d := newJavaDriverTest(t, ctx)
 	harness := dtestutil.NewDriverHarness(t, d)
 	defer harness.Kill()
 

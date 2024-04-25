@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -10,12 +13,11 @@ import (
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/command/agent"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/mitchellh/cli"
 	"github.com/posener/complete"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/shoenig/test/must"
 )
 
 func TestNodeDrainCommand_Implements(t *testing.T) {
@@ -25,7 +27,7 @@ func TestNodeDrainCommand_Implements(t *testing.T) {
 
 func TestNodeDrainCommand_Detach(t *testing.T) {
 	ci.Parallel(t)
-	require := require.New(t)
+
 	server, client, url := testServer(t, true, func(c *agent.Config) {
 		c.NodeName = "drain_detach_node"
 	})
@@ -49,12 +51,12 @@ func TestNodeDrainCommand_Detach(t *testing.T) {
 
 	// Register a job to create an alloc to drain that will block draining
 	job := &api.Job{
-		ID:          helper.StringToPtr("mock_service"),
-		Name:        helper.StringToPtr("mock_service"),
+		ID:          pointer.Of("mock_service"),
+		Name:        pointer.Of("mock_service"),
 		Datacenters: []string{"dc1"},
 		TaskGroups: []*api.TaskGroup{
 			{
-				Name: helper.StringToPtr("mock_group"),
+				Name: pointer.Of("mock_group"),
 				Tasks: []*api.Task{
 					{
 						Name:   "mock_task",
@@ -69,7 +71,7 @@ func TestNodeDrainCommand_Detach(t *testing.T) {
 	}
 
 	_, _, err := client.Jobs().Register(job, nil)
-	require.Nil(err)
+	must.NoError(t, err)
 
 	testutil.WaitForResult(func() (bool, error) {
 		allocs, _, err := client.Nodes().Allocations(nodeID, nil)
@@ -89,16 +91,16 @@ func TestNodeDrainCommand_Detach(t *testing.T) {
 
 	out := ui.OutputWriter.String()
 	expected := "drain strategy set"
-	require.Contains(out, expected)
+	must.StrContains(t, out, expected)
 
 	node, _, err := client.Nodes().Info(nodeID, nil)
-	require.Nil(err)
-	require.NotNil(node.DrainStrategy)
+	must.NoError(t, err)
+	must.NotNil(t, node.DrainStrategy)
 }
 
 func TestNodeDrainCommand_Monitor(t *testing.T) {
 	ci.Parallel(t)
-	require := require.New(t)
+
 	server, client, url := testServer(t, true, func(c *agent.Config) {
 		c.NodeName = "drain_monitor_node"
 	})
@@ -126,19 +128,19 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	// Register a service job to create allocs to drain
 	serviceCount := 3
 	job := &api.Job{
-		ID:          helper.StringToPtr("mock_service"),
-		Name:        helper.StringToPtr("mock_service"),
+		ID:          pointer.Of("mock_service"),
+		Name:        pointer.Of("mock_service"),
 		Datacenters: []string{"dc1"},
-		Type:        helper.StringToPtr("service"),
+		Type:        pointer.Of("service"),
 		TaskGroups: []*api.TaskGroup{
 			{
-				Name:  helper.StringToPtr("mock_group"),
+				Name:  pointer.Of("mock_group"),
 				Count: &serviceCount,
 				Migrate: &api.MigrateStrategy{
-					MaxParallel:     helper.IntToPtr(1),
-					HealthCheck:     helper.StringToPtr("task_states"),
-					MinHealthyTime:  helper.TimeToPtr(10 * time.Millisecond),
-					HealthyDeadline: helper.TimeToPtr(5 * time.Minute),
+					MaxParallel:     pointer.Of(1),
+					HealthCheck:     pointer.Of("task_states"),
+					MinHealthyTime:  pointer.Of(10 * time.Millisecond),
+					HealthyDeadline: pointer.Of(5 * time.Minute),
 				},
 				Tasks: []*api.Task{
 					{
@@ -148,8 +150,8 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 							"run_for": "10m",
 						},
 						Resources: &api.Resources{
-							CPU:      helper.IntToPtr(50),
-							MemoryMB: helper.IntToPtr(50),
+							CPU:      pointer.Of(50),
+							MemoryMB: pointer.Of(50),
 						},
 					},
 				},
@@ -158,18 +160,18 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	}
 
 	_, _, err := client.Jobs().Register(job, nil)
-	require.Nil(err)
+	must.NoError(t, err)
 
 	// Register a system job to ensure it is ignored during draining
 	sysjob := &api.Job{
-		ID:          helper.StringToPtr("mock_system"),
-		Name:        helper.StringToPtr("mock_system"),
+		ID:          pointer.Of("mock_system"),
+		Name:        pointer.Of("mock_system"),
 		Datacenters: []string{"dc1"},
-		Type:        helper.StringToPtr("system"),
+		Type:        pointer.Of("system"),
 		TaskGroups: []*api.TaskGroup{
 			{
-				Name:  helper.StringToPtr("mock_sysgroup"),
-				Count: helper.IntToPtr(1),
+				Name:  pointer.Of("mock_sysgroup"),
+				Count: pointer.Of(1),
 				Tasks: []*api.Task{
 					{
 						Name:   "mock_systask",
@@ -178,8 +180,8 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 							"run_for": "10m",
 						},
 						Resources: &api.Resources{
-							CPU:      helper.IntToPtr(50),
-							MemoryMB: helper.IntToPtr(50),
+							CPU:      pointer.Of(50),
+							MemoryMB: pointer.Of(50),
 						},
 					},
 				},
@@ -188,7 +190,7 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	}
 
 	_, _, err = client.Jobs().Register(sysjob, nil)
-	require.Nil(err)
+	must.NoError(t, err)
 
 	var allocs []*api.Allocation
 	testutil.WaitForResult(func() (bool, error) {
@@ -218,7 +220,7 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	cmd := &NodeDrainCommand{Meta: Meta{Ui: ui}}
 	args := []string{"-address=" + url, "-self", "-enable", "-deadline", "1s", "-ignore-system"}
 	t.Logf("Running: %v", args)
-	require.Zero(cmd.Run(args))
+	must.Zero(t, cmd.Run(args))
 
 	out := outBuf.String()
 	t.Logf("Output:\n%s", out)
@@ -227,7 +229,7 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	// monitor goroutines may start only after some or all the allocs have been
 	// migrated.
 	if !testutil.IsTravis() {
-		require.Contains(out, "Drain complete for node")
+		must.StrContains(t, out, "Drain complete for node")
 		for _, a := range allocs {
 			if *a.Job.Type == "system" {
 				if strings.Contains(out, a.ID) {
@@ -235,8 +237,8 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 				}
 				continue
 			}
-			require.Contains(out, fmt.Sprintf("Alloc %q marked for migration", a.ID))
-			require.Contains(out, fmt.Sprintf("Alloc %q draining", a.ID))
+			must.StrContains(t, out, fmt.Sprintf("Alloc %q marked for migration", a.ID))
+			must.StrContains(t, out, fmt.Sprintf("Alloc %q draining", a.ID))
 		}
 
 		expected := fmt.Sprintf("All allocations on node %q have stopped\n", nodeID)
@@ -249,16 +251,16 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	outBuf.Reset()
 	args = []string{"-address=" + url, "-self", "-monitor", "-ignore-system"}
 	t.Logf("Running: %v", args)
-	require.Zero(cmd.Run(args))
+	must.Zero(t, cmd.Run(args))
 
 	out = outBuf.String()
 	t.Logf("Output:\n%s", out)
-	require.Contains(out, "No drain strategy set")
+	must.StrContains(t, out, "No drain strategy set")
 }
 
 func TestNodeDrainCommand_Monitor_NoDrainStrategy(t *testing.T) {
 	ci.Parallel(t)
-	require := require.New(t)
+
 	server, client, url := testServer(t, true, func(c *agent.Config) {
 		c.NodeName = "drain_monitor_node2"
 	})
@@ -295,7 +297,7 @@ func TestNodeDrainCommand_Monitor_NoDrainStrategy(t *testing.T) {
 	out := outBuf.String()
 	t.Logf("Output:\n%s", out)
 
-	require.Contains(out, "No drain strategy set")
+	must.StrContains(t, out, "No drain strategy set")
 }
 
 func TestNodeDrainCommand_Fails(t *testing.T) {
@@ -414,7 +416,6 @@ func TestNodeDrainCommand_Fails(t *testing.T) {
 
 func TestNodeDrainCommand_AutocompleteArgs(t *testing.T) {
 	ci.Parallel(t)
-	assert := assert.New(t)
 
 	srv, client, url := testServer(t, true, nil)
 	defer srv.Shutdown()
@@ -443,6 +444,6 @@ func TestNodeDrainCommand_AutocompleteArgs(t *testing.T) {
 	predictor := cmd.AutocompleteArgs()
 
 	res := predictor.Predict(args)
-	assert.Equal(1, len(res))
-	assert.Equal(nodeID, res[0])
+	must.Len(t, 1, res)
+	must.Eq(t, nodeID, res[0])
 }

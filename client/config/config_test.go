@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package config
 
 import (
@@ -6,8 +9,8 @@ import (
 
 	"github.com/hashicorp/consul-template/config"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
-	"github.com/stretchr/testify/require"
+	"github.com/hashicorp/nomad/helper/pointer"
+	"github.com/shoenig/test/must"
 )
 
 func TestConfigRead(t *testing.T) {
@@ -16,16 +19,12 @@ func TestConfigRead(t *testing.T) {
 	config := Config{}
 
 	actual := config.Read("cake")
-	if actual != "" {
-		t.Errorf("Expected empty string; found %s", actual)
-	}
+	must.Eq(t, "", actual)
 
 	expected := "chocolate"
 	config.Options = map[string]string{"cake": expected}
 	actual = config.Read("cake")
-	if actual != expected {
-		t.Errorf("Expected %s, found %s", expected, actual)
-	}
+	must.Eq(t, expected, actual)
 }
 
 func TestConfigReadDefault(t *testing.T) {
@@ -35,22 +34,18 @@ func TestConfigReadDefault(t *testing.T) {
 
 	expected := "vanilla"
 	actual := config.ReadDefault("cake", expected)
-	if actual != expected {
-		t.Errorf("Expected %s, found %s", expected, actual)
-	}
+	must.Eq(t, expected, actual)
 
 	expected = "chocolate"
 	config.Options = map[string]string{"cake": expected}
 	actual = config.ReadDefault("cake", "vanilla")
-	if actual != expected {
-		t.Errorf("Expected %s, found %s", expected, actual)
-	}
+	must.Eq(t, expected, actual)
 }
 
 func mockWaitConfig() *WaitConfig {
 	return &WaitConfig{
-		Min: helper.TimeToPtr(5 * time.Second),
-		Max: helper.TimeToPtr(10 * time.Second),
+		Min: pointer.Of(5 * time.Second),
+		Max: pointer.Of(10 * time.Second),
 	}
 }
 
@@ -66,37 +61,33 @@ func TestWaitConfig_Copy(t *testing.T) {
 			"fully-populated",
 			mockWaitConfig(),
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
-				Max: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(5 * time.Second),
+				Max: pointer.Of(10 * time.Second),
 			},
 		},
 		{
 			"min-only",
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
+				Min: pointer.Of(5 * time.Second),
 			},
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
+				Min: pointer.Of(5 * time.Second),
 			},
 		},
 		{
 			"max-only",
 			&WaitConfig{
-				Max: helper.TimeToPtr(5 * time.Second),
+				Max: pointer.Of(5 * time.Second),
 			},
 			&WaitConfig{
-				Max: helper.TimeToPtr(5 * time.Second),
+				Max: pointer.Of(5 * time.Second),
 			},
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			result := _case.Expected.Equals(_case.Wait.Copy())
-			if !result {
-				t.Logf("\nExpected %v\n   Found %v", _case.Expected, result)
-			}
-			require.True(t, result)
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			must.Equal(t, tc.Expected, tc.Wait.Copy())
 		})
 	}
 }
@@ -122,15 +113,15 @@ func TestWaitConfig_IsEmpty(t *testing.T) {
 		{
 			"is-not-empty",
 			&WaitConfig{
-				Min: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(10 * time.Second),
 			},
 			false,
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			require.Equal(t, _case.Expected, _case.Wait.IsEmpty())
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			must.Eq(t, tc.Expected, tc.Wait.IsEmpty())
 		})
 	}
 }
@@ -148,8 +139,8 @@ func TestWaitConfig_IsEqual(t *testing.T) {
 			"are-equal",
 			mockWaitConfig(),
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
-				Max: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(5 * time.Second),
+				Max: pointer.Of(10 * time.Second),
 			},
 			true,
 		},
@@ -157,8 +148,8 @@ func TestWaitConfig_IsEqual(t *testing.T) {
 			"min-different",
 			mockWaitConfig(),
 			&WaitConfig{
-				Min: helper.TimeToPtr(4 * time.Second),
-				Max: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(4 * time.Second),
+				Max: pointer.Of(10 * time.Second),
 			},
 			false,
 		},
@@ -166,16 +157,16 @@ func TestWaitConfig_IsEqual(t *testing.T) {
 			"max-different",
 			mockWaitConfig(),
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
-				Max: helper.TimeToPtr(9 * time.Second),
+				Min: pointer.Of(5 * time.Second),
+				Max: pointer.Of(9 * time.Second),
 			},
 			false,
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			require.Equal(t, _case.Expected, _case.Wait.Equals(_case.Other))
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			must.Eq(t, tc.Expected, tc.Wait.Equal(tc.Other))
 		})
 	}
 }
@@ -191,8 +182,8 @@ func TestWaitConfig_IsValid(t *testing.T) {
 		{
 			"is-valid",
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
-				Max: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(5 * time.Second),
+				Max: pointer.Of(10 * time.Second),
 			},
 			"",
 		},
@@ -209,27 +200,27 @@ func TestWaitConfig_IsValid(t *testing.T) {
 		{
 			"min-greater-than-max",
 			&WaitConfig{
-				Min: helper.TimeToPtr(10 * time.Second),
-				Max: helper.TimeToPtr(5 * time.Second),
+				Min: pointer.Of(10 * time.Second),
+				Max: pointer.Of(5 * time.Second),
 			},
 			"greater than",
 		},
 		{
 			"max-not-set",
 			&WaitConfig{
-				Min: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(10 * time.Second),
 			},
 			"",
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			if _case.Expected == "" {
-				require.Nil(t, _case.Retry.Validate())
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			err := tc.Retry.Validate()
+			if tc.Expected == "" {
+				must.NoError(t, err)
 			} else {
-				err := _case.Retry.Validate()
-				require.Contains(t, err.Error(), _case.Expected)
+				must.ErrorContains(t, err, tc.Expected)
 			}
 		})
 	}
@@ -248,48 +239,44 @@ func TestWaitConfig_Merge(t *testing.T) {
 			"all-fields",
 			mockWaitConfig(),
 			&WaitConfig{
-				Min: helper.TimeToPtr(4 * time.Second),
-				Max: helper.TimeToPtr(9 * time.Second),
+				Min: pointer.Of(4 * time.Second),
+				Max: pointer.Of(9 * time.Second),
 			},
 			&WaitConfig{
-				Min: helper.TimeToPtr(4 * time.Second),
-				Max: helper.TimeToPtr(9 * time.Second),
+				Min: pointer.Of(4 * time.Second),
+				Max: pointer.Of(9 * time.Second),
 			},
 		},
 		{
 			"min-only",
 			mockWaitConfig(),
 			&WaitConfig{
-				Min: helper.TimeToPtr(4 * time.Second),
-				Max: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(4 * time.Second),
+				Max: pointer.Of(10 * time.Second),
 			},
 			&WaitConfig{
-				Min: helper.TimeToPtr(4 * time.Second),
-				Max: helper.TimeToPtr(10 * time.Second),
+				Min: pointer.Of(4 * time.Second),
+				Max: pointer.Of(10 * time.Second),
 			},
 		},
 		{
 			"max-only",
 			mockWaitConfig(),
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
-				Max: helper.TimeToPtr(9 * time.Second),
+				Min: pointer.Of(5 * time.Second),
+				Max: pointer.Of(9 * time.Second),
 			},
 			&WaitConfig{
-				Min: helper.TimeToPtr(5 * time.Second),
-				Max: helper.TimeToPtr(9 * time.Second),
+				Min: pointer.Of(5 * time.Second),
+				Max: pointer.Of(9 * time.Second),
 			},
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			merged := _case.Target.Merge(_case.Other)
-			result := _case.Expected.Equals(merged)
-			if !result {
-				t.Logf("\nExpected %v\n   Found %v", _case.Expected, merged)
-			}
-			require.True(t, result)
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			merged := tc.Target.Merge(tc.Other)
+			must.Equal(t, tc.Expected, merged)
 		})
 	}
 }
@@ -298,28 +285,28 @@ func TestWaitConfig_ToConsulTemplate(t *testing.T) {
 	ci.Parallel(t)
 
 	expected := config.WaitConfig{
-		Enabled: helper.BoolToPtr(true),
-		Min:     helper.TimeToPtr(5 * time.Second),
-		Max:     helper.TimeToPtr(10 * time.Second),
+		Enabled: pointer.Of(true),
+		Min:     pointer.Of(5 * time.Second),
+		Max:     pointer.Of(10 * time.Second),
 	}
 
 	clientWaitConfig := &WaitConfig{
-		Min: helper.TimeToPtr(5 * time.Second),
-		Max: helper.TimeToPtr(10 * time.Second),
+		Min: pointer.Of(5 * time.Second),
+		Max: pointer.Of(10 * time.Second),
 	}
 
 	actual, err := clientWaitConfig.ToConsulTemplate()
-	require.NoError(t, err)
-	require.Equal(t, *expected.Min, *actual.Min)
-	require.Equal(t, *expected.Max, *actual.Max)
+	must.NoError(t, err)
+	must.Eq(t, *expected.Min, *actual.Min)
+	must.Eq(t, *expected.Max, *actual.Max)
 }
 
 func mockRetryConfig() *RetryConfig {
 	return &RetryConfig{
-		Attempts:      helper.IntToPtr(5),
-		Backoff:       helper.TimeToPtr(5 * time.Second),
+		Attempts:      pointer.Of(5),
+		Backoff:       pointer.Of(5 * time.Second),
 		BackoffHCL:    "5s",
-		MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+		MaxBackoff:    pointer.Of(10 * time.Second),
 		MaxBackoffHCL: "10s",
 	}
 }
@@ -335,29 +322,29 @@ func TestRetryConfig_Copy(t *testing.T) {
 			"fully-populated",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 		},
 		{
 			"attempts-only",
 			&RetryConfig{
-				Attempts: helper.IntToPtr(5),
+				Attempts: pointer.Of(5),
 			},
 			&RetryConfig{
-				Attempts: helper.IntToPtr(5),
+				Attempts: pointer.Of(5),
 			},
 		},
 		{
 			"backoff-only",
 			&RetryConfig{
-				Backoff: helper.TimeToPtr(5 * time.Second),
+				Backoff: pointer.Of(5 * time.Second),
 			},
 			&RetryConfig{
-				Backoff: helper.TimeToPtr(5 * time.Second),
+				Backoff: pointer.Of(5 * time.Second),
 			},
 		},
 		{
@@ -372,10 +359,10 @@ func TestRetryConfig_Copy(t *testing.T) {
 		{
 			"max-backoff-only",
 			&RetryConfig{
-				MaxBackoff: helper.TimeToPtr(10 * time.Second),
+				MaxBackoff: pointer.Of(10 * time.Second),
 			},
 			&RetryConfig{
-				MaxBackoff: helper.TimeToPtr(10 * time.Second),
+				MaxBackoff: pointer.Of(10 * time.Second),
 			},
 		},
 		{
@@ -389,13 +376,9 @@ func TestRetryConfig_Copy(t *testing.T) {
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			result := _case.Expected.Equals(_case.Retry.Copy())
-			if !result {
-				t.Logf("\nExpected %v\n   Found %v", _case.Expected, result)
-			}
-			require.True(t, result)
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			must.Equal(t, tc.Expected, tc.Retry.Copy())
 		})
 	}
 }
@@ -421,15 +404,15 @@ func TestRetryConfig_IsEmpty(t *testing.T) {
 		{
 			"is-not-empty",
 			&RetryConfig{
-				Attempts: helper.IntToPtr(12),
+				Attempts: pointer.Of(12),
 			},
 			false,
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			require.Equal(t, _case.Expected, _case.Retry.IsEmpty())
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			must.Eq(t, tc.Expected, tc.Retry.IsEmpty())
 		})
 	}
 }
@@ -447,10 +430,10 @@ func TestRetryConfig_IsEqual(t *testing.T) {
 			"are-equal",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 			true,
@@ -459,10 +442,10 @@ func TestRetryConfig_IsEqual(t *testing.T) {
 			"attempts-different",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(4),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(4),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 			false,
@@ -471,10 +454,10 @@ func TestRetryConfig_IsEqual(t *testing.T) {
 			"backoff-different",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(4 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(4 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 			false,
@@ -483,10 +466,10 @@ func TestRetryConfig_IsEqual(t *testing.T) {
 			"backoff-hcl-different",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "4s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 			false,
@@ -495,10 +478,10 @@ func TestRetryConfig_IsEqual(t *testing.T) {
 			"max-backoff-different",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(9 * time.Second),
+				MaxBackoff:    pointer.Of(9 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 			false,
@@ -507,19 +490,19 @@ func TestRetryConfig_IsEqual(t *testing.T) {
 			"max-backoff-hcl-different",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "9s",
 			},
 			false,
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			require.Equal(t, _case.Expected, _case.Retry.Equals(_case.Other))
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			must.Eq(t, tc.Expected, tc.Retry.Equal(tc.Other))
 		})
 	}
 }
@@ -535,8 +518,8 @@ func TestRetryConfig_IsValid(t *testing.T) {
 		{
 			"is-valid",
 			&RetryConfig{
-				Backoff:    helper.TimeToPtr(5 * time.Second),
-				MaxBackoff: helper.TimeToPtr(10 * time.Second),
+				Backoff:    pointer.Of(5 * time.Second),
+				MaxBackoff: pointer.Of(10 * time.Second),
 			},
 			"",
 		},
@@ -553,42 +536,42 @@ func TestRetryConfig_IsValid(t *testing.T) {
 		{
 			"backoff-greater-than-max-backoff",
 			&RetryConfig{
-				Backoff:    helper.TimeToPtr(10 * time.Second),
-				MaxBackoff: helper.TimeToPtr(5 * time.Second),
+				Backoff:    pointer.Of(10 * time.Second),
+				MaxBackoff: pointer.Of(5 * time.Second),
 			},
 			"greater than max_backoff",
 		},
 		{
 			"backoff-not-set",
 			&RetryConfig{
-				MaxBackoff: helper.TimeToPtr(10 * time.Second),
+				MaxBackoff: pointer.Of(10 * time.Second),
 			},
 			"",
 		},
 		{
 			"max-backoff-not-set",
 			&RetryConfig{
-				Backoff: helper.TimeToPtr(2 * time.Minute),
+				Backoff: pointer.Of(2 * time.Minute),
 			},
 			"greater than default",
 		},
 		{
 			"max-backoff-unbounded",
 			&RetryConfig{
-				Backoff:    helper.TimeToPtr(10 * time.Second),
-				MaxBackoff: helper.TimeToPtr(0 * time.Second),
+				Backoff:    pointer.Of(10 * time.Second),
+				MaxBackoff: pointer.Of(0 * time.Second),
 			},
 			"",
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			if _case.Expected == "" {
-				require.Nil(t, _case.Retry.Validate())
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			err := tc.Retry.Validate()
+			if tc.Expected == "" {
+				must.NoError(t, err)
 			} else {
-				err := _case.Retry.Validate()
-				require.Contains(t, err.Error(), _case.Expected)
+				must.ErrorContains(t, err, tc.Expected)
 			}
 		})
 	}
@@ -607,17 +590,17 @@ func TestRetryConfig_Merge(t *testing.T) {
 			"all-fields",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(4),
-				Backoff:       helper.TimeToPtr(4 * time.Second),
+				Attempts:      pointer.Of(4),
+				Backoff:       pointer.Of(4 * time.Second),
 				BackoffHCL:    "4s",
-				MaxBackoff:    helper.TimeToPtr(9 * time.Second),
+				MaxBackoff:    pointer.Of(9 * time.Second),
 				MaxBackoffHCL: "9s",
 			},
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(4),
-				Backoff:       helper.TimeToPtr(4 * time.Second),
+				Attempts:      pointer.Of(4),
+				Backoff:       pointer.Of(4 * time.Second),
 				BackoffHCL:    "4s",
-				MaxBackoff:    helper.TimeToPtr(9 * time.Second),
+				MaxBackoff:    pointer.Of(9 * time.Second),
 				MaxBackoffHCL: "9s",
 			},
 		},
@@ -625,17 +608,17 @@ func TestRetryConfig_Merge(t *testing.T) {
 			"attempts-only",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(4),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(4),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(4),
-				Backoff:       helper.TimeToPtr(5 * time.Second),
+				Attempts:      pointer.Of(4),
+				Backoff:       pointer.Of(5 * time.Second),
 				BackoffHCL:    "5s",
-				MaxBackoff:    helper.TimeToPtr(10 * time.Second),
+				MaxBackoff:    pointer.Of(10 * time.Second),
 				MaxBackoffHCL: "10s",
 			},
 		},
@@ -643,30 +626,26 @@ func TestRetryConfig_Merge(t *testing.T) {
 			"multi-field",
 			mockRetryConfig(),
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(4 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(4 * time.Second),
 				BackoffHCL:    "4s",
-				MaxBackoff:    helper.TimeToPtr(9 * time.Second),
+				MaxBackoff:    pointer.Of(9 * time.Second),
 				MaxBackoffHCL: "9s",
 			},
 			&RetryConfig{
-				Attempts:      helper.IntToPtr(5),
-				Backoff:       helper.TimeToPtr(4 * time.Second),
+				Attempts:      pointer.Of(5),
+				Backoff:       pointer.Of(4 * time.Second),
 				BackoffHCL:    "4s",
-				MaxBackoff:    helper.TimeToPtr(9 * time.Second),
+				MaxBackoff:    pointer.Of(9 * time.Second),
 				MaxBackoffHCL: "9s",
 			},
 		},
 	}
 
-	for _, _case := range cases {
-		t.Run(_case.Name, func(t *testing.T) {
-			merged := _case.Target.Merge(_case.Other)
-			result := _case.Expected.Equals(merged)
-			if !result {
-				t.Logf("\nExpected %v\n   Found %v", _case.Expected, merged)
-			}
-			require.True(t, result)
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			merged := tc.Target.Merge(tc.Other)
+			must.Equal(t, tc.Expected, merged)
 		})
 	}
 }
@@ -675,15 +654,14 @@ func TestRetryConfig_ToConsulTemplate(t *testing.T) {
 	ci.Parallel(t)
 
 	expected := config.RetryConfig{
-		Enabled:    helper.BoolToPtr(true),
-		Attempts:   helper.IntToPtr(5),
-		Backoff:    helper.TimeToPtr(5 * time.Second),
-		MaxBackoff: helper.TimeToPtr(10 * time.Second),
+		Enabled:    pointer.Of(true),
+		Attempts:   pointer.Of(5),
+		Backoff:    pointer.Of(5 * time.Second),
+		MaxBackoff: pointer.Of(10 * time.Second),
 	}
 
 	actual := mockRetryConfig()
-
-	require.Equal(t, *expected.Attempts, *actual.Attempts)
-	require.Equal(t, *expected.Backoff, *actual.Backoff)
-	require.Equal(t, *expected.MaxBackoff, *actual.MaxBackoff)
+	must.Eq(t, *expected.Attempts, *actual.Attempts)
+	must.Eq(t, *expected.Backoff, *actual.Backoff)
+	must.Eq(t, *expected.MaxBackoff, *actual.MaxBackoff)
 }

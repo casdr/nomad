@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package qemu
 
 import (
@@ -5,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -12,8 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coreos/go-semver/semver"
-	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
@@ -21,6 +24,7 @@ import (
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 )
@@ -38,11 +42,13 @@ const (
 
 	// Represents an ACPI shutdown request to the VM (emulates pressing a physical power button)
 	// Reference: https://en.wikibooks.org/wiki/QEMU/Monitor
+	// Use a short file name since socket paths have a maximum length.
 	qemuGracefulShutdownMsg = "system_powerdown\n"
-	qemuMonitorSocketName   = "qemu-monitor.sock"
+	qemuMonitorSocketName   = "qm.sock"
 
-	// Maximum socket path length prior to qemu 2.10.1
-	qemuLegacyMaxMonitorPathLen = 108
+	// Socket file enabling communication with the Qemu Guest Agent (if enabled and running)
+	// Use a short file name since socket paths have a maximum length.
+	qemuGuestAgentSocketName = "qa.sock"
 
 	// taskHandleVersion is the version of task handle which this driver sets
 	// and understands how to decode driver state
@@ -66,14 +72,6 @@ var (
 
 	versionRegex = regexp.MustCompile(`version (\d[\.\d+]+)`)
 
-	// Prior to qemu 2.10.1, monitor socket paths are truncated to 108 bytes.
-	// We should consider this if driver.qemu.version is < 2.10.1 and the
-	// generated monitor path is too long.
-	//
-	// Relevant fix is here:
-	// https://github.com/qemu/qemu/commit/ad9579aaa16d5b385922d49edac2c96c79bcfb6
-	qemuVersionLongSocketPathFix = semver.New("2.10.1")
-
 	// pluginInfo is the response returned for the PluginInfo RPC
 	pluginInfo = &base.PluginInfoResponse{
 		Type:              base.PluginTypeDriver,
@@ -92,8 +90,10 @@ var (
 	// a taskConfig within a job. It is returned in the TaskConfigSchema RPC
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
 		"image_path":        hclspec.NewAttr("image_path", "string", true),
+		"drive_interface":   hclspec.NewAttr("drive_interface", "string", false),
 		"accelerator":       hclspec.NewAttr("accelerator", "string", false),
 		"graceful_shutdown": hclspec.NewAttr("graceful_shutdown", "bool", false),
+		"guest_agent":       hclspec.NewAttr("guest_agent", "bool", false),
 		"args":              hclspec.NewAttr("args", "list(string)", false),
 		"port_map":          hclspec.NewAttr("port_map", "list(map(number))", false),
 	})
@@ -103,7 +103,7 @@ var (
 	capabilities = &drivers.Capabilities{
 		SendSignals: false,
 		Exec:        false,
-		FSIsolation: drivers.FSIsolationImage,
+		FSIsolation: fsisolation.Image,
 		NetIsolationModes: []drivers.NetIsolationMode{
 			drivers.NetIsolationModeHost,
 			drivers.NetIsolationModeGroup,
@@ -121,6 +121,8 @@ type TaskConfig struct {
 	Args             []string           `codec:"args"`     // extra arguments to qemu executable
 	PortMap          hclutils.MapStrInt `codec:"port_map"` // A map of host port and the port name defined in the image manifest file
 	GracefulShutdown bool               `codec:"graceful_shutdown"`
+	DriveInterface   string             `codec:"drive_interface"` // Use interface for image
+	GuestAgent       bool               `codec:"guest_agent"`
 }
 
 // TaskState is the state which is encoded in the handle returned in StartTask.
@@ -269,11 +271,6 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		return fmt.Errorf("error: handle cannot be nil")
 	}
 
-	// COMPAT(0.10): pre 0.9 upgrade path check
-	if handle.Version == 0 {
-		return d.recoverPre09Task(handle)
-	}
-
 	// If already attached to handle there's nothing to recover.
 	if _, ok := d.tasks.Get(handle.Config.ID); ok {
 		d.logger.Trace("nothing to recover; task already exists",
@@ -295,16 +292,37 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		return fmt.Errorf("failed to build ReattachConfig from taskConfig state: %v", err)
 	}
 
-	execImpl, pluginClient, err := executor.ReattachToExecutor(plugRC,
-		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID))
+	execImpl, pluginClient, err := executor.ReattachToExecutor(
+		plugRC,
+		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
+		d.nomadConfig.Topology.Compute(),
+	)
 	if err != nil {
 		d.logger.Error("failed to reattach to executor", "error", err, "task_id", handle.Config.ID)
 		return fmt.Errorf("failed to reattach to executor: %v", err)
 	}
 
+	// Try to restore monitor socket path.
+	taskDir := filepath.Join(handle.Config.AllocDir, handle.Config.Name)
+	possiblePaths := []string{
+		filepath.Join(taskDir, qemuMonitorSocketName),
+		// Support restoring tasks that used the old socket name.
+		filepath.Join(taskDir, "qemu-monitor.sock"),
+	}
+
+	var monitorPath string
+	for _, path := range possiblePaths {
+		if _, err := os.Stat(path); err == nil {
+			monitorPath = path
+			d.logger.Debug("found existing monitor socket", "monitor", monitorPath)
+			break
+		}
+	}
+
 	h := &taskHandle{
 		exec:         execImpl,
 		pid:          taskState.Pid,
+		monitorPath:  monitorPath,
 		pluginClient: pluginClient,
 		taskConfig:   taskState.TaskConfig,
 		procState:    drivers.TaskStateRunning,
@@ -337,6 +355,19 @@ func isAllowedImagePath(allowedPaths []string, allocDir, imagePath string) bool 
 	// check allowed paths
 	for _, ap := range allowedPaths {
 		if isParent(ap, imagePath) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hardcoded list of drive interfaces, Qemu currently supports
+var allowedDriveInterfaces = []string{"ide", "scsi", "sd", "mtd", "floppy", "pflash", "virtio", "none"}
+
+func isAllowedDriveInterface(driveInterface string) bool {
+	for _, ai := range allowedDriveInterfaces {
+		if driveInterface == ai {
 			return true
 		}
 	}
@@ -405,7 +436,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	mb := cfg.Resources.NomadResources.Memory.MemoryMB
 	if mb < 128 || mb > 4000000 {
-		return nil, nil, fmt.Errorf("Qemu memory assignment out of bounds")
+		return nil, nil, fmt.Errorf("QEMU memory assignment out of bounds")
 	}
 	mem := fmt.Sprintf("%dM", mb)
 
@@ -414,12 +445,20 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, err
 	}
 
+	driveInterface := "ide"
+	if driverConfig.DriveInterface != "" {
+		driveInterface = driverConfig.DriveInterface
+	}
+	if !isAllowedDriveInterface(driveInterface) {
+		return nil, nil, fmt.Errorf("Unsupported drive_interface")
+	}
+
 	args := []string{
 		absPath,
 		"-machine", "type=pc,accel=" + accelerator,
 		"-name", vmID,
 		"-m", mem,
-		"-drive", "file=" + vmPath,
+		"-drive", "file=" + vmPath + ",if=" + driveInterface,
 		"-nographic",
 	}
 
@@ -434,6 +473,8 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		}
 	}
 
+	taskDir := filepath.Join(cfg.AllocDir, cfg.Name)
+
 	var monitorPath string
 	if driverConfig.GracefulShutdown {
 		if runtime.GOOS == "windows" {
@@ -441,18 +482,27 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		}
 		// This socket will be used to manage the virtual machine (for example,
 		// to perform graceful shutdowns)
-		taskDir := filepath.Join(cfg.AllocDir, cfg.Name)
-		fingerPrint := d.buildFingerprint()
-		if fingerPrint.Attributes == nil {
-			return nil, nil, fmt.Errorf("unable to get qemu driver version from fingerprinted attributes")
-		}
-		monitorPath, err = d.getMonitorPath(taskDir, fingerPrint)
-		if err != nil {
-			d.logger.Debug("could not get qemu monitor path", "error", err)
+		monitorPath = filepath.Join(taskDir, qemuMonitorSocketName)
+		if err := validateSocketPath(monitorPath); err != nil {
 			return nil, nil, err
 		}
 		d.logger.Debug("got monitor path", "monitorPath", monitorPath)
 		args = append(args, "-monitor", fmt.Sprintf("unix:%s,server,nowait", monitorPath))
+	}
+
+	if driverConfig.GuestAgent {
+		if runtime.GOOS == "windows" {
+			return nil, nil, errors.New("QEMU Guest Agent socket is unsupported on the Windows platform")
+		}
+		// This socket will be used to communicate with the Guest Agent (if it's running)
+		agentSocketPath := filepath.Join(taskDir, qemuGuestAgentSocketName)
+		if err := validateSocketPath(agentSocketPath); err != nil {
+			return nil, nil, err
+		}
+
+		args = append(args, "-chardev", fmt.Sprintf("socket,path=%s,server,nowait,id=qga0", agentSocketPath))
+		args = append(args, "-device", "virtio-serial")
+		args = append(args, "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0")
 	}
 
 	// Add pass through arguments to qemu executable. A user can specify
@@ -510,12 +560,13 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 			)
 		}
 	}
-	d.logger.Debug("starting QemuVM command ", "args", strings.Join(args, " "))
+	d.logger.Debug("starting QEMU VM command ", "args", strings.Join(args, " "))
 
 	pluginLogFile := filepath.Join(cfg.TaskDir().Dir, fmt.Sprintf("%s-executor.out", cfg.Name))
 	executorConfig := &executor.ExecutorConfig{
 		LogFile:  pluginLogFile,
 		LogLevel: "debug",
+		Compute:  d.nomadConfig.Topology.Compute(),
 	}
 
 	execImpl, pluginClient, err := executor.CreateExecutor(
@@ -540,7 +591,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		pluginClient.Kill()
 		return nil, nil, err
 	}
-	d.logger.Debug("started new QemuVM", "ID", vmID)
+	d.logger.Debug("started new QEMU VM", "id", vmID)
 
 	h := &taskHandle{
 		exec:         execImpl,
@@ -602,6 +653,8 @@ func (d *Driver) StopTask(taskID string, timeout time.Duration, signal string) e
 		if err := sendQemuShutdown(d.logger, handle.monitorPath, handle.pid); err != nil {
 			d.logger.Debug("error sending graceful shutdown ", "pid", handle.pid, "error", err)
 		}
+	} else {
+		d.logger.Debug("monitor socket is empty, forcing shutdown")
 	}
 
 	// TODO(preetha) we are calling shutdown on the executor here
@@ -629,7 +682,7 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 
 	if !handle.pluginClient.Exited() {
 		if err := handle.exec.Shutdown("", 0); err != nil {
-			handle.logger.Error("destroying executor failed", "err", err)
+			handle.logger.Error("destroying executor failed", "error", err)
 		}
 
 		handle.pluginClient.Kill()
@@ -661,12 +714,12 @@ func (d *Driver) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, err
 	return d.eventer.TaskEvents(ctx)
 }
 
-func (d *Driver) SignalTask(taskID string, signal string) error {
-	return fmt.Errorf("Qemu driver can't signal commands")
+func (d *Driver) SignalTask(_ string, _ string) error {
+	return fmt.Errorf("QEMU driver can't signal commands")
 }
 
-func (d *Driver) ExecTask(taskID string, cmdArgs []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
-	return nil, fmt.Errorf("Qemu driver can't execute commands")
+func (d *Driver) ExecTask(_ string, _ []string, _ time.Duration) (*drivers.ExecTaskResult, error) {
+	return nil, fmt.Errorf("QEMU driver can't execute commands")
 
 }
 
@@ -691,8 +744,9 @@ func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *dr
 		}
 	} else {
 		result = &drivers.ExitResult{
-			ExitCode: ps.ExitCode,
-			Signal:   ps.Signal,
+			ExitCode:  ps.ExitCode,
+			Signal:    ps.Signal,
+			OOMKilled: ps.OOMKilled,
 		}
 	}
 
@@ -703,27 +757,16 @@ func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *dr
 	}
 }
 
-// getMonitorPath is used to determine whether a qemu monitor socket can be
-// safely created and accessed in the task directory by the version of qemu
-// present on the host. If it is safe to use, the socket's full path is
-// returned along with a nil error. Otherwise, an empty string is returned
-// along with a descriptive error.
-func (d *Driver) getMonitorPath(dir string, fingerPrint *drivers.Fingerprint) (string, error) {
-	var longPathSupport bool
-	currentQemuVer := fingerPrint.Attributes[driverVersionAttr]
-	currentQemuSemver := semver.New(currentQemuVer.GoString())
-	if currentQemuSemver.LessThan(*qemuVersionLongSocketPathFix) {
-		longPathSupport = false
-		d.logger.Debug("long socket paths are not available in this version of QEMU", "version", currentQemuVer)
-	} else {
-		longPathSupport = true
-		d.logger.Debug("long socket paths available in this version of QEMU", "version", currentQemuVer)
+// validateSocketPath provides best effort validation of socket paths since
+// some rules may be platform-dependant.
+func validateSocketPath(path string) error {
+	if maxSocketPathLen > 0 && len(path) > maxSocketPathLen {
+		return fmt.Errorf(
+			"socket path %s is longer than the maximum length allowed (%d), try to reduce the task name or Nomad's data_dir if possible.",
+			path, maxSocketPathLen)
 	}
-	fullSocketPath := fmt.Sprintf("%s/%s", dir, qemuMonitorSocketName)
-	if len(fullSocketPath) > qemuLegacyMaxMonitorPathLen && !longPathSupport {
-		return "", fmt.Errorf("monitor path is too long for this version of qemu")
-	}
-	return fullSocketPath, nil
+
+	return nil
 }
 
 // sendQemuShutdown attempts to issue an ACPI power-off command via the qemu

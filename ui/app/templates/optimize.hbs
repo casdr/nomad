@@ -1,3 +1,8 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 <Breadcrumb @crumb={{hash label="Recommendations" args=(array "optimize")}} />
 <PageLayout>
   <section class="section">
@@ -23,12 +28,7 @@
                 @label="Namespace"
                 @options={{this.optionsNamespaces}}
                 @selection={{this.qpNamespace}}
-                @onSelect={{action
-                  (queue
-                    (action this.cacheNamespace)
-                    (action this.setFacetQueryParam "qpNamespace")
-                  )
-                }}
+                @onSelect={{action this.setFacetQueryParam "qpNamespace"}}
               />
             {{/if}}
             <MultiSelectDropdown

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Component from '@ember/component';
 import { computed } from '@ember/object';
 import { tagName } from '@ember-decorators/component';
@@ -15,9 +20,9 @@ export default class LifecycleChartRow extends Component {
     return undefined;
   }
 
-  @computed('taskState.finishedAt')
+  @computed('taskState.state')
   get finishedClass() {
-    if (this.taskState && this.taskState.finishedAt) {
+    if (this.taskState && this.taskState.state === 'dead') {
       return 'is-finished';
     }
 

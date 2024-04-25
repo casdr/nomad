@@ -1,12 +1,18 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package structs
 
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
 	multierror "github.com/hashicorp/go-multierror"
+
 	"github.com/hashicorp/nomad/helper"
 )
 
@@ -18,11 +24,11 @@ const CSISocketName = "csi.sock"
 // where Nomad will expect plugins to create intermediary mounts for volumes.
 const CSIIntermediaryDirname = "volumes"
 
-// VolumeTypeCSI is the type in the volume stanza of a TaskGroup
+// VolumeTypeCSI is the type in the volume block of a TaskGroup
 const VolumeTypeCSI = "csi"
 
 // CSIPluginType is an enum string that encapsulates the valid options for a
-// CSIPlugin stanza's Type. These modes will allow the plugin to be used in
+// CSIPlugin block's Type. These modes will allow the plugin to be used in
 // different ways by the client.
 type CSIPluginType string
 
@@ -62,11 +68,39 @@ type TaskCSIPluginConfig struct {
 	// Type instructs Nomad on how to handle processing a plugin
 	Type CSIPluginType
 
-	// MountDir is the destination that nomad should mount in its CSI
-	// directory for the plugin. It will then expect a file called CSISocketName
-	// to be created by the plugin, and will provide references into
-	// "MountDir/CSIIntermediaryDirname/{VolumeName}/{AllocID} for mounts.
+	// MountDir is the directory (within its container) in which the plugin creates a
+	// socket (called CSISocketName) for communication with Nomad. Default is /csi.
 	MountDir string
+
+	// StagePublishBaseDir is the base directory (within its container) in which the plugin
+	// mounts volumes being staged and bind mount volumes being published.
+	// e.g. staging_target_path = {StagePublishBaseDir}/staging/{volume-id}/{usage-mode}
+	// e.g. target_path = {StagePublishBaseDir}/per-alloc/{alloc-id}/{volume-id}/{usage-mode}
+	// Default is /local/csi.
+	StagePublishBaseDir string
+
+	// HealthTimeout is the time after which the CSI plugin tasks will be killed
+	// if the CSI Plugin is not healthy.
+	HealthTimeout time.Duration `mapstructure:"health_timeout" hcl:"health_timeout,optional"`
+}
+
+func (t *TaskCSIPluginConfig) Equal(o *TaskCSIPluginConfig) bool {
+	if t == nil || o == nil {
+		return t == o
+	}
+	switch {
+	case t.ID != o.ID:
+		return false
+	case t.Type != o.Type:
+		return false
+	case t.MountDir != o.MountDir:
+		return false
+	case t.StagePublishBaseDir != o.StagePublishBaseDir:
+		return false
+	case t.HealthTimeout != o.HealthTimeout:
+		return false
+	}
+	return true
 }
 
 func (t *TaskCSIPluginConfig) Copy() *TaskCSIPluginConfig {
@@ -97,15 +131,6 @@ const (
 	CSIVolumeAttachmentModeFilesystem  CSIVolumeAttachmentMode = "file-system"
 )
 
-func ValidCSIVolumeAttachmentMode(attachmentMode CSIVolumeAttachmentMode) bool {
-	switch attachmentMode {
-	case CSIVolumeAttachmentModeBlockDevice, CSIVolumeAttachmentModeFilesystem:
-		return true
-	default:
-		return false
-	}
-}
-
 // CSIVolumeAccessMode indicates how a volume should be used in a storage topology
 // e.g whether the provider should make the volume available concurrently.
 type CSIVolumeAccessMode string
@@ -120,31 +145,6 @@ const (
 	CSIVolumeAccessModeMultiNodeSingleWriter CSIVolumeAccessMode = "multi-node-single-writer"
 	CSIVolumeAccessModeMultiNodeMultiWriter  CSIVolumeAccessMode = "multi-node-multi-writer"
 )
-
-// ValidCSIVolumeAccessMode checks to see that the provided access mode is a valid,
-// non-empty access mode.
-func ValidCSIVolumeAccessMode(accessMode CSIVolumeAccessMode) bool {
-	switch accessMode {
-	case CSIVolumeAccessModeSingleNodeReader, CSIVolumeAccessModeSingleNodeWriter,
-		CSIVolumeAccessModeMultiNodeReader, CSIVolumeAccessModeMultiNodeSingleWriter,
-		CSIVolumeAccessModeMultiNodeMultiWriter:
-		return true
-	default:
-		return false
-	}
-}
-
-// ValidCSIVolumeWriteAccessMode checks for a writable access mode.
-func ValidCSIVolumeWriteAccessMode(accessMode CSIVolumeAccessMode) bool {
-	switch accessMode {
-	case CSIVolumeAccessModeSingleNodeWriter,
-		CSIVolumeAccessModeMultiNodeSingleWriter,
-		CSIVolumeAccessModeMultiNodeMultiWriter:
-		return true
-	default:
-		return false
-	}
-}
 
 // CSIMountOptions contain optional additional configuration that can be used
 // when specifying that a Volume should be used with VolumeAccessTypeMount.
@@ -165,7 +165,7 @@ func (o *CSIMountOptions) Copy() *CSIMountOptions {
 	}
 
 	no := *o
-	no.MountFlags = helper.CopySliceString(o.MountFlags)
+	no.MountFlags = slices.Clone(o.MountFlags)
 	return &no
 }
 
@@ -188,13 +188,10 @@ func (o *CSIMountOptions) Equal(p *CSIMountOptions) bool {
 	if o == nil || p == nil {
 		return false
 	}
-
 	if o.FSType != p.FSType {
 		return false
 	}
-
-	return helper.CompareSliceSetString(
-		o.MountFlags, p.MountFlags)
+	return helper.SliceSetEq(o.MountFlags, p.MountFlags)
 }
 
 // CSIMountOptions implements the Stringer and GoStringer interfaces to prevent
@@ -297,9 +294,9 @@ type CSIVolume struct {
 	ReadAllocs  map[string]*Allocation // AllocID -> Allocation
 	WriteAllocs map[string]*Allocation // AllocID -> Allocation
 
-	ReadClaims  map[string]*CSIVolumeClaim // AllocID -> claim
-	WriteClaims map[string]*CSIVolumeClaim // AllocID -> claim
-	PastClaims  map[string]*CSIVolumeClaim // AllocID -> claim
+	ReadClaims  map[string]*CSIVolumeClaim `json:"-"` // AllocID -> claim
+	WriteClaims map[string]*CSIVolumeClaim `json:"-"` // AllocID -> claim
+	PastClaims  map[string]*CSIVolumeClaim `json:"-"` // AllocID -> claim
 
 	// Schedulable is true if all the denormalized plugin health fields are true, and the
 	// volume has not been marked for garbage collection
@@ -358,12 +355,15 @@ type CSIVolListStub struct {
 	Schedulable         bool
 	PluginID            string
 	Provider            string
+	ControllerRequired  bool
 	ControllersHealthy  int
 	ControllersExpected int
 	NodesHealthy        int
 	NodesExpected       int
-	CreateIndex         uint64
-	ModifyIndex         uint64
+	ResourceExhausted   time.Time
+
+	CreateIndex uint64
+	ModifyIndex uint64
 }
 
 // NewCSIVolume creates the volume struct. No side-effects
@@ -400,7 +400,7 @@ func (v *CSIVolume) RemoteID() string {
 }
 
 func (v *CSIVolume) Stub() *CSIVolListStub {
-	stub := CSIVolListStub{
+	return &CSIVolListStub{
 		ID:                  v.ID,
 		Namespace:           v.Namespace,
 		Name:                v.Name,
@@ -413,15 +413,15 @@ func (v *CSIVolume) Stub() *CSIVolListStub {
 		Schedulable:         v.Schedulable,
 		PluginID:            v.PluginID,
 		Provider:            v.Provider,
+		ControllerRequired:  v.ControllerRequired,
 		ControllersHealthy:  v.ControllersHealthy,
 		ControllersExpected: v.ControllersExpected,
 		NodesHealthy:        v.NodesHealthy,
 		NodesExpected:       v.NodesExpected,
+		ResourceExhausted:   v.ResourceExhausted,
 		CreateIndex:         v.CreateIndex,
 		ModifyIndex:         v.ModifyIndex,
 	}
-
-	return &stub
 }
 
 // ReadSchedulable determines if the volume is potentially schedulable
@@ -783,20 +783,6 @@ func (v *CSIVolume) Merge(other *CSIVolume) error {
 			"volume snapshot ID cannot be updated"))
 	}
 
-	// must be compatible with capacity range
-	// TODO: when ExpandVolume is implemented we'll need to update
-	// this logic https://github.com/hashicorp/nomad/issues/10324
-	if v.Capacity != 0 {
-		if other.RequestedCapacityMax < v.Capacity ||
-			other.RequestedCapacityMin > v.Capacity {
-			errs = multierror.Append(errs, errors.New(
-				"volume requested capacity update was not compatible with existing capacity"))
-		} else {
-			v.RequestedCapacityMin = other.RequestedCapacityMin
-			v.RequestedCapacityMax = other.RequestedCapacityMax
-		}
-	}
-
 	// must be compatible with volume_capabilities
 	if v.AccessMode != CSIVolumeAccessModeUnknown ||
 		v.AttachmentMode != CSIVolumeAttachmentModeUnknown {
@@ -827,16 +813,22 @@ func (v *CSIVolume) Merge(other *CSIVolume) error {
 		}
 	}
 
-	// MountOptions can be updated so long as the volume isn't in use,
-	// but the caller will reject updating an in-use volume
-	v.MountOptions = other.MountOptions
+	// MountOptions can be updated so long as the volume isn't in use
+	if v.InUse() {
+		if !v.MountOptions.Equal(other.MountOptions) {
+			errs = multierror.Append(errs, errors.New(
+				"can not update mount options while volume is in use"))
+		}
+	} else {
+		v.MountOptions = other.MountOptions
+	}
 
 	// Secrets can be updated freely
 	v.Secrets = other.Secrets
 
 	// must be compatible with parameters set by from CreateVolumeResponse
 
-	if len(other.Parameters) != 0 && !helper.CompareMapStringString(v.Parameters, other.Parameters) {
+	if len(other.Parameters) != 0 && !maps.Equal(v.Parameters, other.Parameters) {
 		errs = multierror.Append(errs, errors.New(
 			"volume parameters cannot be updated"))
 	}
@@ -879,10 +871,24 @@ type CSIVolumeCreateResponse struct {
 
 type CSIVolumeDeleteRequest struct {
 	VolumeIDs []string
+	Secrets   CSISecrets
 	WriteRequest
 }
 
 type CSIVolumeDeleteResponse struct {
+	QueryMeta
+}
+
+type CSIVolumeExpandRequest struct {
+	VolumeID             string
+	RequestedCapacityMin int64
+	RequestedCapacityMax int64
+	Secrets              CSISecrets
+	WriteRequest
+}
+
+type CSIVolumeExpandResponse struct {
+	CapacityBytes int64
 	QueryMeta
 }
 
@@ -961,7 +967,7 @@ type CSIVolumeListResponse struct {
 }
 
 // CSIVolumeExternalListRequest is a request to a controller plugin to list
-// all the volumes known to the the storage provider. This request is
+// all the volumes known to the storage provider. This request is
 // paginated by the plugin and accepts the QueryOptions.PerPage and
 // QueryOptions.NextToken fields
 type CSIVolumeExternalListRequest struct {
@@ -1049,7 +1055,7 @@ type CSISnapshotDeleteResponse struct {
 }
 
 // CSISnapshotListRequest is a request to a controller plugin to list all the
-// snapshot known to the the storage provider. This request is paginated by
+// snapshot known to the storage provider. This request is paginated by
 // the plugin and accepts the QueryOptions.PerPage and QueryOptions.NextToken
 // fields
 type CSISnapshotListRequest struct {

@@ -1,19 +1,31 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Service, { inject as service } from '@ember/service';
 import { computed } from '@ember/object';
 import { alias, reads } from '@ember/object/computed';
 import { getOwner } from '@ember/application';
 import { assign } from '@ember/polyfills';
-import { task } from 'ember-concurrency';
+import { task, timeout } from 'ember-concurrency';
 import queryString from 'query-string';
 import fetch from 'nomad-ui/utils/fetch';
 import classic from 'ember-classic-decorator';
+import moment from 'moment';
 
+const MINUTES_LEFT_AT_WARNING = 10;
+const EXPIRY_NOTIFICATION_TITLE = 'Your access is about to expire';
 @classic
 export default class TokenService extends Service {
   @service store;
   @service system;
+  @service router;
+  @service notifications;
 
   aclEnabled = true;
+
+  tokenNotFound = false;
 
   @computed
   get secret() {
@@ -31,11 +43,16 @@ export default class TokenService extends Service {
   @task(function* () {
     const TokenAdapter = getOwner(this).lookup('adapter:token');
     try {
-      return yield TokenAdapter.findSelf();
+      var token = yield TokenAdapter.findSelf();
+      this.secret = token.secret;
+      return token;
     } catch (e) {
       const errors = e.errors ? e.errors.mapBy('detail') : [];
       if (errors.find((error) => error === 'ACL support disabled')) {
         this.set('aclEnabled', false);
+      }
+      if (errors.find((error) => error === 'ACL token not found')) {
+        this.set('tokenNotFound', true);
       }
       return null;
     }
@@ -54,7 +71,24 @@ export default class TokenService extends Service {
   @task(function* () {
     try {
       if (this.selfToken) {
-        return yield this.selfToken.get('policies');
+        // return yield this.selfToken.get('policies');
+        let tokenPolicies = yield this.selfToken.get('policies');
+        let rolePolicies = [];
+        const roles = yield this.selfToken.get('roles');
+        if (roles.length) {
+          yield Promise.all(
+            roles.map((role) => {
+              return role.policies;
+            })
+          );
+          rolePolicies = roles
+            .map((role) => {
+              return role.policies;
+            })
+            .map((policies) => policies.toArray())
+            .flat();
+        }
+        return [...tokenPolicies.toArray(), ...rolePolicies];
       } else {
         let policy = yield this.store.findRecord('policy', 'anonymous');
         return [policy];
@@ -69,6 +103,7 @@ export default class TokenService extends Service {
 
   @task(function* () {
     yield this.fetchSelfToken.perform();
+    this.kickoffTokenTTLMonitoring();
     if (this.aclEnabled) {
       yield this.fetchSelfTokenPolicies.perform();
     }
@@ -107,7 +142,68 @@ export default class TokenService extends Service {
     this.fetchSelfToken.cancelAll({ resetState: true });
     this.fetchSelfTokenPolicies.cancelAll({ resetState: true });
     this.fetchSelfTokenAndPolicies.cancelAll({ resetState: true });
+    this.monitorTokenTime.cancelAll({ resetState: true });
+    window.localStorage.removeItem('nomadOIDCNonce');
+    window.localStorage.removeItem('nomadOIDCAuthMethod');
   }
+
+  kickoffTokenTTLMonitoring() {
+    this.monitorTokenTime.perform();
+  }
+
+  @task(function* () {
+    while (this.selfToken?.expirationTime) {
+      const diff = new Date(this.selfToken.expirationTime) - new Date();
+      // Let the user know at the 10 minute mark,
+      // or any time they refresh with under 10 minutes left
+      if (diff < 1000 * 60 * MINUTES_LEFT_AT_WARNING) {
+        const existingNotification = this.notifications.queue?.find(
+          (m) => m.title === EXPIRY_NOTIFICATION_TITLE
+        );
+        // For the sake of updating the "time left" message, we keep running the task down to the moment of expiration
+        if (diff > 0) {
+          if (existingNotification) {
+            existingNotification.set(
+              'message',
+              `Your token access expires ${moment(
+                this.selfToken.expirationTime
+              ).fromNow()}`
+            );
+          } else {
+            if (!this.expirationNotificationDismissed) {
+              this.notifications.add({
+                title: EXPIRY_NOTIFICATION_TITLE,
+                message: `Your token access expires ${moment(
+                  this.selfToken.expirationTime
+                ).fromNow()}`,
+                color: 'warning',
+                sticky: true,
+                customCloseAction: () => {
+                  this.set('expirationNotificationDismissed', true);
+                },
+                customAction: {
+                  label: 'Re-authenticate',
+                  action: () => {
+                    this.router.transitionTo('settings.tokens');
+                  },
+                },
+              });
+            }
+          }
+        } else {
+          if (existingNotification) {
+            existingNotification.setProperties({
+              title: 'Your access has expired',
+              message: `Your token will need to be re-authenticated`,
+            });
+          }
+          this.monitorTokenTime.cancelAll(); // Stop updating time left after expiration
+        }
+      }
+      yield timeout(1000);
+    }
+  })
+  monitorTokenTime;
 }
 
 function addParams(url, params) {

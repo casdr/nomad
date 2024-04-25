@@ -1,11 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/hashicorp/nomad/ci"
 	"github.com/mitchellh/cli"
+	"github.com/shoenig/test/must"
 )
 
 func TestMonitorCommand_Implements(t *testing.T) {
@@ -22,25 +25,30 @@ func TestMonitorCommand_Fails(t *testing.T) {
 	cmd := &MonitorCommand{Meta: Meta{Ui: ui}}
 
 	// Fails on misuse
-	if code := cmd.Run([]string{"some", "bad", "args"}); code != 1 {
-		t.Fatalf("exepected exit code 1, got: %d", code)
-	}
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, commandErrorText(cmd)) {
-		t.Fatalf("expected help output, got: %s", out)
-	}
+	code := cmd.Run([]string{"some", "bad", "args"})
+	must.One(t, code)
+
+	out := ui.ErrorWriter.String()
+	must.StrContains(t, out, commandErrorText(cmd))
 
 	ui.ErrorWriter.Reset()
 
-	if code := cmd.Run([]string{"-address=nope"}); code != 1 {
-		t.Fatalf("exepected exit code 1, got: %d", code)
-	}
+	code = cmd.Run([]string{"-address=nope"})
+	must.One(t, code)
 
 	// Fails on nonexistent node
-	if code := cmd.Run([]string{"-address=" + url, "-node-id=12345678-abcd-efab-cdef-123456789abc"}); code != 1 {
-		t.Fatalf("expected exit 1, got: %d", code)
-	}
-	if out := ui.ErrorWriter.String(); !strings.Contains(out, "No node(s) with prefix") {
-		t.Fatalf("expected not found error, got: %s", out)
-	}
+	code = cmd.Run([]string{"-address=" + url, "-node-id=12345678-abcd-efab-cdef-123456789abc"})
+	must.One(t, code)
+
+	out = ui.ErrorWriter.String()
+	must.StrContains(t, out, "No node(s) with prefix")
+
 	ui.ErrorWriter.Reset()
+
+	// Fails on passing a log-include-location flag which cannot be parsed.
+	code = cmd.Run([]string{"-address=" + url, "-log-include-location=maybe"})
+	must.One(t, code)
+
+	out = ui.ErrorWriter.String()
+	must.StrContains(t, out, `invalid boolean value "maybe" for -log-include-location`)
 }

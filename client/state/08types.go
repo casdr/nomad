@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state
 
 import (
@@ -16,7 +19,6 @@ import (
 // changed over the life-cycle of the alloc_runner in Nomad 0.8.
 //
 // https://github.com/hashicorp/nomad/blob/v0.8.6/client/alloc_runner.go#L146-L153
-//
 type allocRunnerMutableState08 struct {
 	// AllocClientStatus does not need to be upgraded as it is computed
 	// from task states.

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -11,6 +14,7 @@ import (
 
 	log "github.com/hashicorp/go-hclog"
 	memdb "github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/nomad/nomad/state"
 
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -68,10 +72,7 @@ func (s *Server) DispatchJob(job *structs.Job) (*structs.Evaluation, error) {
 			Namespace: job.Namespace,
 		},
 	}
-	fsmErr, index, err := s.raftApply(structs.JobRegisterRequestType, req)
-	if err, ok := fsmErr.(error); ok && err != nil {
-		return nil, err
-	}
+	_, index, err := s.raftApply(structs.JobRegisterRequestType, req)
 	if err != nil {
 		return nil, err
 	}
@@ -79,40 +80,19 @@ func (s *Server) DispatchJob(job *structs.Job) (*structs.Evaluation, error) {
 	eval.CreateIndex = index
 	eval.ModifyIndex = index
 
-	// COMPAT(1.1): Remove in 1.1.0 - 0.12.1 introduced atomic eval job registration
-	if !ServersMeetMinimumVersion(s.Members(), minJobRegisterAtomicEvalVersion, false) {
-		// Create a new evaluation
-		eval.JobModifyIndex = index
-		update := &structs.EvalUpdateRequest{
-			Evals: []*structs.Evaluation{eval},
-		}
-
-		// Commit this evaluation via Raft
-		// There is a risk of partial failure where the JobRegister succeeds
-		// but that the EvalUpdate does not, before Nomad 0.12.1
-		_, evalIndex, err := s.raftApply(structs.EvalUpdateRequestType, update)
-		if err != nil {
-			return nil, err
-		}
-
-		// Update its indexes.
-		eval.CreateIndex = evalIndex
-		eval.ModifyIndex = evalIndex
-	}
-
 	return eval, nil
 }
 
 // RunningChildren checks whether the passed job has any running children.
 func (s *Server) RunningChildren(job *structs.Job) (bool, error) {
-	state, err := s.fsm.State().Snapshot()
+	snap, err := s.fsm.State().Snapshot()
 	if err != nil {
 		return false, err
 	}
 
 	ws := memdb.NewWatchSet()
 	prefix := fmt.Sprintf("%s%s", job.ID, structs.PeriodicLaunchSuffix)
-	iter, err := state.JobsByIDPrefix(ws, job.Namespace, prefix)
+	iter, err := snap.JobsByIDPrefix(ws, job.Namespace, prefix, state.SortDefault)
 	if err != nil {
 		return false, err
 	}
@@ -127,7 +107,7 @@ func (s *Server) RunningChildren(job *structs.Job) (bool, error) {
 		}
 
 		// Get the childs evaluations.
-		evals, err := state.EvalsByJob(ws, child.Namespace, child.ID)
+		evals, err := snap.EvalsByJob(ws, child.Namespace, child.ID)
 		if err != nil {
 			return false, err
 		}
@@ -138,7 +118,7 @@ func (s *Server) RunningChildren(job *structs.Job) (bool, error) {
 				return true, nil
 			}
 
-			allocs, err := state.AllocsByEval(ws, eval.ID)
+			allocs, err := snap.AllocsByEval(ws, eval.ID)
 			if err != nil {
 				return false, err
 			}
@@ -298,9 +278,9 @@ func (p *PeriodicDispatch) removeLocked(jobID structs.NamespacedID) error {
 	return nil
 }
 
-// ForceRun causes the periodic job to be evaluated immediately and returns the
+// ForceEval causes the periodic job to be evaluated immediately and returns the
 // subsequent eval.
-func (p *PeriodicDispatch) ForceRun(namespace, jobID string) (*structs.Evaluation, error) {
+func (p *PeriodicDispatch) ForceEval(namespace, jobID string) (*structs.Evaluation, error) {
 	p.l.Lock()
 
 	// Do nothing if not enabled

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import {
   attribute,
   create,
@@ -62,6 +67,22 @@ export default create({
         text: text(),
         link: property('href'),
       },
+
+      signInLink: {
+        scope: '[data-test-header-signin-link]',
+        text: text(),
+        link: property('href'),
+      },
+
+      profileDropdown: {
+        scope: '[data-test-header-profile-dropdown]',
+        text: text(),
+        open: clickable(),
+        options: collection('.dropdown-label', {
+          label: text(),
+          choose: clickable(),
+        }),
+      },
     },
   },
 
@@ -71,6 +92,10 @@ export default create({
 
     optimize: {
       scope: '[data-test-gutter-link="optimize"]',
+    },
+
+    variables: {
+      scope: '[data-test-gutter-link="variables"]',
     },
 
     visitClients: clickable('[data-test-gutter-link="clients"]'),
@@ -102,5 +127,9 @@ export default create({
 
     isDanger: hasClass('is-danger', '[data-test-inline-error]'),
     isWarning: hasClass('is-warning', '[data-test-inline-error]'),
+  },
+
+  keyboard: {
+    modalShown: isPresent('.keyboard-shortcuts'),
   },
 });

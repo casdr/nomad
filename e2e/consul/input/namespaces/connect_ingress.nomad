@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "connect_ingress" {
   datacenters = ["dc1"]
   type        = "service"
@@ -97,7 +100,7 @@ job "connect_ingress" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/uuid-api:v3"
+        image        = "hashicorpdev/uuid-api:v3"
         network_mode = "host"
       }
 
@@ -130,7 +133,7 @@ job "connect_ingress" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/uuid-api:v3"
+        image        = "hashicorpdev/uuid-api:v3"
         network_mode = "host"
       }
 

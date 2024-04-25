@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package exec
 
 import (
@@ -9,18 +12,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/nomad/client/lib/cgutil"
-	"github.com/hashicorp/nomad/drivers/shared/capabilities"
-
 	"github.com/hashicorp/consul-template/signals"
 	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
+	"github.com/hashicorp/nomad/client/lib/cpustats"
+	"github.com/hashicorp/nomad/drivers/shared/capabilities"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/drivers/shared/resolvconf"
-	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/drivers/utils"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
@@ -97,7 +101,7 @@ var (
 	driverCapabilities = &drivers.Capabilities{
 		SendSignals: true,
 		Exec:        true,
-		FSIsolation: drivers.FSIsolationChroot,
+		FSIsolation: fsisolation.Chroot,
 		NetIsolationModes: []drivers.NetIsolationMode{
 			drivers.NetIsolationModeHost,
 			drivers.NetIsolationModeGroup,
@@ -133,6 +137,9 @@ type Driver struct {
 	// whether it has been successful
 	fingerprintSuccess *bool
 	fingerprintLock    sync.Mutex
+
+	// compute contains cpu compute information
+	compute cpustats.Compute
 }
 
 // Config is the driver configuration set by the SetConfig RPC call
@@ -248,14 +255,14 @@ func NewExecDriver(ctx context.Context, logger hclog.Logger) drivers.DriverPlugi
 // setFingerprintSuccess marks the driver as having fingerprinted successfully
 func (d *Driver) setFingerprintSuccess() {
 	d.fingerprintLock.Lock()
-	d.fingerprintSuccess = helper.BoolToPtr(true)
+	d.fingerprintSuccess = pointer.Of(true)
 	d.fingerprintLock.Unlock()
 }
 
 // setFingerprintFailure marks the driver as having failed fingerprinting
 func (d *Driver) setFingerprintFailure() {
 	d.fingerprintLock.Lock()
-	d.fingerprintSuccess = helper.BoolToPtr(false)
+	d.fingerprintSuccess = pointer.Of(false)
 	d.fingerprintLock.Unlock()
 }
 
@@ -290,6 +297,7 @@ func (d *Driver) SetConfig(cfg *base.Config) error {
 
 	if cfg != nil && cfg.AgentConfig != nil {
 		d.nomadConfig = cfg.AgentConfig.Driver
+		d.compute = cfg.AgentConfig.Compute()
 	}
 	return nil
 }
@@ -348,20 +356,9 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		return fp
 	}
 
-	mount, err := cgutil.FindCgroupMountpointDir()
-	if err != nil {
+	if cgroupslib.GetMode() == cgroupslib.OFF {
 		fp.Health = drivers.HealthStateUnhealthy
 		fp.HealthDescription = drivers.NoCgroupMountMessage
-		if d.fingerprintSuccessful() {
-			d.logger.Warn(fp.HealthDescription, "error", err)
-		}
-		d.setFingerprintFailure()
-		return fp
-	}
-
-	if mount == "" {
-		fp.Health = drivers.HealthStateUnhealthy
-		fp.HealthDescription = drivers.CgroupMountEmpty
 		d.setFingerprintFailure()
 		return fp
 	}
@@ -374,11 +371,6 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 	if handle == nil {
 		return fmt.Errorf("handle cannot be nil")
-	}
-
-	// COMPAT(0.10): pre 0.9 upgrade path check
-	if handle.Version == 0 {
-		return d.recoverPre09Task(handle)
 	}
 
 	// If already attached to handle there's nothing to recover.
@@ -404,8 +396,11 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		return fmt.Errorf("failed to build ReattachConfig from task state: %v", err)
 	}
 
-	exec, pluginClient, err := executor.ReattachToExecutor(plugRC,
-		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID))
+	exec, pluginClient, err := executor.ReattachToExecutor(
+		plugRC,
+		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
+		d.compute,
+	)
 	if err != nil {
 		d.logger.Error("failed to reattach to executor", "error", err, "task_id", handle.Config.ID)
 		return fmt.Errorf("failed to reattach to executor: %v", err)
@@ -451,6 +446,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		LogFile:     pluginLogFile,
 		LogLevel:    "debug",
 		FSIsolation: true,
+		Compute:     d.compute,
 	}
 
 	exec, pluginClient, err := executor.CreateExecutor(
@@ -557,8 +553,9 @@ func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *dr
 		}
 	} else {
 		result = &drivers.ExitResult{
-			ExitCode: ps.ExitCode,
-			Signal:   ps.Signal,
+			ExitCode:  ps.ExitCode,
+			Signal:    ps.Signal,
+			OOMKilled: ps.OOMKilled,
 		}
 	}
 
@@ -599,7 +596,7 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 
 	if !handle.pluginClient.Exited() {
 		if err := handle.exec.Shutdown("", 0); err != nil {
-			handle.logger.Error("destroying executor failed", "err", err)
+			handle.logger.Error("destroying executor failed", "error", err)
 		}
 
 		handle.pluginClient.Kill()

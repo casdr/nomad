@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 # This file was used to generate basic.json from https://www.hcl2json.com/
 region = "foobar"
 
@@ -14,6 +17,8 @@ log_level = "ERR"
 log_json = true
 
 log_file = "/var/log/nomad.log"
+
+log_include_location = true
 
 bind_addr = "192.168.0.1"
 
@@ -37,11 +42,12 @@ advertise {
 }
 
 client {
-  enabled    = true
-  state_dir  = "/tmp/client-state"
-  alloc_dir  = "/tmp/alloc"
-  servers    = ["a.b.c:80", "127.0.0.1:1234"]
-  node_class = "linux-medium-64bit"
+  enabled          = true
+  state_dir        = "/tmp/client-state"
+  alloc_dir        = "/tmp/alloc"
+  alloc_mounts_dir = "/tmp/mounts"
+  servers          = ["a.b.c:80", "127.0.0.1:1234"]
+  node_class       = "linux-medium-64bit"
 
   meta {
     foo = "bar"
@@ -114,8 +120,10 @@ server {
   job_gc_threshold              = "12h"
   eval_gc_threshold             = "12h"
   deployment_gc_threshold       = "12h"
+  csi_volume_claim_gc_interval  = "3m"
   csi_volume_claim_gc_threshold = "12h"
   csi_plugin_gc_threshold       = "12h"
+  acl_token_gc_threshold        = "12h"
   heartbeat_grace               = "30s"
   min_heartbeat_ttl             = "33s"
   max_heartbeats_per_second     = 11.0
@@ -132,6 +140,14 @@ server {
   raft_multiplier               = 4
   enable_event_broker           = false
   event_buffer_size             = 200
+  job_default_priority          = 100
+  job_max_priority              = 200
+
+  plan_rejection_tracker {
+    enabled        = true
+    node_threshold = 100
+    node_window    = "41m"
+  }
 
   server_join {
     retry_join     = ["1.1.1.1", "2.2.2.2"]
@@ -153,10 +169,13 @@ server {
 }
 
 acl {
-  enabled           = true
-  token_ttl         = "60s"
-  policy_ttl        = "60s"
-  replication_token = "foobar"
+  enabled                  = true
+  token_ttl                = "60s"
+  policy_ttl               = "60s"
+  role_ttl                 = "60s"
+  token_min_expiration_ttl = "1h"
+  token_max_expiration_ttl = "100h"
+  replication_token        = "foobar"
 }
 
 audit {
@@ -181,13 +200,15 @@ audit {
 }
 
 telemetry {
-  statsite_address           = "127.0.0.1:1234"
-  statsd_address             = "127.0.0.1:2345"
-  prometheus_metrics         = true
-  disable_hostname           = true
-  collection_interval        = "3s"
-  publish_allocation_metrics = true
-  publish_node_metrics       = true
+  in_memory_collection_interval = "1m"
+  in_memory_retention_period    = "24h"
+  statsite_address              = "127.0.0.1:1234"
+  statsd_address                = "127.0.0.1:2345"
+  prometheus_metrics            = true
+  disable_hostname              = true
+  collection_interval           = "3s"
+  publish_allocation_metrics    = true
+  publish_node_metrics          = true
 }
 
 leave_on_interrupt = true
@@ -226,6 +247,23 @@ consul {
   client_auto_join       = true
   auto_advertise         = true
   checks_use_advertise   = true
+  timeout                = "5s"
+  service_auth_method    = "nomad-services"
+  task_auth_method       = "nomad-tasks"
+
+  service_identity {
+    aud  = ["consul.io", "nomad.dev"]
+    env  = false
+    file = true
+    ttl  = "1h"
+  }
+
+  task_identity {
+    aud  = ["consul.io"]
+    env  = true
+    file = false
+    ttl  = "2h"
+  }
 }
 
 vault {
@@ -241,6 +279,14 @@ vault {
   tls_server_name       = "foobar"
   tls_skip_verify       = true
   create_from_role      = "test_role"
+  jwt_auth_backend_path = "nomad_jwt"
+
+  default_identity {
+    aud  = ["vault.io", "nomad.io"]
+    env  = false
+    file = true
+    ttl  = "3h"
+  }
 }
 
 tls {
@@ -295,5 +341,11 @@ plugin "docker" {
 plugin "exec" {
   config {
     foo = true
+  }
+}
+
+reporting {
+  license {
+    enabled = true
   }
 }

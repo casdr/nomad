@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { computed } from '@ember/object';
 import Model from '@ember-data/model';
 import { attr, belongsTo, hasMany } from '@ember-data/model';
@@ -42,8 +47,6 @@ export default class Volume extends Model {
 
   @computed('plainId')
   get idWithNamespace() {
-    // does this handle default namespace -- I think the backend handles this for us
-    // but the client would always need to recreate that logic
     return `${this.plainId}@${this.belongsTo('namespace').id()}`;
   }
 

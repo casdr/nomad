@@ -1,7 +1,17 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package scheduler
 
+// The structs and helpers in this file are split out of reconciler.go for code
+// manageability and should not be shared to the system schedulers! If you need
+// something here for system/sysbatch jobs, double-check it's safe to use for
+// all scheduler types before moving it into util.go
+
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -209,17 +219,89 @@ func (a allocSet) fromKeys(keys ...[]string) allocSet {
 }
 
 // filterByTainted takes a set of tainted nodes and filters the allocation set
-// into three groups:
+// into the following groups:
 // 1. Those that exist on untainted nodes
 // 2. Those exist on nodes that are draining
-// 3. Those that exist on lost nodes
-func (a allocSet) filterByTainted(taintedNodes map[string]*structs.Node) (untainted, migrate, lost allocSet) {
+// 3. Those that exist on lost nodes or have expired
+// 4. Those that are on nodes that are disconnected, but have not had their ClientState set to unknown
+// 5. Those that are on a node that has reconnected.
+// 6. Those that are in a state that results in a noop.
+func (a allocSet) filterByTainted(taintedNodes map[string]*structs.Node, serverSupportsDisconnectedClients bool, now time.Time) (untainted, migrate, lost, disconnecting, reconnecting, ignore, expiring allocSet) {
 	untainted = make(map[string]*structs.Allocation)
 	migrate = make(map[string]*structs.Allocation)
 	lost = make(map[string]*structs.Allocation)
+	disconnecting = make(map[string]*structs.Allocation)
+	reconnecting = make(map[string]*structs.Allocation)
+	ignore = make(map[string]*structs.Allocation)
+	expiring = make(map[string]*structs.Allocation)
+
 	for _, alloc := range a {
-		// Terminal allocs are always untainted as they should never be migrated
-		if alloc.TerminalStatus() {
+		// make sure we don't apply any reconnect logic to task groups
+		// without max_client_disconnect
+		supportsDisconnectedClients := alloc.SupportsDisconnectedClients(serverSupportsDisconnectedClients)
+
+		reconnect := false
+
+		// Only compute reconnect for unknown, running, and failed since they
+		// need to go through the reconnect logic.
+		if supportsDisconnectedClients &&
+			(alloc.ClientStatus == structs.AllocClientStatusUnknown ||
+				alloc.ClientStatus == structs.AllocClientStatusRunning ||
+				alloc.ClientStatus == structs.AllocClientStatusFailed) {
+			reconnect = alloc.NeedsToReconnect()
+		}
+
+		// Failed allocs that need to be reconnected must be added to
+		// reconnecting so that they can be handled as a failed reconnect.
+		if supportsDisconnectedClients &&
+			reconnect &&
+			alloc.DesiredStatus == structs.AllocDesiredStatusRun &&
+			alloc.ClientStatus == structs.AllocClientStatusFailed {
+			reconnecting[alloc.ID] = alloc
+			continue
+		}
+
+		taintedNode, nodeIsTainted := taintedNodes[alloc.NodeID]
+		if taintedNode != nil && taintedNode.Status == structs.NodeStatusDisconnected {
+			// Group disconnecting
+			if supportsDisconnectedClients {
+				// Filter running allocs on a node that is disconnected to be marked as unknown.
+				if alloc.ClientStatus == structs.AllocClientStatusRunning {
+					disconnecting[alloc.ID] = alloc
+					continue
+				}
+				// Filter pending allocs on a node that is disconnected to be marked as lost.
+				if alloc.ClientStatus == structs.AllocClientStatusPending {
+					lost[alloc.ID] = alloc
+					continue
+				}
+
+			} else {
+				if alloc.PreventRescheduleOnDisconnect() {
+					if alloc.ClientStatus == structs.AllocClientStatusRunning {
+						disconnecting[alloc.ID] = alloc
+						continue
+					}
+
+					untainted[alloc.ID] = alloc
+					continue
+				}
+
+				lost[alloc.ID] = alloc
+				continue
+			}
+		}
+
+		if alloc.TerminalStatus() && !reconnect {
+			// Server-terminal allocs, if supportsDisconnectedClient and not reconnect,
+			// are probably stopped replacements and should be ignored
+			if supportsDisconnectedClients && alloc.ServerTerminalStatus() {
+				ignore[alloc.ID] = alloc
+				continue
+			}
+
+			// Terminal allocs, if not reconnect, are always untainted as they
+			// should never be migrated.
 			untainted[alloc.ID] = alloc
 			continue
 		}
@@ -230,15 +312,68 @@ func (a allocSet) filterByTainted(taintedNodes map[string]*structs.Node) (untain
 			continue
 		}
 
-		taintedNode, ok := taintedNodes[alloc.NodeID]
-		if !ok {
-			// Node is untainted so alloc is untainted
+		if supportsDisconnectedClients && alloc.Expired(now) {
+			expiring[alloc.ID] = alloc
+			continue
+		}
+
+		// Acknowledge unknown allocs that we want to reconnect eventually.
+		if supportsDisconnectedClients &&
+			alloc.ClientStatus == structs.AllocClientStatusUnknown &&
+			alloc.DesiredStatus == structs.AllocDesiredStatusRun {
+			untainted[alloc.ID] = alloc
+			continue
+		}
+
+		// Ignore failed allocs that need to be reconnected and that have been
+		// marked to stop by the server.
+		if supportsDisconnectedClients &&
+			reconnect &&
+			alloc.ClientStatus == structs.AllocClientStatusFailed &&
+			alloc.DesiredStatus == structs.AllocDesiredStatusStop {
+			ignore[alloc.ID] = alloc
+			continue
+		}
+
+		if !nodeIsTainted || (taintedNode != nil && taintedNode.Status == structs.NodeStatusReady) {
+			// Filter allocs on a node that is now re-connected to be resumed.
+			if reconnect {
+				// Expired unknown allocs should be processed depending on the max client disconnect
+				// and/or avoid reschedule on lost configurations, they are both treated as
+				// expiring.
+				if alloc.Expired(now) {
+					expiring[alloc.ID] = alloc
+					continue
+				}
+
+				reconnecting[alloc.ID] = alloc
+				continue
+			}
+
+			// Otherwise, Node is untainted so alloc is untainted
 			untainted[alloc.ID] = alloc
 			continue
 		}
 
 		// Allocs on GC'd (nil) or lost nodes are Lost
-		if taintedNode == nil || taintedNode.TerminalStatus() {
+		if taintedNode == nil {
+			lost[alloc.ID] = alloc
+			continue
+		}
+
+		// Allocs on terminal nodes that can't be rescheduled need to be treated
+		// differently than those that can.
+		if taintedNode.TerminalStatus() {
+			if alloc.PreventRescheduleOnDisconnect() {
+				if alloc.ClientStatus == structs.AllocClientStatusUnknown {
+					untainted[alloc.ID] = alloc
+					continue
+				} else if alloc.ClientStatus == structs.AllocClientStatusRunning {
+					disconnecting[alloc.ID] = alloc
+					continue
+				}
+			}
+
 			lost[alloc.ID] = alloc
 			continue
 		}
@@ -246,6 +381,7 @@ func (a allocSet) filterByTainted(taintedNodes map[string]*structs.Node) (untain
 		// All other allocs are untainted
 		untainted[alloc.ID] = alloc
 	}
+
 	return
 }
 
@@ -253,45 +389,57 @@ func (a allocSet) filterByTainted(taintedNodes map[string]*structs.Node) (untain
 // untainted or a set of allocations that must be rescheduled now. Allocations that can be rescheduled
 // at a future time are also returned so that we can create follow up evaluations for them. Allocs are
 // skipped or considered untainted according to logic defined in shouldFilter method.
-func (a allocSet) filterByRescheduleable(isBatch bool, now time.Time, evalID string, deployment *structs.Deployment) (untainted, rescheduleNow allocSet, rescheduleLater []*delayedRescheduleInfo) {
-	untainted = make(map[string]*structs.Allocation)
-	rescheduleNow = make(map[string]*structs.Allocation)
+func (a allocSet) filterByRescheduleable(isBatch, isDisconnecting bool, now time.Time, evalID string, deployment *structs.Deployment) (allocSet, allocSet, []*delayedRescheduleInfo) {
+	untainted := make(map[string]*structs.Allocation)
+	rescheduleNow := make(map[string]*structs.Allocation)
+	rescheduleLater := []*delayedRescheduleInfo{}
 
 	for _, alloc := range a {
+		// Ignore disconnecting allocs that are already unknown. This can happen
+		// in the case of canaries that are interrupted by a disconnect.
+		if isDisconnecting && alloc.ClientStatus == structs.AllocClientStatusUnknown {
+			continue
+		}
+
 		var eligibleNow, eligibleLater bool
 		var rescheduleTime time.Time
 
-		// Ignore failing allocs that have already been rescheduled
-		// only failed allocs should be rescheduled, but protect against a bug allowing rescheduling
-		// running allocs
+		// Ignore failing allocs that have already been rescheduled.
+		// Only failed or disconnecting allocs should be rescheduled.
+		// Protects against a bug allowing rescheduling running allocs.
 		if alloc.NextAllocation != "" && alloc.TerminalStatus() {
 			continue
 		}
 
 		isUntainted, ignore := shouldFilter(alloc, isBatch)
-		if isUntainted {
+		if isUntainted && !isDisconnecting {
 			untainted[alloc.ID] = alloc
 		}
-		if isUntainted || ignore {
+
+		if ignore {
 			continue
 		}
 
-		// Only failed allocs with desired state run get to this point
-		// If the failed alloc is not eligible for rescheduling now we add it to the untainted set
-		eligibleNow, eligibleLater, rescheduleTime = updateByReschedulable(alloc, now, evalID, deployment)
-		if !eligibleNow {
-			untainted[alloc.ID] = alloc
-			if eligibleLater {
-				rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, alloc, rescheduleTime})
-			}
-		} else {
+		eligibleNow, eligibleLater, rescheduleTime = updateByReschedulable(alloc, now, evalID, deployment, isDisconnecting)
+		if eligibleNow {
 			rescheduleNow[alloc.ID] = alloc
+			continue
 		}
+
+		// If the failed alloc is not eligible for rescheduling now we
+		// add it to the untainted set.
+		untainted[alloc.ID] = alloc
+
+		if eligibleLater {
+			rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, alloc, rescheduleTime})
+		}
+
 	}
-	return
+	return untainted, rescheduleNow, rescheduleLater
 }
 
-// shouldFilter returns whether the alloc should be ignored or considered untainted
+// shouldFilter returns whether the alloc should be ignored or considered untainted.
+//
 // Ignored allocs are filtered out.
 // Untainted allocs count against the desired total.
 // Filtering logic for batch jobs:
@@ -308,40 +456,40 @@ func shouldFilter(alloc *structs.Allocation, isBatch bool) (untainted, ignore bo
 	// complete but not failed, they shouldn't be replaced.
 	if isBatch {
 		switch alloc.DesiredStatus {
-		case structs.AllocDesiredStatusStop, structs.AllocDesiredStatusEvict:
+		case structs.AllocDesiredStatusStop:
 			if alloc.RanSuccessfully() {
 				return true, false
 			}
 			return false, true
-		default:
+		case structs.AllocDesiredStatusEvict:
+			return false, true
 		}
 
 		switch alloc.ClientStatus {
 		case structs.AllocClientStatusFailed:
-		default:
-			return true, false
+			return false, false
 		}
-		return false, false
+
+		return true, false
 	}
 
 	// Handle service jobs
 	switch alloc.DesiredStatus {
 	case structs.AllocDesiredStatusStop, structs.AllocDesiredStatusEvict:
 		return false, true
-	default:
 	}
 
 	switch alloc.ClientStatus {
 	case structs.AllocClientStatusComplete, structs.AllocClientStatusLost:
 		return false, true
-	default:
 	}
+
 	return false, false
 }
 
 // updateByReschedulable is a helper method that encapsulates logic for whether a failed allocation
 // should be rescheduled now, later or left in the untainted set
-func updateByReschedulable(alloc *structs.Allocation, now time.Time, evalID string, d *structs.Deployment) (rescheduleNow, rescheduleLater bool, rescheduleTime time.Time) {
+func updateByReschedulable(alloc *structs.Allocation, now time.Time, evalID string, d *structs.Deployment, isDisconnecting bool) (rescheduleNow, rescheduleLater bool, rescheduleTime time.Time) {
 	// If the allocation is part of an ongoing active deployment, we only allow it to reschedule
 	// if it has been marked eligible
 	if d != nil && alloc.DeploymentID == d.ID && d.Active() && !alloc.DesiredTransition.ShouldReschedule() {
@@ -354,14 +502,28 @@ func updateByReschedulable(alloc *structs.Allocation, now time.Time, evalID stri
 	}
 
 	// Reschedule if the eval ID matches the alloc's followup evalID or if its close to its reschedule time
-	rescheduleTime, eligible := alloc.NextRescheduleTime()
+	var eligible bool
+	switch {
+	case isDisconnecting:
+		rescheduleTime, eligible = alloc.RescheduleTimeOnDisconnect(now)
+
+	case alloc.ClientStatus == structs.AllocClientStatusUnknown && alloc.FollowupEvalID == evalID:
+		lastDisconnectTime := alloc.LastUnknown()
+		rescheduleTime, eligible = alloc.NextRescheduleTimeByTime(lastDisconnectTime)
+
+	default:
+		rescheduleTime, eligible = alloc.NextRescheduleTime()
+	}
+
 	if eligible && (alloc.FollowupEvalID == evalID || rescheduleTime.Sub(now) <= rescheduleWindowSize) {
 		rescheduleNow = true
 		return
 	}
-	if eligible && alloc.FollowupEvalID == "" {
+
+	if eligible && (alloc.FollowupEvalID == "" || isDisconnecting) {
 		rescheduleLater = true
 	}
+
 	return
 }
 
@@ -392,7 +554,7 @@ func (a allocSet) filterByDeployment(id string) (match, nonmatch allocSet) {
 }
 
 // delayByStopAfterClientDisconnect returns a delay for any lost allocation that's got a
-// stop_after_client_disconnect configured
+// disconnect.stop_on_client_after configured
 func (a allocSet) delayByStopAfterClientDisconnect() (later []*delayedRescheduleInfo) {
 	now := time.Now().UTC()
 	for _, a := range a {
@@ -413,30 +575,86 @@ func (a allocSet) delayByStopAfterClientDisconnect() (later []*delayedReschedule
 	return later
 }
 
+// delayByMaxClientDisconnect returns a delay for any unknown allocation
+// that's got a max_client_reconnect configured
+func (a allocSet) delayByMaxClientDisconnect(now time.Time) ([]*delayedRescheduleInfo, error) {
+	var later []*delayedRescheduleInfo
+
+	for _, alloc := range a {
+		timeout := alloc.DisconnectTimeout(now)
+		if !timeout.After(now) {
+			return nil, errors.New("unable to computing disconnecting timeouts")
+		}
+
+		later = append(later, &delayedRescheduleInfo{
+			allocID:        alloc.ID,
+			alloc:          alloc,
+			rescheduleTime: timeout,
+		})
+	}
+
+	return later, nil
+}
+
+// filterOutByClientStatus returns all allocs from the set without the specified client status.
+func (a allocSet) filterOutByClientStatus(clientStatuses ...string) allocSet {
+	allocs := make(allocSet)
+	for _, alloc := range a {
+		if !slices.Contains(clientStatuses, alloc.ClientStatus) {
+			allocs[alloc.ID] = alloc
+		}
+	}
+
+	return allocs
+}
+
+// filterByClientStatus returns allocs from the set with the specified client status.
+func (a allocSet) filterByClientStatus(clientStatus string) allocSet {
+	allocs := make(allocSet)
+	for _, alloc := range a {
+		if alloc.ClientStatus == clientStatus {
+			allocs[alloc.ID] = alloc
+		}
+	}
+
+	return allocs
+}
+
 // allocNameIndex is used to select allocation names for placement or removal
 // given an existing set of placed allocations.
 type allocNameIndex struct {
 	job, taskGroup string
 	count          int
 	b              structs.Bitmap
+
+	// duplicates is used to store duplicate allocation indexes which are
+	// currently present within the index tracking. The map key is the index,
+	// and the current count of duplicates. The map is only accessed within a
+	// single routine and multiple times per job scheduler invocation,
+	// therefore no lock is used.
+	duplicates map[uint]int
 }
 
 // newAllocNameIndex returns an allocNameIndex for use in selecting names of
 // allocations to create or stop. It takes the job and task group name, desired
 // count and any existing allocations as input.
 func newAllocNameIndex(job, taskGroup string, count int, in allocSet) *allocNameIndex {
+
+	bitMap, duplicates := bitmapFrom(in, uint(count))
+
 	return &allocNameIndex{
-		count:     count,
-		b:         bitmapFrom(in, uint(count)),
-		job:       job,
-		taskGroup: taskGroup,
+		count:      count,
+		b:          bitMap,
+		job:        job,
+		taskGroup:  taskGroup,
+		duplicates: duplicates,
 	}
 }
 
 // bitmapFrom creates a bitmap from the given allocation set and a minimum size
 // maybe given. The size of the bitmap is as the larger of the passed minimum
 // and the maximum alloc index of the passed input (byte aligned).
-func bitmapFrom(input allocSet, minSize uint) structs.Bitmap {
+func bitmapFrom(input allocSet, minSize uint) (structs.Bitmap, map[uint]int) {
 	var max uint
 	for _, a := range input {
 		if num := a.Index(); num > max {
@@ -471,11 +689,25 @@ func bitmapFrom(input allocSet, minSize uint) structs.Bitmap {
 		panic(err)
 	}
 
+	// Initialize our duplicates mapping, allowing us to store a non-nil map
+	// at the cost of 48 bytes.
+	duplicates := make(map[uint]int)
+
+	// Iterate through the allocSet input and hydrate the bitmap. We check that
+	// the bitmap does not contain the index first, so we can track duplicate
+	// entries.
 	for _, a := range input {
-		bitmap.Set(a.Index())
+
+		allocIndex := a.Index()
+
+		if bitmap.Check(allocIndex) {
+			duplicates[allocIndex]++
+		} else {
+			bitmap.Set(allocIndex)
+		}
 	}
 
-	return bitmap
+	return bitmap, duplicates
 }
 
 // Highest removes and returns the highest n used names. The returned set
@@ -494,23 +726,25 @@ func (a *allocNameIndex) Highest(n uint) map[string]struct{} {
 	return h
 }
 
-// Set sets the indexes from the passed alloc set as used
-func (a *allocNameIndex) Set(set allocSet) {
-	for _, alloc := range set {
-		a.b.Set(alloc.Index())
-	}
-}
-
-// Unset unsets all indexes of the passed alloc set as being used
-func (a *allocNameIndex) Unset(as allocSet) {
-	for _, alloc := range as {
-		a.b.Unset(alloc.Index())
-	}
+// IsDuplicate checks whether the passed allocation index is duplicated within
+// the tracking.
+func (a *allocNameIndex) IsDuplicate(idx uint) bool {
+	val, ok := a.duplicates[idx]
+	return ok && val > 0
 }
 
 // UnsetIndex unsets the index as having its name used
 func (a *allocNameIndex) UnsetIndex(idx uint) {
-	a.b.Unset(idx)
+
+	// If this index is a duplicate, remove the duplicate entry. Otherwise, we
+	// can remove it from the bitmap tracking.
+	if num, ok := a.duplicates[idx]; ok {
+		if num--; num == 0 {
+			delete(a.duplicates, idx)
+		}
+	} else {
+		a.b.Unset(idx)
+	}
 }
 
 // NextCanaries returns the next n names for use as canaries and sets them as
@@ -521,9 +755,11 @@ func (a *allocNameIndex) NextCanaries(n uint, existing, destructive allocSet) []
 	// Create a name index
 	existingNames := existing.nameSet()
 
-	// First select indexes from the allocations that are undergoing destructive
-	// updates. This way we avoid duplicate names as they will get replaced.
-	dmap := bitmapFrom(destructive, uint(a.count))
+	// First select indexes from the allocations that are undergoing
+	// destructive updates. This way we avoid duplicate names as they will get
+	// replaced. As this process already takes into account duplicate checking,
+	// we can discard the duplicate mapping when generating the bitmap.
+	dmap, _ := bitmapFrom(destructive, uint(a.count))
 	remainder := n
 	for _, idx := range dmap.IndexesInRange(true, uint(0), uint(a.count)-1) {
 		name := structs.AllocName(a.job, a.taskGroup, uint(idx))

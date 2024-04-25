@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { module, test } from 'qunit';
 import { create } from 'ember-cli-page-object';
 import { setupRenderingTest } from 'ember-qunit';
@@ -29,6 +34,7 @@ module('Integration | Component | job-client-status-bar', function (hooks) {
         failed: [],
         lost: [],
         notScheduled: [],
+        unknown: [],
       },
     },
     isNarrow: true,

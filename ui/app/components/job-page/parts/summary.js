@@ -1,9 +1,13 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Component from '@ember/component';
-import { action, computed } from '@ember/object';
+import { computed } from '@ember/object';
 import { inject as service } from '@ember/service';
 import { classNames } from '@ember-decorators/component';
 import classic from 'ember-classic-decorator';
-
 @classic
 @classNames('boxed-section')
 export default class Summary extends Component {
@@ -11,22 +15,6 @@ export default class Summary extends Component {
 
   job = null;
   forceCollapsed = false;
-
-  @action
-  gotoAllocations(status) {
-    this.router.transitionTo('jobs.job.allocations', this.job, {
-      queryParams: {
-        status: JSON.stringify(status),
-        namespace: this.job.get('namespace.name'),
-      },
-    });
-  }
-
-  @action
-  onSliceClick(ev, slice) {
-    /* eslint-disable-next-line ember/no-string-prototype-extensions */
-    this.gotoAllocations([slice.label.camelize()]);
-  }
 
   @computed('forceCollapsed')
   get isExpanded() {

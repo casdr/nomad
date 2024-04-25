@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -7,17 +10,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/rpc"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/go-msgpack/codec"
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/hashicorp/go-msgpack/v2/codec"
+	"github.com/hashicorp/go-sockaddr"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
 	"github.com/hashicorp/nomad/ci"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper/pool"
@@ -30,13 +34,15 @@ import (
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/yamux"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // rpcClient is a test helper method to return a ClientCodec to use to make rpc
 // calls to the passed server.
-func rpcClient(t *testing.T, s *Server) rpc.ClientCodec {
+func rpcClient(t testing.TB, s *Server) rpc.ClientCodec {
+	t.Helper()
 	addr := s.config.RPCAddr
 	conn, err := net.DialTimeout("tcp", addr.String(), time.Second)
 	if err != nil {
@@ -45,6 +51,36 @@ func rpcClient(t *testing.T, s *Server) rpc.ClientCodec {
 	// Write the Nomad RPC byte to set the mode
 	conn.Write([]byte{byte(pool.RpcNomad)})
 	return pool.NewClientCodec(conn)
+}
+
+// rpcClientWithTLS is a test helper method to return a ClientCodec to use to
+// make RPC calls to the passed server via mTLS
+func rpcClientWithTLS(t testing.TB, srv *Server, cfg *config.TLSConfig) rpc.ClientCodec {
+	t.Helper()
+
+	// configure TLS, ignoring client-side validation
+	tlsConf, err := tlsutil.NewTLSConfiguration(cfg, true, true)
+	must.NoError(t, err)
+	outTLSConf, err := tlsConf.OutgoingTLSConfig()
+	must.NoError(t, err)
+	outTLSConf.InsecureSkipVerify = true
+
+	// make the TCP connection
+	conn, err := net.DialTimeout("tcp", srv.config.RPCAddr.String(), time.Second)
+
+	// write the TLS byte to set the mode
+	_, err = conn.Write([]byte{byte(pool.RpcTLS)})
+	must.NoError(t, err)
+
+	// connect w/ TLS
+	tlsConn := tls.Client(conn, outTLSConf)
+	must.NoError(t, tlsConn.Handshake())
+
+	// write the Nomad RPC byte to set the mode
+	_, err = tlsConn.Write([]byte{byte(pool.RpcNomad)})
+	must.NoError(t, err)
+
+	return pool.NewClientCodec(tlsConn)
 }
 
 func TestRPC_forwardLeader(t *testing.T) {
@@ -69,7 +105,7 @@ func TestRPC_forwardLeader(t *testing.T) {
 
 	if remote != nil {
 		var out struct{}
-		err := s1.forwardLeader(remote, "Status.Ping", struct{}{}, &out)
+		err := s1.forwardLeader(remote, "Status.Ping", &structs.GenericRequest{}, &out)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -82,7 +118,7 @@ func TestRPC_forwardLeader(t *testing.T) {
 
 	if remote != nil {
 		var out struct{}
-		err := s2.forwardLeader(remote, "Status.Ping", struct{}{}, &out)
+		err := s2.forwardLeader(remote, "Status.Ping", &structs.GenericRequest{}, &out)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -145,12 +181,12 @@ func TestRPC_forwardRegion(t *testing.T) {
 	testutil.WaitForLeader(t, s2.RPC)
 
 	var out struct{}
-	err := s1.forwardRegion("global", "Status.Ping", struct{}{}, &out)
+	err := s1.forwardRegion("global", "Status.Ping", &structs.GenericRequest{}, &out)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	err = s2.forwardRegion("global", "Status.Ping", struct{}{}, &out)
+	err = s2.forwardRegion("global", "Status.Ping", &structs.GenericRequest{}, &out)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -187,12 +223,11 @@ func TestRPC_PlaintextRPCSucceedsWhenInUpgradeMode(t *testing.T) {
 	assert := assert.New(t)
 
 	const (
-		cafile  = "../helper/tlsutil/testdata/ca.pem"
-		foocert = "../helper/tlsutil/testdata/nomad-foo.pem"
-		fookey  = "../helper/tlsutil/testdata/nomad-foo-key.pem"
+		cafile  = "../helper/tlsutil/testdata/nomad-agent-ca.pem"
+		foocert = "../helper/tlsutil/testdata/regionFoo-client-nomad.pem"
+		fookey  = "../helper/tlsutil/testdata/regionFoo-client-nomad-key.pem"
 	)
-	dir := tmpDir(t)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.DataDir = path.Join(dir, "node1")
@@ -230,12 +265,11 @@ func TestRPC_PlaintextRPCFailsWhenNotInUpgradeMode(t *testing.T) {
 	assert := assert.New(t)
 
 	const (
-		cafile  = "../helper/tlsutil/testdata/ca.pem"
-		foocert = "../helper/tlsutil/testdata/nomad-foo.pem"
-		fookey  = "../helper/tlsutil/testdata/nomad-foo-key.pem"
+		cafile  = "../helper/tlsutil/testdata/nomad-agent-ca.pem"
+		foocert = "../helper/tlsutil/testdata/regionFoo-client-nomad.pem"
+		fookey  = "../helper/tlsutil/testdata/regionFoo-client-nomad-key.pem"
 	)
-	dir := tmpDir(t)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.DataDir = path.Join(dir, "node1")
@@ -297,12 +331,11 @@ func TestRPC_streamingRpcConn_badMethod_TLS(t *testing.T) {
 	require := require.New(t)
 
 	const (
-		cafile  = "../helper/tlsutil/testdata/ca.pem"
-		foocert = "../helper/tlsutil/testdata/nomad-foo.pem"
-		fookey  = "../helper/tlsutil/testdata/nomad-foo-key.pem"
+		cafile  = "../helper/tlsutil/testdata/nomad-agent-ca.pem"
+		foocert = "../helper/tlsutil/testdata/regionFoo-server-nomad.pem"
+		fookey  = "../helper/tlsutil/testdata/regionFoo-server-nomad-key.pem"
 	)
-	dir := tmpDir(t)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.Region = "regionFoo"
 		c.BootstrapExpect = 2
@@ -355,8 +388,7 @@ func TestRPC_streamingRpcConn_badMethod_TLS(t *testing.T) {
 func TestRPC_streamingRpcConn_goodMethod_Plaintext(t *testing.T) {
 	ci.Parallel(t)
 	require := require.New(t)
-	dir := tmpDir(t)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.Region = "regionFoo"
 		c.BootstrapExpect = 2
@@ -409,12 +441,11 @@ func TestRPC_streamingRpcConn_goodMethod_TLS(t *testing.T) {
 	require := require.New(t)
 
 	const (
-		cafile  = "../helper/tlsutil/testdata/ca.pem"
-		foocert = "../helper/tlsutil/testdata/nomad-foo.pem"
-		fookey  = "../helper/tlsutil/testdata/nomad-foo-key.pem"
+		cafile  = "../helper/tlsutil/testdata/nomad-agent-ca.pem"
+		foocert = "../helper/tlsutil/testdata/regionFoo-server-nomad.pem"
+		fookey  = "../helper/tlsutil/testdata/regionFoo-server-nomad-key.pem"
 	)
-	dir := tmpDir(t)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.Region = "regionFoo"
 		c.BootstrapExpect = 2
@@ -548,9 +579,9 @@ func TestRPC_TLS_in_TLS(t *testing.T) {
 	ci.Parallel(t)
 
 	const (
-		cafile  = "../helper/tlsutil/testdata/ca.pem"
-		foocert = "../helper/tlsutil/testdata/nomad-foo.pem"
-		fookey  = "../helper/tlsutil/testdata/nomad-foo-key.pem"
+		cafile  = "../helper/tlsutil/testdata/nomad-agent-ca.pem"
+		foocert = "../helper/tlsutil/testdata/regionFoo-client-nomad.pem"
+		fookey  = "../helper/tlsutil/testdata/regionFoo-client-nomad-key.pem"
 	)
 
 	s, cleanup := TestServer(t, func(c *Config) {
@@ -608,9 +639,9 @@ func TestRPC_Limits_OK(t *testing.T) {
 	ci.Parallel(t)
 
 	const (
-		cafile   = "../helper/tlsutil/testdata/ca.pem"
-		foocert  = "../helper/tlsutil/testdata/nomad-foo.pem"
-		fookey   = "../helper/tlsutil/testdata/nomad-foo-key.pem"
+		cafile   = "../helper/tlsutil/testdata/nomad-agent-ca.pem"
+		foocert  = "../helper/tlsutil/testdata/regionFoo-client-nomad.pem"
+		fookey   = "../helper/tlsutil/testdata/regionFoo-client-nomad-key.pem"
 		maxConns = 10 // limit must be < this for testing
 	)
 
@@ -868,6 +899,15 @@ func TestRPC_Limits_OK(t *testing.T) {
 				}
 				c.RPCHandshakeTimeout = tc.timeout
 				c.RPCMaxConnsPerClient = tc.limit
+
+				// Bind the server to a private IP so that Autopilot's
+				// StatsFetcher requests come from a different IP than the test
+				// requests, otherwise they would interfere with the connection
+				// rate limiter since limits are imposed by IP address.
+				ip, err := sockaddr.GetPrivateIP()
+				require.NoError(t, err)
+				c.RPCAddr.IP = []byte(ip)
+				c.SerfConfig.MemberlistConfig.BindAddr = ip
 			})
 			defer func() {
 				cleanup()
@@ -1105,19 +1145,14 @@ func TestRPC_TLS_Enforcement_Raft(t *testing.T) {
 func TestRPC_TLS_Enforcement_RPC(t *testing.T) {
 	ci.Parallel(t)
 
-	defer func() {
-		//TODO Avoid panics from logging during shutdown
-		time.Sleep(1 * time.Second)
-	}()
-
 	tlsHelper := newTLSTestHelper(t)
-	defer tlsHelper.cleanup()
+	t.Cleanup(tlsHelper.cleanup)
 
-	standardRPCs := map[string]interface{}{
-		"Status.Ping": struct{}{},
+	standardRPCs := map[string]any{
+		"Status.Ping": &structs.GenericRequest{},
 	}
 
-	localServersOnlyRPCs := map[string]interface{}{
+	localServersOnlyRPCs := map[string]any{
 		"Eval.Update": &structs.EvalUpdateRequest{
 			WriteRequest: structs.WriteRequest{Region: "global"},
 		},
@@ -1136,7 +1171,7 @@ func TestRPC_TLS_Enforcement_RPC(t *testing.T) {
 		"Eval.Reblock": &structs.EvalUpdateRequest{
 			WriteRequest: structs.WriteRequest{Region: "global"},
 		},
-		"Eval.Reap": &structs.EvalDeleteRequest{
+		"Eval.Reap": &structs.EvalReapRequest{
 			WriteRequest: structs.WriteRequest{Region: "global"},
 		},
 		"Plan.Submit": &structs.PlanRequest{
@@ -1147,7 +1182,7 @@ func TestRPC_TLS_Enforcement_RPC(t *testing.T) {
 		},
 	}
 
-	localClientsOnlyRPCs := map[string]interface{}{
+	localClientsOnlyRPCs := map[string]any{
 		"Alloc.GetAllocs": &structs.AllocsGetRequest{
 			QueryOptions: structs.QueryOptions{Region: "global"},
 		},
@@ -1155,6 +1190,9 @@ func TestRPC_TLS_Enforcement_RPC(t *testing.T) {
 			WriteRequest: structs.WriteRequest{Region: "global"},
 		},
 		"Node.UpdateAlloc": &structs.AllocUpdateRequest{
+			WriteRequest: structs.WriteRequest{Region: "global"},
+		},
+		"ServiceRegistration.Upsert": &structs.ServiceRegistrationUpsertRequest{
 			WriteRequest: structs.WriteRequest{Region: "global"},
 		},
 	}
@@ -1165,99 +1203,93 @@ func TestRPC_TLS_Enforcement_RPC(t *testing.T) {
 	// Some endpoints can only be called server -> server
 	// Some endpoints can only be called client -> server
 	cases := []struct {
-		name   string
-		cn     string
-		rpcs   map[string]interface{}
-		canRPC bool
+		name      string
+		cn        string
+		rpcs      map[string]any
+		expectErr string
 	}{
 		// Local server.
 		{
-			name:   "local server/standard rpc",
-			cn:     "server.global.nomad",
-			rpcs:   standardRPCs,
-			canRPC: true,
+			name: "local server/standard rpc",
+			cn:   "server.global.nomad",
+			rpcs: standardRPCs,
 		},
 		{
-			name:   "local server/servers only rpc",
-			cn:     "server.global.nomad",
-			rpcs:   localServersOnlyRPCs,
-			canRPC: true,
+			name: "local server/servers only rpc",
+			cn:   "server.global.nomad",
+			rpcs: localServersOnlyRPCs,
 		},
 		{
-			name:   "local server/clients only rpc",
-			cn:     "server.global.nomad",
-			rpcs:   localClientsOnlyRPCs,
-			canRPC: true,
+			name: "local server/clients only rpc",
+			cn:   "server.global.nomad",
+			rpcs: localClientsOnlyRPCs,
 		},
 		// Local client.
 		{
-			name:   "local client/standard rpc",
-			cn:     "client.global.nomad",
-			rpcs:   standardRPCs,
-			canRPC: true,
+			name: "local client/standard rpc",
+			cn:   "client.global.nomad",
+			rpcs: standardRPCs,
 		},
 		{
-			name:   "local client/servers only rpc",
-			cn:     "client.global.nomad",
-			rpcs:   localServersOnlyRPCs,
-			canRPC: false,
+			name:      "local client/servers only rpc",
+			cn:        "client.global.nomad",
+			rpcs:      localServersOnlyRPCs,
+			expectErr: "(Permission denied|broken pipe)",
 		},
 		{
-			name:   "local client/clients only rpc",
-			cn:     "client.global.nomad",
-			rpcs:   localClientsOnlyRPCs,
-			canRPC: true,
+			name: "local client/clients only rpc",
+			cn:   "client.global.nomad",
+			rpcs: localClientsOnlyRPCs,
 		},
 		// Other region server.
 		{
-			name:   "other region server/standard rpc",
-			cn:     "server.other.nomad",
-			rpcs:   standardRPCs,
-			canRPC: true,
+			name: "other region server/standard rpc",
+			cn:   "server.other.nomad",
+			rpcs: standardRPCs,
 		},
 		{
-			name:   "other region server/servers only rpc",
-			cn:     "server.other.nomad",
-			rpcs:   localServersOnlyRPCs,
-			canRPC: false,
+			name:      "other region server/servers only rpc",
+			cn:        "server.other.nomad",
+			rpcs:      localServersOnlyRPCs,
+			expectErr: "(Permission denied|broken pipe)",
 		},
 		{
-			name:   "other region server/clients only rpc",
-			cn:     "server.other.nomad",
-			rpcs:   localClientsOnlyRPCs,
-			canRPC: false,
+			name:      "other region server/clients only rpc",
+			cn:        "server.other.nomad",
+			rpcs:      localClientsOnlyRPCs,
+			expectErr: "(Permission denied|broken pipe)",
 		},
 		// Other region client.
 		{
-			name:   "other region client/standard rpc",
-			cn:     "client.other.nomad",
-			rpcs:   standardRPCs,
-			canRPC: false,
+			name:      "other region client/standard rpc",
+			cn:        "client.other.nomad",
+			rpcs:      standardRPCs,
+			expectErr: "(certificate|broken pipe)",
 		},
 		{
-			name:   "other region client/servers only rpc",
-			cn:     "client.other.nomad",
-			rpcs:   localServersOnlyRPCs,
-			canRPC: false,
+			name:      "other region client/servers only rpc",
+			cn:        "client.other.nomad",
+			rpcs:      localServersOnlyRPCs,
+			expectErr: "(certificate|broken pipe)",
 		},
 		{
-			name:   "other region client/clients only rpc",
-			cn:     "client.other.nomad",
-			rpcs:   localClientsOnlyRPCs,
-			canRPC: false,
+			name:      "other region client/clients only rpc",
+			cn:        "client.other.nomad",
+			rpcs:      localClientsOnlyRPCs,
+			expectErr: "(certificate|broken pipe)",
 		},
 		// Wrong certs.
 		{
-			name:   "irrelevant cert",
-			cn:     "nomad.example.com",
-			rpcs:   standardRPCs,
-			canRPC: false,
+			name:      "irrelevant cert",
+			cn:        "nomad.example.com",
+			rpcs:      standardRPCs,
+			expectErr: "(certificate|broken pipe)",
 		},
 		{
-			name:   "globs",
-			cn:     "*.global.nomad",
-			rpcs:   standardRPCs,
-			canRPC: false,
+			name:      "globs",
+			cn:        "*.global.nomad",
+			rpcs:      standardRPCs,
+			expectErr: "(certificate|broken pipe)",
 		},
 		{},
 	}
@@ -1280,13 +1312,21 @@ func TestRPC_TLS_Enforcement_RPC(t *testing.T) {
 					t.Run(name, func(t *testing.T) {
 						err := tlsHelper.nomadRPC(t, srv, cfg, method, arg)
 
-						if tc.canRPC {
+						if tc.expectErr == "" {
 							if err != nil {
-								require.NotContains(t, err, "certificate")
+								// note: lots of these RPCs will return
+								// validation errors after connection b/c we're
+								// focusing on testing TLS here
+								must.StrNotContains(t, err.Error(), "certificate")
 							}
 						} else {
-							require.Error(t, err)
-							require.Contains(t, err.Error(), "certificate")
+							// We expect "bad certificate" for these failures,
+							// but locally the error can return before the error
+							// message bytes have been received, in which case
+							// we immediately write on the pipe that was just
+							// closed by the client
+							must.Error(t, err)
+							must.RegexMatch(t, regexp.MustCompile(tc.expectErr), err.Error())
 						}
 					})
 				}
@@ -1294,7 +1334,7 @@ func TestRPC_TLS_Enforcement_RPC(t *testing.T) {
 				t.Run(fmt.Sprintf("nomad RPC: rpc=%s verify_hostname=false", method), func(t *testing.T) {
 					err := tlsHelper.nomadRPC(t, tlsHelper.nonVerifyServer, cfg, method, arg)
 					if err != nil {
-						require.NotContains(t, err, "certificate")
+						must.StrNotContains(t, "certificate", err.Error())
 					}
 				})
 			}
@@ -1307,9 +1347,9 @@ type tlsTestHelper struct {
 	nodeID int
 
 	mtlsServer1            *Server
-	mtlsServer1Cleanup     func()
+	mtlsServerCleanup1     func()
 	mtlsServer2            *Server
-	mtlsServer2Cleanup     func()
+	mtlsServerCleanup2     func()
 	nonVerifyServer        *Server
 	nonVerifyServerCleanup func()
 
@@ -1322,62 +1362,53 @@ func newTLSTestHelper(t *testing.T) tlsTestHelper {
 	var err error
 
 	h := tlsTestHelper{
-		dir:    tmpDir(t),
+		dir:    t.TempDir(),
 		nodeID: 1,
 	}
 
 	// Generate CA certificate and write it to disk.
-	h.caPEM, h.pk, err = tlsutil.GenerateCA(tlsutil.CAOpts{Days: 5, Domain: "nomad"})
-	require.NoError(t, err)
+	h.caPEM, h.pk, err = tlsutil.GenerateCA(tlsutil.CAOpts{
+		Name:               "Nomad CA",
+		Country:            "ZZ",
+		Days:               5,
+		Organization:       "CustOrgUnit",
+		OrganizationalUnit: "CustOrgUnit",
+	})
+	must.NoError(t, err)
 
-	err = ioutil.WriteFile(filepath.Join(h.dir, "ca.pem"), []byte(h.caPEM), 0600)
-	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(h.dir, "ca.pem"), []byte(h.caPEM), 0600)
+	must.NoError(t, err)
 
 	// Generate servers and their certificate.
 	h.serverCert = h.newCert(t, "server.global.nomad")
 
-	h.mtlsServer1, h.mtlsServer1Cleanup = TestServer(t, func(c *Config) {
-		c.BootstrapExpect = 2
-		c.TLSConfig = &config.TLSConfig{
-			EnableRPC:            true,
-			VerifyServerHostname: true,
-			CAFile:               filepath.Join(h.dir, "ca.pem"),
-			CertFile:             h.serverCert + ".pem",
-			KeyFile:              h.serverCert + ".key",
-		}
-	})
-	h.mtlsServer2, h.mtlsServer2Cleanup = TestServer(t, func(c *Config) {
-		c.BootstrapExpect = 2
-		c.TLSConfig = &config.TLSConfig{
-			EnableRPC:            true,
-			VerifyServerHostname: true,
-			CAFile:               filepath.Join(h.dir, "ca.pem"),
-			CertFile:             h.serverCert + ".pem",
-			KeyFile:              h.serverCert + ".key",
-		}
-	})
-	TestJoin(t, h.mtlsServer1, h.mtlsServer2)
-	testutil.WaitForLeader(t, h.mtlsServer1.RPC)
-	testutil.WaitForLeader(t, h.mtlsServer2.RPC)
+	makeServer := func(bootstrapExpect int, verifyServerHostname bool) (*Server, func()) {
+		return TestServer(t, func(c *Config) {
+			c.NumSchedulers = 0
+			c.BootstrapExpect = bootstrapExpect
+			c.TLSConfig = &config.TLSConfig{
+				EnableRPC:            true,
+				VerifyServerHostname: verifyServerHostname,
+				CAFile:               filepath.Join(h.dir, "ca.pem"),
+				CertFile:             h.serverCert + ".pem",
+				KeyFile:              h.serverCert + ".key",
+			}
+		})
+	}
 
-	h.nonVerifyServer, h.nonVerifyServerCleanup = TestServer(t, func(c *Config) {
-		c.TLSConfig = &config.TLSConfig{
-			EnableRPC:            true,
-			VerifyServerHostname: false,
-			CAFile:               filepath.Join(h.dir, "ca.pem"),
-			CertFile:             h.serverCert + ".pem",
-			KeyFile:              h.serverCert + ".key",
-		}
-	})
+	h.mtlsServer1, h.mtlsServerCleanup1 = makeServer(3, true)
+	h.mtlsServer2, h.mtlsServerCleanup2 = makeServer(3, true)
+	h.nonVerifyServer, h.nonVerifyServerCleanup = makeServer(3, false)
 
+	TestJoin(t, h.mtlsServer1, h.mtlsServer2, h.nonVerifyServer)
+	testutil.WaitForLeaders(t, h.mtlsServer1.RPC, h.mtlsServer2.RPC, h.nonVerifyServer.RPC)
 	return h
 }
 
 func (h tlsTestHelper) cleanup() {
-	h.mtlsServer1Cleanup()
-	h.mtlsServer2Cleanup()
+	h.mtlsServerCleanup1()
+	h.mtlsServerCleanup2()
 	h.nonVerifyServerCleanup()
-	os.RemoveAll(h.dir)
 }
 
 func (h tlsTestHelper) newCert(t *testing.T, name string) string {
@@ -1398,41 +1429,43 @@ func (h tlsTestHelper) newCert(t *testing.T, name string) string {
 	})
 	require.NoError(t, err)
 
-	err = ioutil.WriteFile(filepath.Join(h.dir, node+"-"+name+".pem"), []byte(pem), 0600)
+	err = os.WriteFile(filepath.Join(h.dir, node+"-"+name+".pem"), []byte(pem), 0600)
 	require.NoError(t, err)
-	err = ioutil.WriteFile(filepath.Join(h.dir, node+"-"+name+".key"), []byte(key), 0600)
+	err = os.WriteFile(filepath.Join(h.dir, node+"-"+name+".key"), []byte(key), 0600)
 	require.NoError(t, err)
 
 	return filepath.Join(h.dir, node+"-"+name)
 }
 
 func (h tlsTestHelper) connect(t *testing.T, s *Server, c *config.TLSConfig) net.Conn {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", s.config.RPCAddr.String(), time.Second)
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	// configure TLS
 	_, err = conn.Write([]byte{byte(pool.RpcTLS)})
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	// Client TLS verification isn't necessary for
 	// our assertions
 	tlsConf, err := tlsutil.NewTLSConfiguration(c, true, true)
-	require.NoError(t, err)
+	must.NoError(t, err)
 	outTLSConf, err := tlsConf.OutgoingTLSConfig()
-	require.NoError(t, err)
+	must.NoError(t, err)
 	outTLSConf.InsecureSkipVerify = true
 
 	tlsConn := tls.Client(conn, outTLSConf)
-	require.NoError(t, tlsConn.Handshake())
+	must.NoError(t, tlsConn.Handshake())
 
 	return tlsConn
 }
 
 func (h tlsTestHelper) nomadRPC(t *testing.T, s *Server, c *config.TLSConfig, method string, arg interface{}) error {
+	t.Helper()
 	conn := h.connect(t, s, c)
 	defer conn.Close()
 	_, err := conn.Write([]byte{byte(pool.RpcNomad)})
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	codec := pool.NewClientCodec(conn)
 

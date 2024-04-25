@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state
 
 import (
@@ -6,28 +9,38 @@ import (
 )
 
 var MsgTypeEvents = map[structs.MessageType]string{
-	structs.NodeRegisterRequestType:                 structs.TypeNodeRegistration,
-	structs.NodeDeregisterRequestType:               structs.TypeNodeDeregistration,
-	structs.UpsertNodeEventsType:                    structs.TypeNodeEvent,
-	structs.EvalUpdateRequestType:                   structs.TypeEvalUpdated,
-	structs.AllocClientUpdateRequestType:            structs.TypeAllocationUpdated,
-	structs.JobRegisterRequestType:                  structs.TypeJobRegistered,
-	structs.AllocUpdateRequestType:                  structs.TypeAllocationUpdated,
-	structs.NodeUpdateStatusRequestType:             structs.TypeNodeEvent,
-	structs.JobDeregisterRequestType:                structs.TypeJobDeregistered,
-	structs.JobBatchDeregisterRequestType:           structs.TypeJobBatchDeregistered,
-	structs.AllocUpdateDesiredTransitionRequestType: structs.TypeAllocationUpdateDesiredStatus,
-	structs.NodeUpdateEligibilityRequestType:        structs.TypeNodeDrain,
-	structs.NodeUpdateDrainRequestType:              structs.TypeNodeDrain,
-	structs.BatchNodeUpdateDrainRequestType:         structs.TypeNodeDrain,
-	structs.DeploymentStatusUpdateRequestType:       structs.TypeDeploymentUpdate,
-	structs.DeploymentPromoteRequestType:            structs.TypeDeploymentPromotion,
-	structs.DeploymentAllocHealthRequestType:        structs.TypeDeploymentAllocHealth,
-	structs.ApplyPlanResultsRequestType:             structs.TypePlanResult,
-	structs.ACLTokenDeleteRequestType:               structs.TypeACLTokenDeleted,
-	structs.ACLTokenUpsertRequestType:               structs.TypeACLTokenUpserted,
-	structs.ACLPolicyDeleteRequestType:              structs.TypeACLPolicyDeleted,
-	structs.ACLPolicyUpsertRequestType:              structs.TypeACLPolicyUpserted,
+	structs.NodeRegisterRequestType:                      structs.TypeNodeRegistration,
+	structs.NodeDeregisterRequestType:                    structs.TypeNodeDeregistration,
+	structs.UpsertNodeEventsType:                         structs.TypeNodeEvent,
+	structs.NodePoolUpsertRequestType:                    structs.TypeNodePoolUpserted,
+	structs.NodePoolDeleteRequestType:                    structs.TypeNodePoolDeleted,
+	structs.EvalUpdateRequestType:                        structs.TypeEvalUpdated,
+	structs.AllocClientUpdateRequestType:                 structs.TypeAllocationUpdated,
+	structs.JobRegisterRequestType:                       structs.TypeJobRegistered,
+	structs.NodeUpdateStatusRequestType:                  structs.TypeNodeEvent,
+	structs.JobDeregisterRequestType:                     structs.TypeJobDeregistered,
+	structs.JobBatchDeregisterRequestType:                structs.TypeJobBatchDeregistered,
+	structs.AllocUpdateDesiredTransitionRequestType:      structs.TypeAllocationUpdateDesiredStatus,
+	structs.NodeUpdateEligibilityRequestType:             structs.TypeNodeDrain,
+	structs.NodeUpdateDrainRequestType:                   structs.TypeNodeDrain,
+	structs.BatchNodeUpdateDrainRequestType:              structs.TypeNodeDrain,
+	structs.DeploymentStatusUpdateRequestType:            structs.TypeDeploymentUpdate,
+	structs.DeploymentPromoteRequestType:                 structs.TypeDeploymentPromotion,
+	structs.DeploymentAllocHealthRequestType:             structs.TypeDeploymentAllocHealth,
+	structs.ApplyPlanResultsRequestType:                  structs.TypePlanResult,
+	structs.ACLTokenDeleteRequestType:                    structs.TypeACLTokenDeleted,
+	structs.ACLTokenUpsertRequestType:                    structs.TypeACLTokenUpserted,
+	structs.ACLPolicyDeleteRequestType:                   structs.TypeACLPolicyDeleted,
+	structs.ACLPolicyUpsertRequestType:                   structs.TypeACLPolicyUpserted,
+	structs.ACLRolesDeleteByIDRequestType:                structs.TypeACLRoleDeleted,
+	structs.ACLRolesUpsertRequestType:                    structs.TypeACLRoleUpserted,
+	structs.ACLAuthMethodsUpsertRequestType:              structs.TypeACLAuthMethodUpserted,
+	structs.ACLAuthMethodsDeleteRequestType:              structs.TypeACLAuthMethodDeleted,
+	structs.ACLBindingRulesUpsertRequestType:             structs.TypeACLBindingRuleUpserted,
+	structs.ACLBindingRulesDeleteRequestType:             structs.TypeACLBindingRuleDeleted,
+	structs.ServiceRegistrationUpsertRequestType:         structs.TypeServiceRegistration,
+	structs.ServiceRegistrationDeleteByIDRequestType:     structs.TypeServiceDeregistration,
+	structs.ServiceRegistrationDeleteByNodeIDRequestType: structs.TypeServiceDeregistration,
 }
 
 func eventsFromChanges(tx ReadTxn, changes Changes) *structs.Events {
@@ -74,6 +87,57 @@ func eventFromChange(change memdb.Change) (structs.Event, bool) {
 					ACLPolicy: before,
 				},
 			}, true
+		case TableACLRoles:
+			before, ok := change.Before.(*structs.ACLRole)
+			if !ok {
+				return structs.Event{}, false
+			}
+			return structs.Event{
+				Topic:      structs.TopicACLRole,
+				Key:        before.ID,
+				FilterKeys: []string{before.Name},
+				Payload: &structs.ACLRoleStreamEvent{
+					ACLRole: before,
+				},
+			}, true
+		case TableACLAuthMethods:
+			before, ok := change.Before.(*structs.ACLAuthMethod)
+			if !ok {
+				return structs.Event{}, false
+			}
+			return structs.Event{
+				Topic: structs.TopicACLAuthMethod,
+				Key:   before.Name,
+				Payload: &structs.ACLAuthMethodEvent{
+					AuthMethod: before,
+				},
+			}, true
+		case TableACLBindingRules:
+			before, ok := change.Before.(*structs.ACLBindingRule)
+			if !ok {
+				return structs.Event{}, false
+			}
+			return structs.Event{
+				Topic:      structs.TopicACLBindingRule,
+				Key:        before.ID,
+				FilterKeys: []string{before.AuthMethod},
+				Payload: &structs.ACLBindingRuleEvent{
+					ACLBindingRule: before,
+				},
+			}, true
+		case "jobs":
+			before, ok := change.Before.(*structs.Job)
+			if !ok {
+				return structs.Event{}, false
+			}
+			return structs.Event{
+				Topic:     structs.TopicJob,
+				Key:       before.ID,
+				Namespace: before.Namespace,
+				Payload: &structs.JobEvent{
+					Job: before,
+				},
+			}, true
 		case "nodes":
 			before, ok := change.Before.(*structs.Node)
 			if !ok {
@@ -86,6 +150,35 @@ func eventFromChange(change memdb.Change) (structs.Event, bool) {
 				Key:   before.ID,
 				Payload: &structs.NodeStreamEvent{
 					Node: before,
+				},
+			}, true
+		case TableNodePools:
+			before, ok := change.Before.(*structs.NodePool)
+			if !ok {
+				return structs.Event{}, false
+			}
+			return structs.Event{
+				Topic: structs.TopicNodePool,
+				Key:   before.Name,
+				Payload: &structs.NodePoolEvent{
+					NodePool: before,
+				},
+			}, true
+		case TableServiceRegistrations:
+			before, ok := change.Before.(*structs.ServiceRegistration)
+			if !ok {
+				return structs.Event{}, false
+			}
+			return structs.Event{
+				Topic: structs.TopicService,
+				Key:   before.ID,
+				FilterKeys: []string{
+					before.JobID,
+					before.ServiceName,
+				},
+				Namespace: before.Namespace,
+				Payload: &structs.ServiceRegistrationStreamEvent{
+					Service: before,
 				},
 			}, true
 		}
@@ -114,6 +207,44 @@ func eventFromChange(change memdb.Change) (structs.Event, bool) {
 			Key:   after.Name,
 			Payload: &structs.ACLPolicyEvent{
 				ACLPolicy: after,
+			},
+		}, true
+	case TableACLRoles:
+		after, ok := change.After.(*structs.ACLRole)
+		if !ok {
+			return structs.Event{}, false
+		}
+		return structs.Event{
+			Topic:      structs.TopicACLRole,
+			Key:        after.ID,
+			FilterKeys: []string{after.Name},
+			Payload: &structs.ACLRoleStreamEvent{
+				ACLRole: after,
+			},
+		}, true
+	case TableACLAuthMethods:
+		after, ok := change.After.(*structs.ACLAuthMethod)
+		if !ok {
+			return structs.Event{}, false
+		}
+		return structs.Event{
+			Topic: structs.TopicACLAuthMethod,
+			Key:   after.Name,
+			Payload: &structs.ACLAuthMethodEvent{
+				AuthMethod: after,
+			},
+		}, true
+	case TableACLBindingRules:
+		after, ok := change.After.(*structs.ACLBindingRule)
+		if !ok {
+			return structs.Event{}, false
+		}
+		return structs.Event{
+			Topic:      structs.TopicACLBindingRule,
+			Key:        after.ID,
+			FilterKeys: []string{after.AuthMethod},
+			Payload: &structs.ACLBindingRuleEvent{
+				ACLBindingRule: after,
 			},
 		}, true
 	case "evals":
@@ -184,6 +315,18 @@ func eventFromChange(change memdb.Change) (structs.Event, bool) {
 				Node: after,
 			},
 		}, true
+	case TableNodePools:
+		after, ok := change.After.(*structs.NodePool)
+		if !ok {
+			return structs.Event{}, false
+		}
+		return structs.Event{
+			Topic: structs.TopicNodePool,
+			Key:   after.Name,
+			Payload: &structs.NodePoolEvent{
+				NodePool: after,
+			},
+		}, true
 	case "deployment":
 		after, ok := change.After.(*structs.Deployment)
 		if !ok {
@@ -196,6 +339,23 @@ func eventFromChange(change memdb.Change) (structs.Event, bool) {
 			FilterKeys: []string{after.JobID},
 			Payload: &structs.DeploymentEvent{
 				Deployment: after,
+			},
+		}, true
+	case TableServiceRegistrations:
+		after, ok := change.After.(*structs.ServiceRegistration)
+		if !ok {
+			return structs.Event{}, false
+		}
+		return structs.Event{
+			Topic: structs.TopicService,
+			Key:   after.ID,
+			FilterKeys: []string{
+				after.JobID,
+				after.ServiceName,
+			},
+			Namespace: after.Namespace,
+			Payload: &structs.ServiceRegistrationStreamEvent{
+				Service: after,
 			},
 		}, true
 	}

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -8,10 +11,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/go-hclog"
-	memdb "github.com/hashicorp/go-memdb"
-	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/go-memdb"
+	"github.com/shoenig/test"
+	"github.com/shoenig/test/must"
+	"github.com/shoenig/test/wait"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/mock"
@@ -20,8 +27,6 @@ import (
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestLeader_LeftServer(t *testing.T) {
@@ -409,7 +414,7 @@ func TestLeader_PeriodicDispatcher_Restore_NoEvals(t *testing.T) {
 	now := time.Now()
 
 	// Sleep till after the job should have been launched.
-	time.Sleep(3 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	// Restore the periodic dispatcher.
 	s1.periodicDispatcher.SetEnabled(true)
@@ -436,6 +441,27 @@ func TestLeader_PeriodicDispatcher_Restore_NoEvals(t *testing.T) {
 	}
 }
 
+type mockJobEvalDispatcher struct {
+	forceEvalCalled, children bool
+	evalToReturn              *structs.Evaluation
+	JobEvalDispatcher
+}
+
+func (mjed *mockJobEvalDispatcher) DispatchJob(_ *structs.Job) (*structs.Evaluation, error) {
+	mjed.forceEvalCalled = true
+	return mjed.evalToReturn, nil
+}
+
+func (mjed *mockJobEvalDispatcher) RunningChildren(_ *structs.Job) (bool, error) {
+	return mjed.children, nil
+}
+
+func testPeriodicJob_OverlapEnabled(times ...time.Time) *structs.Job {
+	job := testPeriodicJob(times...)
+	job.Periodic.ProhibitOverlap = true
+	return job
+}
+
 func TestLeader_PeriodicDispatcher_Restore_Evals(t *testing.T) {
 	ci.Parallel(t)
 
@@ -443,6 +469,7 @@ func TestLeader_PeriodicDispatcher_Restore_Evals(t *testing.T) {
 		c.NumSchedulers = 0
 	})
 	defer cleanupS1()
+
 	testutil.WaitForLeader(t, s1.RPC)
 
 	// Inject a periodic job that triggered once in the past, should trigger now
@@ -463,7 +490,16 @@ func TestLeader_PeriodicDispatcher_Restore_Evals(t *testing.T) {
 	}
 
 	// Create an eval for the past launch.
-	s1.periodicDispatcher.createEval(job, past)
+	eval, err := s1.periodicDispatcher.createEval(job, past)
+	must.NoError(t, err)
+
+	md := &mockJobEvalDispatcher{
+		children:          false,
+		evalToReturn:      eval,
+		JobEvalDispatcher: s1,
+	}
+
+	s1.periodicDispatcher.dispatcher = md
 
 	// Flush the periodic dispatcher, ensuring that no evals will be created.
 	s1.periodicDispatcher.SetEnabled(false)
@@ -473,6 +509,7 @@ func TestLeader_PeriodicDispatcher_Restore_Evals(t *testing.T) {
 
 	// Restore the periodic dispatcher.
 	s1.periodicDispatcher.SetEnabled(true)
+
 	s1.restorePeriodicDispatcher()
 
 	// Ensure the job is tracked.
@@ -493,6 +530,128 @@ func TestLeader_PeriodicDispatcher_Restore_Evals(t *testing.T) {
 	if last.Launch == past {
 		t.Fatalf("restorePeriodicDispatcher did not force launch")
 	}
+
+	must.True(t, md.forceEvalCalled, must.Sprint("failed to force job evaluation"))
+}
+
+func TestLeader_PeriodicDispatcher_No_Overlaps_No_Running_Job(t *testing.T) {
+	ci.Parallel(t)
+
+	s1, cleanupS1 := TestServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+	})
+	defer cleanupS1()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Inject a periodic job that triggered once in the past, should trigger now
+	// and once in the future.
+	now := time.Now()
+	past := now.Add(-1 * time.Second)
+	future := now.Add(10 * time.Second)
+
+	job := testPeriodicJob_OverlapEnabled(past, now, future)
+	req := structs.JobRegisterRequest{
+		Job: job,
+		WriteRequest: structs.WriteRequest{
+			Namespace: job.Namespace,
+		},
+	}
+	_, _, err := s1.raftApply(structs.JobRegisterRequestType, req)
+	must.NoError(t, err)
+
+	// Create an eval for the past launch.
+	eval, err := s1.periodicDispatcher.createEval(job, past)
+	must.NoError(t, err)
+
+	md := &mockJobEvalDispatcher{
+		children:     false,
+		evalToReturn: eval,
+	}
+
+	s1.periodicDispatcher.dispatcher = md
+
+	// Flush the periodic dispatcher, ensuring that no evals will be created.
+	s1.periodicDispatcher.SetEnabled(false)
+
+	// Sleep till after the job should have been launched.
+	time.Sleep(3 * time.Second)
+
+	// Restore the periodic dispatcher.
+	s1.periodicDispatcher.SetEnabled(true)
+	must.NoError(t, s1.restorePeriodicDispatcher())
+
+	// Ensure the job is tracked.
+	tuple := structs.NamespacedID{
+		ID:        job.ID,
+		Namespace: job.Namespace,
+	}
+	must.MapContainsKey(t, s1.periodicDispatcher.tracked, tuple, must.Sprint("periodic job not restored"))
+
+	// Check that an eval was made.
+	ws := memdb.NewWatchSet()
+	last, err := s1.fsm.State().PeriodicLaunchByID(ws, job.Namespace, job.ID)
+	must.NoError(t, err)
+	must.NotNil(t, last)
+
+	must.NotEq(t, last.Launch, past, must.Sprint("restorePeriodicDispatcher did not force launch"))
+
+	must.True(t, md.forceEvalCalled, must.Sprint("failed to force job evaluation"))
+}
+
+func TestLeader_PeriodicDispatcher_No_Overlaps_Running_Job(t *testing.T) {
+	ci.Parallel(t)
+
+	s1, cleanupS1 := TestServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+	})
+	defer cleanupS1()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Inject a periodic job that triggered once in the past, should trigger now
+	// and once in the future.
+	now := time.Now()
+	past := now.Add(-1 * time.Second)
+	future := now.Add(10 * time.Second)
+
+	job := testPeriodicJob_OverlapEnabled(past, now, future)
+	req := structs.JobRegisterRequest{
+		Job: job,
+		WriteRequest: structs.WriteRequest{
+			Namespace: job.Namespace,
+		},
+	}
+	_, _, err := s1.raftApply(structs.JobRegisterRequestType, req)
+	must.NoError(t, err)
+
+	// Create an eval for the past launch.
+	eval, err := s1.periodicDispatcher.createEval(job, past)
+	must.NoError(t, err)
+
+	md := &mockJobEvalDispatcher{
+		children:     true,
+		evalToReturn: eval,
+	}
+
+	s1.periodicDispatcher.dispatcher = md
+
+	// Flush the periodic dispatcher, ensuring that no evals will be created.
+	s1.periodicDispatcher.SetEnabled(false)
+
+	// Sleep till after the job should have been launched.
+	time.Sleep(3 * time.Second)
+
+	// Restore the periodic dispatcher.
+	s1.periodicDispatcher.SetEnabled(true)
+	must.NoError(t, s1.restorePeriodicDispatcher())
+
+	// Ensure the job is tracked.
+	tuple := structs.NamespacedID{
+		ID:        job.ID,
+		Namespace: job.Namespace,
+	}
+	must.MapContainsKey(t, s1.periodicDispatcher.tracked, tuple, must.Sprint("periodic job not restored"))
+
+	must.False(t, md.forceEvalCalled, must.Sprint("evaluation forced with job already running"))
 }
 
 func TestLeader_PeriodicDispatch(t *testing.T) {
@@ -659,6 +818,31 @@ func TestLeader_revokeVaultAccessorsOnRestore(t *testing.T) {
 	}
 }
 
+func TestLeader_revokeVaultAccessorsOnRestore_workloadIdentity(t *testing.T) {
+	ci.Parallel(t)
+
+	s1, cleanupS1 := TestServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+	})
+	defer cleanupS1()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Insert a Vault accessor that should be revoked
+	fsmState := s1.fsm.State()
+	va := mock.VaultAccessor()
+	err := fsmState.UpsertVaultAccessor(100, []*structs.VaultAccessor{va})
+	must.NoError(t, err)
+
+	// Do a restore
+	err = s1.revokeVaultAccessorsOnRestore()
+	must.NoError(t, err)
+
+	// Verify accessor was removed from state.
+	got, err := fsmState.VaultAccessor(nil, va.Accessor)
+	must.NoError(t, err)
+	must.Nil(t, got)
+}
+
 func TestLeader_revokeSITokenAccessorsOnRestore(t *testing.T) {
 	ci.Parallel(t)
 	r := require.New(t)
@@ -701,118 +885,10 @@ func TestLeader_ClusterID(t *testing.T) {
 	defer cleanupS1()
 	testutil.WaitForLeader(t, s1.RPC)
 
-	clusterID, err := s1.ClusterID()
+	clusterMD, err := s1.ClusterMetadata()
 
 	require.NoError(t, err)
-	require.True(t, helper.IsUUID(clusterID))
-}
-
-func TestLeader_ClusterID_upgradePath(t *testing.T) {
-	ci.Parallel(t)
-
-	before := version.Must(version.NewVersion("0.10.1")).String()
-	after := minClusterIDVersion.String()
-
-	type server struct {
-		s       *Server
-		cleanup func()
-	}
-
-	outdated := func() server {
-		s, cleanup := TestServer(t, func(c *Config) {
-			c.NumSchedulers = 0
-			c.Build = before
-			c.BootstrapExpect = 3
-			c.Logger.SetLevel(hclog.Trace)
-		})
-		return server{s: s, cleanup: cleanup}
-	}
-
-	upgraded := func() server {
-		s, cleanup := TestServer(t, func(c *Config) {
-			c.NumSchedulers = 0
-			c.Build = after
-			c.BootstrapExpect = 0
-			c.Logger.SetLevel(hclog.Trace)
-		})
-		return server{s: s, cleanup: cleanup}
-	}
-
-	servers := []server{outdated(), outdated(), outdated()}
-	// fallback shutdown attempt in case testing fails
-	defer servers[0].cleanup()
-	defer servers[1].cleanup()
-	defer servers[2].cleanup()
-
-	upgrade := func(i int) {
-		previous := servers[i]
-
-		servers[i] = upgraded()
-		TestJoin(t, servers[i].s, servers[(i+1)%3].s, servers[(i+2)%3].s)
-		testutil.WaitForLeader(t, servers[i].s.RPC)
-
-		require.NoError(t, previous.s.Leave())
-		require.NoError(t, previous.s.Shutdown())
-	}
-
-	// Join the servers before doing anything
-	TestJoin(t, servers[0].s, servers[1].s, servers[2].s)
-
-	// Wait for servers to settle
-	for i := 0; i < len(servers); i++ {
-		testutil.WaitForLeader(t, servers[i].s.RPC)
-	}
-
-	// A check that ClusterID is not available yet
-	noIDYet := func() {
-		for _, s := range servers {
-			retry.Run(t, func(r *retry.R) {
-				if _, err := s.s.ClusterID(); err == nil {
-					r.Error("expected error")
-				}
-			})
-		}
-	}
-
-	// Replace first old server with new server
-	upgrade(0)
-	defer servers[0].cleanup()
-	noIDYet() // ClusterID should not work yet, servers: [new, old, old]
-
-	// Replace second old server with new server
-	upgrade(1)
-	defer servers[1].cleanup()
-	noIDYet() // ClusterID should not work yet, servers: [new, new, old]
-
-	// Replace third / final old server with new server
-	upgrade(2)
-	defer servers[2].cleanup()
-
-	// Wait for old servers to really be gone
-	for _, s := range servers {
-		testutil.WaitForResult(func() (bool, error) {
-			peers, _ := s.s.numPeers()
-			return peers == 3, nil
-		}, func(_ error) {
-			t.Fatalf("should have 3 peers")
-		})
-	}
-
-	// Now we can tickle the leader into making a cluster ID
-	leaderID := ""
-	for _, s := range servers {
-		if s.s.IsLeader() {
-			id, err := s.s.ClusterID()
-			require.NoError(t, err)
-			leaderID = id
-			break
-		}
-	}
-	require.True(t, helper.IsUUID(leaderID))
-
-	// Now every participating server has been upgraded, each one should be
-	// able to get the cluster ID, having been plumbed all the way through.
-	agreeClusterID(t, []*Server{servers[0].s, servers[1].s, servers[2].s})
+	require.True(t, helper.IsUUID(clusterMD.ClusterID))
 }
 
 func TestLeader_ClusterID_noUpgrade(t *testing.T) {
@@ -861,23 +937,32 @@ func TestLeader_ClusterID_noUpgrade(t *testing.T) {
 }
 
 func agreeClusterID(t *testing.T, servers []*Server) {
-	retries := &retry.Timer{Timeout: 60 * time.Second, Wait: 1 * time.Second}
-	ids := make([]string, 3)
-	for i, s := range servers {
-		retry.RunWith(retries, t, func(r *retry.R) {
-			id, err := s.ClusterID()
-			if err != nil {
-				r.Error(err.Error())
-				return
-			}
-			if !helper.IsUUID(id) {
-				r.Error("not a UUID")
-				return
-			}
-			ids[i] = id
-		})
+	must.Len(t, 3, servers)
+
+	f := func() error {
+		id1, err1 := servers[0].ClusterMetadata()
+		if err1 != nil {
+			return err1
+		}
+		id2, err2 := servers[1].ClusterMetadata()
+		if err2 != nil {
+			return err2
+		}
+		id3, err3 := servers[2].ClusterMetadata()
+		if err3 != nil {
+			return err3
+		}
+		if id1.ClusterID != id2.ClusterID || id2.ClusterID != id3.ClusterID {
+			return fmt.Errorf("ids do not match, id1: %s, id2: %s, id3: %s", id1.ClusterID, id2.ClusterID, id3.ClusterID)
+		}
+		return nil
 	}
-	require.True(t, ids[0] == ids[1] && ids[1] == ids[2], "ids[0] %s, ids[1] %s, ids[2] %s", ids[0], ids[1], ids[2])
+
+	must.Wait(t, wait.InitialSuccess(
+		wait.ErrorFunc(f),
+		wait.Timeout(60*time.Second),
+		wait.Gap(1*time.Second),
+	))
 }
 
 func TestLeader_ReplicateACLPolicies(t *testing.T) {
@@ -1025,109 +1110,183 @@ func TestLeader_DiffACLTokens(t *testing.T) {
 	assert.Equal(t, []string{p3.AccessorID, p4.AccessorID}, update)
 }
 
-func TestLeader_UpgradeRaftVersion(t *testing.T) {
+func TestServer_replicationBackoffContinue(t *testing.T) {
 	ci.Parallel(t)
 
-	s1, cleanupS1 := TestServer(t, func(c *Config) {
-		c.Datacenter = "dc1"
-		c.RaftConfig.ProtocolVersion = 2
-	})
-	defer cleanupS1()
+	testCases := []struct {
+		name   string
+		testFn func()
+	}{
+		{
+			name: "leadership lost",
+			testFn: func() {
 
-	s2, cleanupS2 := TestServer(t, func(c *Config) {
-		c.BootstrapExpect = 3
-		c.RaftConfig.ProtocolVersion = 1
-	})
-	defer cleanupS2()
+				// Create a test server with a long enough backoff that we will
+				// be able to close the channel before it fires, but not too
+				// long that the test having problems means CI will hang
+				// forever.
+				testServer, testServerCleanup := TestServer(t, func(c *Config) {
+					c.ReplicationBackoff = 5 * time.Second
+				})
+				defer testServerCleanup()
 
-	s3, cleanupS3 := TestServer(t, func(c *Config) {
-		c.BootstrapExpect = 3
-		c.RaftConfig.ProtocolVersion = 2
-	})
-	defer cleanupS3()
+				// Create our stop channel which is used by the server to
+				// indicate leadership loss.
+				stopCh := make(chan struct{})
 
-	servers := []*Server{s1, s2, s3}
+				// The resultCh is used to block and collect the output from
+				// the test routine.
+				resultCh := make(chan bool, 1)
 
-	// Try to join
-	TestJoin(t, s1, s2, s3)
+				// Run a routine to collect the result and close the channel
+				// straight away.
+				go func() {
+					output := testServer.replicationBackoffContinue(stopCh)
+					resultCh <- output
+				}()
 
-	for _, s := range servers {
-		testutil.WaitForResult(func() (bool, error) {
-			peers, _ := s.numPeers()
-			return peers == 3, nil
-		}, func(err error) {
-			t.Fatalf("should have 3 peers")
+				close(stopCh)
+
+				actualResult := <-resultCh
+				require.False(t, actualResult)
+			},
+		},
+		{
+			name: "backoff continue",
+			testFn: func() {
+
+				// Create a test server with a short backoff.
+				testServer, testServerCleanup := TestServer(t, func(c *Config) {
+					c.ReplicationBackoff = 10 * time.Nanosecond
+				})
+				defer testServerCleanup()
+
+				// Create our stop channel which is used by the server to
+				// indicate leadership loss.
+				stopCh := make(chan struct{})
+
+				// The resultCh is used to block and collect the output from
+				// the test routine.
+				resultCh := make(chan bool, 1)
+
+				// Run a routine to collect the result without closing stopCh.
+				go func() {
+					output := testServer.replicationBackoffContinue(stopCh)
+					resultCh <- output
+				}()
+
+				actualResult := <-resultCh
+				require.True(t, actualResult)
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.testFn()
 		})
 	}
+}
 
-	// Kill the v1 server
-	if err := s2.Leave(); err != nil {
-		t.Fatal(err)
-	}
+func Test_diffACLRoles(t *testing.T) {
+	ci.Parallel(t)
 
-	for _, s := range []*Server{s1, s3} {
-		minVer, err := s.autopilot.MinRaftProtocol()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got, want := minVer, 2; got != want {
-			t.Fatalf("got min raft version %d want %d", got, want)
-		}
-	}
+	stateStore := state.TestStateStore(t)
 
-	// Replace the dead server with one running raft protocol v3
-	s4, cleanupS4 := TestServer(t, func(c *Config) {
-		c.BootstrapExpect = 3
-		c.Datacenter = "dc1"
-		c.RaftConfig.ProtocolVersion = 3
-	})
-	defer cleanupS4()
-	TestJoin(t, s1, s4)
-	servers[1] = s4
+	// Build an initial baseline of ACL Roles.
+	aclRole0 := mock.ACLRole()
+	aclRole1 := mock.ACLRole()
+	aclRole2 := mock.ACLRole()
+	aclRole3 := mock.ACLRole()
 
-	// Make sure we're back to 3 total peers with the new one added via ID
-	for _, s := range servers {
-		testutil.WaitForResult(func() (bool, error) {
-			addrs := 0
-			ids := 0
-			future := s.raft.GetConfiguration()
-			if err := future.Error(); err != nil {
-				return false, err
-			}
-			for _, server := range future.Configuration().Servers {
-				if string(server.ID) == string(server.Address) {
-					addrs++
-				} else {
-					ids++
-				}
-			}
-			if got, want := addrs, 2; got != want {
-				return false, fmt.Errorf("got %d server addresses want %d", got, want)
-			}
-			if got, want := ids, 1; got != want {
-				return false, fmt.Errorf("got %d server ids want %d", got, want)
-			}
+	// Upsert these into our local state. Use copies, so we can alter the roles
+	// directly and use within the diff func.
+	err := stateStore.UpsertACLRoles(structs.MsgTypeTestSetup, 50,
+		[]*structs.ACLRole{aclRole0.Copy(), aclRole1.Copy(), aclRole2.Copy(), aclRole3.Copy()}, true)
+	require.NoError(t, err)
 
-			return true, nil
-		}, func(err error) {
-			t.Fatal(err)
-		})
-	}
+	// Modify the ACL roles to create a number of differences. These roles
+	// represent the state of the authoritative region.
+	aclRole2.ModifyIndex = 50
+	aclRole3.ModifyIndex = 200
+	aclRole3.Hash = []byte{0, 1, 2, 3}
+	aclRole4 := mock.ACLRole()
+
+	// Run the diff function and test the output.
+	toDelete, toUpdate := diffACLRoles(stateStore, 50, []*structs.ACLRoleListStub{
+		aclRole2.Stub(), aclRole3.Stub(), aclRole4.Stub()})
+	require.ElementsMatch(t, []string{aclRole0.ID, aclRole1.ID}, toDelete)
+	require.ElementsMatch(t, []string{aclRole3.ID, aclRole4.ID}, toUpdate)
+}
+
+func Test_diffACLAuthMethods(t *testing.T) {
+	ci.Parallel(t)
+
+	stateStore := state.TestStateStore(t)
+
+	// Build an initial baseline of ACL auth-methods.
+	aclAuthMethod0 := mock.ACLOIDCAuthMethod()
+	aclAuthMethod1 := mock.ACLOIDCAuthMethod()
+	aclAuthMethod2 := mock.ACLOIDCAuthMethod()
+	aclAuthMethod3 := mock.ACLOIDCAuthMethod()
+
+	// Upsert these into our local state. Use copies, so we can alter the
+	// auth-methods directly and use within the diff func.
+	err := stateStore.UpsertACLAuthMethods(50,
+		[]*structs.ACLAuthMethod{aclAuthMethod0.Copy(), aclAuthMethod1.Copy(),
+			aclAuthMethod2.Copy(), aclAuthMethod3.Copy()})
+	must.NoError(t, err)
+
+	// Modify the ACL auth-methods to create a number of differences. These
+	// methods represent the state of the authoritative region.
+	aclAuthMethod2.ModifyIndex = 50
+	aclAuthMethod3.ModifyIndex = 200
+	aclAuthMethod3.Hash = []byte{0, 1, 2, 3}
+	aclAuthMethod4 := mock.ACLOIDCAuthMethod()
+
+	// Run the diff function and test the output.
+	toDelete, toUpdate := diffACLAuthMethods(stateStore, 50, []*structs.ACLAuthMethodStub{
+		aclAuthMethod2.Stub(), aclAuthMethod3.Stub(), aclAuthMethod4.Stub()})
+	require.ElementsMatch(t, []string{aclAuthMethod0.Name, aclAuthMethod1.Name}, toDelete)
+	require.ElementsMatch(t, []string{aclAuthMethod3.Name, aclAuthMethod4.Name}, toUpdate)
+}
+
+func Test_diffACLBindingRules(t *testing.T) {
+	ci.Parallel(t)
+
+	stateStore := state.TestStateStore(t)
+
+	// Build an initial baseline of ACL binding rules.
+	aclBindingRule0 := mock.ACLBindingRule()
+	aclBindingRule1 := mock.ACLBindingRule()
+	aclBindingRule2 := mock.ACLBindingRule()
+	aclBindingRule3 := mock.ACLBindingRule()
+
+	// Upsert these into our local state. Use copies, so we can alter the
+	// binding rules directly and use within the diff func.
+	err := stateStore.UpsertACLBindingRules(50,
+		[]*structs.ACLBindingRule{aclBindingRule0.Copy(), aclBindingRule1.Copy(),
+			aclBindingRule2.Copy(), aclBindingRule3.Copy()}, true)
+	must.NoError(t, err)
+
+	// Modify the ACL auth-methods to create a number of differences. These
+	// methods represent the state of the authoritative region.
+	aclBindingRule2.ModifyIndex = 50
+	aclBindingRule3.ModifyIndex = 200
+	aclBindingRule3.Hash = []byte{0, 1, 2, 3}
+	aclBindingRule4 := mock.ACLBindingRule()
+
+	// Run the diff function and test the output.
+	toDelete, toUpdate := diffACLBindingRules(stateStore, 50, []*structs.ACLBindingRuleListStub{
+		aclBindingRule2.Stub(), aclBindingRule3.Stub(), aclBindingRule4.Stub()})
+	must.SliceContainsAll(t, []string{aclBindingRule0.ID, aclBindingRule1.ID}, toDelete)
+	must.SliceContainsAll(t, []string{aclBindingRule3.ID, aclBindingRule4.ID}, toUpdate)
 }
 
 func TestLeader_Reelection(t *testing.T) {
 	ci.Parallel(t)
 
-	raftProtocols := []int{1, 2, 3}
-	for _, p := range raftProtocols {
-		t.Run(fmt.Sprintf("Leader Election - Protocol version %d", p), func(t *testing.T) {
-			leaderElectionTest(t, raft.ProtocolVersion(p))
-		})
-	}
+	const raftProtocol = 3
 
-}
-
-func leaderElectionTest(t *testing.T, raftProtocol raft.ProtocolVersion) {
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.BootstrapExpect = 3
 		c.RaftConfig.ProtocolVersion = raftProtocol
@@ -1178,8 +1337,10 @@ func leaderElectionTest(t *testing.T, raftProtocol raft.ProtocolVersion) {
 		}
 	}
 
-	// Shutdown the leader
+	// make sure we still have a leader, then shut it down
+	must.NotNil(t, leader, must.Sprint("expected there to be a leader"))
 	leader.Shutdown()
+
 	// Wait for new leader to elect
 	testutil.WaitForLeader(t, nonLeader.RPC)
 }
@@ -1188,126 +1349,122 @@ func TestLeader_RollRaftServer(t *testing.T) {
 	ci.Parallel(t)
 
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
-		c.RaftConfig.ProtocolVersion = 2
+		c.BootstrapExpect = 3
+		c.RaftConfig.ProtocolVersion = 3
 	})
 	defer cleanupS1()
 
 	s2, cleanupS2 := TestServer(t, func(c *Config) {
 		c.BootstrapExpect = 3
-		c.RaftConfig.ProtocolVersion = 2
+		c.RaftConfig.ProtocolVersion = 3
 	})
 	defer cleanupS2()
 
 	s3, cleanupS3 := TestServer(t, func(c *Config) {
 		c.BootstrapExpect = 3
-		c.RaftConfig.ProtocolVersion = 2
+		c.RaftConfig.ProtocolVersion = 3
 	})
 	defer cleanupS3()
 
 	servers := []*Server{s1, s2, s3}
-
-	// Try to join
 	TestJoin(t, s1, s2, s3)
 
-	for _, s := range servers {
-		retry.Run(t, func(r *retry.R) { r.Check(wantPeers(s, 3)) })
-	}
+	t.Logf("waiting for initial stable cluster")
+	waitForStableLeadership(t, servers)
 
-	// Kill the first v2 server
+	t.Logf("killing server s1")
 	s1.Shutdown()
-
-	for _, s := range []*Server{s1, s3} {
-		retry.Run(t, func(r *retry.R) {
-			minVer, err := s.autopilot.MinRaftProtocol()
-			if err != nil {
-				r.Fatal(err)
-			}
-			if got, want := minVer, 2; got != want {
-				r.Fatalf("got min raft version %d want %d", got, want)
-			}
-		})
+	for _, s := range []*Server{s2, s3} {
+		s.RemoveFailedNode(s1.config.NodeID)
 	}
 
-	// Replace the dead server with one running raft protocol v3
+	t.Logf("waiting for server loss to be detected")
+	testutil.WaitForResultUntil(time.Second*10,
+		func() (bool, error) {
+			for _, s := range []*Server{s2, s3} {
+				err := wantPeers(s, 2)
+				if err != nil {
+					return false, err
+				}
+			}
+			return true, nil
+
+		},
+		func(err error) { must.NoError(t, err) },
+	)
+
+	t.Logf("adding replacement server s4")
 	s4, cleanupS4 := TestServer(t, func(c *Config) {
 		c.BootstrapExpect = 3
 		c.RaftConfig.ProtocolVersion = 3
 	})
 	defer cleanupS4()
-	TestJoin(t, s4, s2)
-	servers[0] = s4
+	TestJoin(t, s2, s3, s4)
+	servers = []*Server{s4, s2, s3}
 
-	// Kill the second v2 server
+	t.Logf("waiting for s4 to stabilize")
+	waitForStableLeadership(t, servers)
+
+	t.Logf("killing server s2")
 	s2.Shutdown()
-
 	for _, s := range []*Server{s3, s4} {
-		retry.Run(t, func(r *retry.R) {
-			minVer, err := s.autopilot.MinRaftProtocol()
-			if err != nil {
-				r.Fatal(err)
-			}
-			if got, want := minVer, 2; got != want {
-				r.Fatalf("got min raft version %d want %d", got, want)
-			}
-		})
+		s.RemoveFailedNode(s2.config.NodeID)
 	}
-	// Replace another dead server with one running raft protocol v3
+
+	t.Logf("waiting for server loss to be detected")
+	testutil.WaitForResultUntil(time.Second*10,
+		func() (bool, error) {
+			for _, s := range []*Server{s3, s4} {
+				err := wantPeers(s, 2)
+				if err != nil {
+					return false, err
+				}
+			}
+			return true, nil
+		},
+		func(err error) { must.NoError(t, err) },
+	)
+
+	t.Logf("adding replacement server s5")
 	s5, cleanupS5 := TestServer(t, func(c *Config) {
 		c.BootstrapExpect = 3
 		c.RaftConfig.ProtocolVersion = 3
 	})
 	defer cleanupS5()
-	TestJoin(t, s5, s4)
-	servers[1] = s5
+	TestJoin(t, s3, s4, s5)
+	servers = []*Server{s4, s5, s3}
 
-	// Kill the last v2 server, now minRaftProtocol should be 3
+	t.Logf("waiting for s5 to stabilize")
+	waitForStableLeadership(t, servers)
+
+	t.Logf("killing server s3")
 	s3.Shutdown()
 
-	for _, s := range []*Server{s4, s5} {
-		retry.Run(t, func(r *retry.R) {
-			minVer, err := s.autopilot.MinRaftProtocol()
-			if err != nil {
-				r.Fatal(err)
+	t.Logf("waiting for server loss to be detected")
+	testutil.WaitForResultUntil(time.Second*10,
+		func() (bool, error) {
+			for _, s := range []*Server{s4, s5} {
+				err := wantPeers(s, 2)
+				if err != nil {
+					return false, err
+				}
 			}
-			if got, want := minVer, 3; got != want {
-				r.Fatalf("got min raft version %d want %d", got, want)
-			}
-		})
-	}
+			return true, nil
+		},
+		func(err error) { must.NoError(t, err) },
+	)
 
-	// Replace the last dead server with one running raft protocol v3
+	t.Logf("adding replacement server s6")
 	s6, cleanupS6 := TestServer(t, func(c *Config) {
 		c.BootstrapExpect = 3
 		c.RaftConfig.ProtocolVersion = 3
 	})
 	defer cleanupS6()
 	TestJoin(t, s6, s4)
-	servers[2] = s6
+	servers = []*Server{s4, s5, s6}
 
-	// Make sure all the dead servers are removed and we're back to 3 total peers
-	for _, s := range servers {
-		retry.Run(t, func(r *retry.R) {
-			addrs := 0
-			ids := 0
-			future := s.raft.GetConfiguration()
-			if err := future.Error(); err != nil {
-				r.Fatal(err)
-			}
-			for _, server := range future.Configuration().Servers {
-				if string(server.ID) == string(server.Address) {
-					addrs++
-				} else {
-					ids++
-				}
-			}
-			if got, want := addrs, 0; got != want {
-				r.Fatalf("got %d server addresses want %d", got, want)
-			}
-			if got, want := ids, 3; got != want {
-				r.Fatalf("got %d server ids want %d", got, want)
-			}
-		})
-	}
+	t.Logf("waiting for s6 to stabilize")
+	waitForStableLeadership(t, servers)
 }
 
 func TestLeader_RevokeLeadership_MultipleTimes(t *testing.T) {
@@ -1353,7 +1510,7 @@ func TestLeader_TransitionsUpdateConsistencyRead(t *testing.T) {
 // (and unpaused) upon leader elections (and step downs).
 func TestLeader_PausingWorkers(t *testing.T) {
 	ci.Parallel(t)
-	
+
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 12
 	})
@@ -1414,7 +1571,7 @@ func TestServer_ReconcileMember(t *testing.T) {
 	// after leadership has been established to reduce
 	s3, cleanupS3 := TestServer(t, func(c *Config) {
 		c.BootstrapExpect = 0
-		c.RaftConfig.ProtocolVersion = 2
+		c.RaftConfig.ProtocolVersion = 3
 	})
 	defer cleanupS3()
 
@@ -1569,6 +1726,87 @@ func TestLeader_DiffNamespaces(t *testing.T) {
 	assert.Equal(t, []string{ns3.Name, ns4.Name}, update)
 }
 
+func TestLeader_ReplicateNodePools(t *testing.T) {
+	ci.Parallel(t)
+
+	s1, root, cleanupS1 := TestACLServer(t, func(c *Config) {
+		c.Region = "region1"
+		c.AuthoritativeRegion = "region1"
+		c.ACLEnabled = true
+	})
+	defer cleanupS1()
+	s2, _, cleanupS2 := TestACLServer(t, func(c *Config) {
+		c.Region = "region2"
+		c.AuthoritativeRegion = "region1"
+		c.ACLEnabled = true
+		c.ReplicationBackoff = 20 * time.Millisecond
+		c.ReplicationToken = root.SecretID
+	})
+	defer cleanupS2()
+	TestJoin(t, s1, s2)
+	testutil.WaitForLeader(t, s1.RPC)
+	testutil.WaitForLeader(t, s2.RPC)
+
+	// Write a node pool to the authoritative region
+	np1 := mock.NodePool()
+	must.NoError(t, s1.State().UpsertNodePools(
+		structs.MsgTypeTestSetup, 100, []*structs.NodePool{np1}))
+
+	// Wait for the node pool to replicate
+	testutil.WaitForResult(func() (bool, error) {
+		store := s2.State()
+		out, err := store.NodePoolByName(nil, np1.Name)
+		return out != nil, err
+	}, func(err error) {
+		t.Fatalf("should replicate node pool")
+	})
+
+	// Delete the node pool at the authoritative region
+	must.NoError(t, s1.State().DeleteNodePools(structs.MsgTypeTestSetup, 200, []string{np1.Name}))
+
+	// Wait for the namespace deletion to replicate
+	testutil.WaitForResult(func() (bool, error) {
+		store := s2.State()
+		out, err := store.NodePoolByName(nil, np1.Name)
+		return out == nil, err
+	}, func(err error) {
+		t.Fatalf("should replicate node pool deletion")
+	})
+}
+
+func TestLeader_DiffNodePools(t *testing.T) {
+	ci.Parallel(t)
+
+	state := state.TestStateStore(t)
+
+	// Populate the local state
+	np1, np2, np3 := mock.NodePool(), mock.NodePool(), mock.NodePool()
+	must.NoError(t, state.UpsertNodePools(
+		structs.MsgTypeTestSetup, 100, []*structs.NodePool{np1, np2, np3}))
+
+	// Simulate a remote list
+	rnp2 := np2.Copy()
+	rnp2.ModifyIndex = 50 // Ignored, same index
+	rnp3 := np3.Copy()
+	rnp3.ModifyIndex = 100 // Updated, higher index
+	rnp3.Description = "force a hash update"
+	rnp3.SetHash()
+	rnp4 := mock.NodePool()
+	remoteList := []*structs.NodePool{
+		rnp2,
+		rnp3,
+		rnp4,
+	}
+	delete, update := diffNodePools(state, 50, remoteList)
+	sort.Strings(delete)
+
+	// np1 does not exist on the remote side, should delete
+	test.Eq(t, []string{structs.NodePoolAll, structs.NodePoolDefault, np1.Name}, delete)
+
+	// np2 is un-modified - ignore. np3 modified, np4 new.
+	test.Eq(t, []*structs.NodePool{rnp3, rnp4}, update)
+}
+
 // waitForStableLeadership waits until a leader is elected and all servers
 // get promoted as voting members, returns the leader
 func waitForStableLeadership(t *testing.T, servers []*Server) *Server {
@@ -1626,4 +1864,111 @@ func waitForStableLeadership(t *testing.T, servers []*Server) *Server {
 	})
 
 	return leader
+}
+
+func TestServer_getLatestIndex(t *testing.T) {
+	ci.Parallel(t)
+
+	testServer, testServerCleanup := TestServer(t, nil)
+	defer testServerCleanup()
+
+	// Test a new state store value.
+	idx, success := testServer.getLatestIndex()
+	require.True(t, success)
+	must.Eq(t, 1, idx)
+
+	// Upsert something with a high index, and check again.
+	err := testServer.State().UpsertACLPolicies(
+		structs.MsgTypeTestSetup, 1013, []*structs.ACLPolicy{mock.ACLPolicy()})
+	require.NoError(t, err)
+
+	idx, success = testServer.getLatestIndex()
+	require.True(t, success)
+	must.Eq(t, 1013, idx)
+}
+
+func TestServer_handleEvalBrokerStateChange(t *testing.T) {
+	ci.Parallel(t)
+
+	testCases := []struct {
+		startValue                  bool
+		testServerCallBackConfig    func(c *Config)
+		inputSchedulerConfiguration *structs.SchedulerConfiguration
+		expectedOutput              bool
+		name                        string
+	}{
+		{
+			startValue:                  false,
+			testServerCallBackConfig:    func(c *Config) { c.DefaultSchedulerConfig.PauseEvalBroker = false },
+			inputSchedulerConfiguration: nil,
+			expectedOutput:              true,
+			name:                        "bootstrap un-paused",
+		},
+		{
+			startValue:                  false,
+			testServerCallBackConfig:    func(c *Config) { c.DefaultSchedulerConfig.PauseEvalBroker = true },
+			inputSchedulerConfiguration: nil,
+			expectedOutput:              false,
+			name:                        "bootstrap paused",
+		},
+		{
+			startValue:                  true,
+			testServerCallBackConfig:    nil,
+			inputSchedulerConfiguration: &structs.SchedulerConfiguration{PauseEvalBroker: true},
+			expectedOutput:              false,
+			name:                        "state change to paused",
+		},
+		{
+			startValue:                  false,
+			testServerCallBackConfig:    nil,
+			inputSchedulerConfiguration: &structs.SchedulerConfiguration{PauseEvalBroker: true},
+			expectedOutput:              false,
+			name:                        "no state change to paused",
+		},
+		{
+			startValue:                  false,
+			testServerCallBackConfig:    nil,
+			inputSchedulerConfiguration: &structs.SchedulerConfiguration{PauseEvalBroker: false},
+			expectedOutput:              true,
+			name:                        "state change to un-paused",
+		},
+		{
+			startValue:                  false,
+			testServerCallBackConfig:    nil,
+			inputSchedulerConfiguration: &structs.SchedulerConfiguration{PauseEvalBroker: true},
+			expectedOutput:              false,
+			name:                        "no state change to un-paused",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			// Create a new server and wait for leadership to be established.
+			testServer, cleanupFn := TestServer(t, nil)
+			_ = waitForStableLeadership(t, []*Server{testServer})
+			defer cleanupFn()
+
+			// If we set a callback config, we are just testing the eventual
+			// state of the brokers. Otherwise, we set our starting value and
+			// then perform our state modification change and check.
+			if tc.testServerCallBackConfig == nil {
+				testServer.evalBroker.SetEnabled(tc.startValue)
+				testServer.blockedEvals.SetEnabled(tc.startValue)
+				actualOutput := testServer.handleEvalBrokerStateChange(tc.inputSchedulerConfiguration)
+				require.Equal(t, tc.expectedOutput, actualOutput)
+			}
+
+			// Check the brokers are in the expected state.
+			var expectedEnabledVal bool
+
+			if tc.inputSchedulerConfiguration == nil {
+				expectedEnabledVal = !testServer.config.DefaultSchedulerConfig.PauseEvalBroker
+			} else {
+				expectedEnabledVal = !tc.inputSchedulerConfiguration.PauseEvalBroker
+			}
+			require.Equal(t, expectedEnabledVal, testServer.evalBroker.Enabled())
+			require.Equal(t, expectedEnabledVal, testServer.blockedEvals.Enabled())
+		})
+	}
 }

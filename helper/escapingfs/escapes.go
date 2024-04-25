@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package escapingfs
 
 import (
@@ -49,16 +52,19 @@ func pathEscapesBaseViaSymlink(base, full string) (bool, error) {
 		return false, err
 	}
 
-	rel, err := filepath.Rel(resolveSym, base)
-	if err != nil {
-		return true, nil
-	}
+	// Nomad owns most of the prefix path, which includes the alloc UUID, so
+	// it's safe to assume that we can do a case insensitive check regardless of
+	// filesystem, as even if the cluster admin remounted the datadir with a
+	// slightly different capitalization, you'd only be able to escape into that
+	// same directory.
+	return !hasPrefixCaseInsensitive(resolveSym, base), nil
+}
 
-	// note: this is not the same as !filesystem.IsAbs; we are asking if the relative
-	// path is descendent of the base path, indicating it does not escape.
-	isRelative := strings.HasPrefix(rel, "..") || rel == "."
-	escapes := !isRelative
-	return escapes, nil
+func hasPrefixCaseInsensitive(path, prefix string) bool {
+	if len(prefix) > len(path) {
+		return false
+	}
+	return strings.EqualFold(path[:len(prefix)], prefix)
 }
 
 // PathEscapesAllocDir returns true if base/prefix/path escapes the given base directory.
@@ -96,4 +102,26 @@ func PathEscapesAllocDir(base, prefix, path string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// PathEscapesSandbox returns whether previously cleaned path inside the
+// sandbox directory (typically this will be the allocation directory)
+// escapes.
+func PathEscapesSandbox(sandboxDir, path string) bool {
+	rel, err := filepath.Rel(sandboxDir, path)
+	if err != nil {
+		return true
+	}
+	if strings.HasPrefix(rel, "..") {
+		return true
+	}
+	return false
+}
+
+// EnsurePath is used to make sure a path exists
+func EnsurePath(path string, dir bool) error {
+	if !dir {
+		path = filepath.Dir(path)
+	}
+	return os.MkdirAll(path, 0755)
 }

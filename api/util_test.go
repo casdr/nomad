@@ -1,44 +1,44 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
-	crand "crypto/rand"
+	"crypto/rand"
 	"fmt"
 	"testing"
+
+	"github.com/shoenig/test/must"
 )
 
 func assertQueryMeta(t *testing.T, qm *QueryMeta) {
 	t.Helper()
-	if qm.LastIndex == 0 {
-		t.Fatalf("bad index: %d", qm.LastIndex)
-	}
-	if !qm.KnownLeader {
-		t.Fatalf("expected known leader, got none")
-	}
+
+	must.NotEq(t, 0, qm.LastIndex, must.Sprint("bad index"))
+	must.True(t, qm.KnownLeader, must.Sprint("expected a known leader but gone none"))
 }
 
 func assertWriteMeta(t *testing.T, wm *WriteMeta) {
 	t.Helper()
-	if wm.LastIndex == 0 {
-		t.Fatalf("bad index: %d", wm.LastIndex)
-	}
+	must.Positive(t, wm.LastIndex, must.Sprint("expected WriteMeta.LastIndex to be > 0"))
 }
 
 func testJob() *Job {
 	task := NewTask("task1", "raw_exec").
 		SetConfig("command", "/bin/sleep").
 		Require(&Resources{
-			CPU:      intToPtr(100),
-			MemoryMB: intToPtr(256),
+			CPU:      pointerOf(100),
+			MemoryMB: pointerOf(256),
 		}).
 		SetLogConfig(&LogConfig{
-			MaxFiles:      intToPtr(1),
-			MaxFileSizeMB: intToPtr(2),
+			MaxFiles:      pointerOf(1),
+			MaxFileSizeMB: pointerOf(2),
 		})
 
 	group := NewTaskGroup("group1", 1).
 		AddTask(task).
 		RequireDisk(&EphemeralDisk{
-			SizeMB: intToPtr(25),
+			SizeMB: pointerOf(25),
 		})
 
 	job := NewBatchJob("job1", "redis", "global", 1).
@@ -48,22 +48,30 @@ func testJob() *Job {
 	return job
 }
 
+func testServiceJob() *Job {
+	// Create a job of type service
+	task := NewTask("dummy-task", "exec").SetConfig("command", "/bin/sleep")
+	group1 := NewTaskGroup("dummy-group", 1).AddTask(task)
+	job := NewServiceJob("dummy-service", "dummy-service", "global", 5).AddTaskGroup(group1)
+	return job
+}
+
 func testJobWithScalingPolicy() *Job {
 	job := testJob()
 	job.TaskGroups[0].Scaling = &ScalingPolicy{
 		Policy:  map[string]interface{}{},
-		Min:     int64ToPtr(1),
-		Max:     int64ToPtr(5),
-		Enabled: boolToPtr(true),
+		Min:     pointerOf(int64(1)),
+		Max:     pointerOf(int64(5)),
+		Enabled: pointerOf(true),
 	}
 	return job
 }
 
 func testPeriodicJob() *Job {
 	job := testJob().AddPeriodicConfig(&PeriodicConfig{
-		Enabled:  boolToPtr(true),
-		Spec:     stringToPtr("*/30 * * * *"),
-		SpecType: stringToPtr("cron"),
+		Enabled:  pointerOf(true),
+		Spec:     pointerOf("*/30 * * * *"),
+		SpecType: pointerOf("cron"),
 	})
 	return job
 }
@@ -103,14 +111,14 @@ func testNamespace() *Namespace {
 
 func testQuotaSpec() *QuotaSpec {
 	return &QuotaSpec{
-		Name:        "test-namespace",
+		Name:        "test-quota",
 		Description: "Testing namespaces",
 		Limits: []*QuotaLimit{
 			{
 				Region: "global",
 				RegionLimit: &Resources{
-					CPU:      intToPtr(2000),
-					MemoryMB: intToPtr(2000),
+					CPU:      pointerOf(2000),
+					MemoryMB: pointerOf(2000),
 				},
 			},
 		},
@@ -128,7 +136,7 @@ func float64ToPtr(f float64) *float64 {
 // generateUUID generates a uuid useful for testing only
 func generateUUID() string {
 	buf := make([]byte, 16)
-	if _, err := crand.Read(buf); err != nil {
+	if _, err := rand.Read(buf); err != nil {
 		panic(fmt.Errorf("failed to read random bytes: %v", err))
 	}
 

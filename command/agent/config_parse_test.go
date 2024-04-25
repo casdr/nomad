@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
@@ -8,23 +11,24 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
-	"github.com/stretchr/testify/require"
+	"github.com/shoenig/test/must"
 )
 
 var basicConfig = &Config{
-	Region:      "foobar",
-	Datacenter:  "dc2",
-	NodeName:    "my-web",
-	DataDir:     "/tmp/nomad",
-	PluginDir:   "/tmp/nomad-plugins",
-	LogFile:     "/var/log/nomad.log",
-	LogLevel:    "ERR",
-	LogJson:     true,
-	BindAddr:    "192.168.0.1",
-	EnableDebug: true,
+	Region:             "foobar",
+	Datacenter:         "dc2",
+	NodeName:           "my-web",
+	DataDir:            "/tmp/nomad",
+	PluginDir:          "/tmp/nomad-plugins",
+	LogFile:            "/var/log/nomad.log",
+	LogLevel:           "ERR",
+	LogIncludeLocation: true,
+	LogJson:            true,
+	BindAddr:           "192.168.0.1",
+	EnableDebug:        true,
 	Ports: &Ports{
 		HTTP: 1234,
 		RPC:  2345,
@@ -40,11 +44,12 @@ var basicConfig = &Config{
 		Serf: "127.0.0.4",
 	},
 	Client: &ClientConfig{
-		Enabled:   true,
-		StateDir:  "/tmp/client-state",
-		AllocDir:  "/tmp/alloc",
-		Servers:   []string{"a.b.c:80", "127.0.0.1:1234"},
-		NodeClass: "linux-medium-64bit",
+		Enabled:        true,
+		StateDir:       "/tmp/client-state",
+		AllocDir:       "/tmp/alloc",
+		AllocMountsDir: "/tmp/mounts",
+		Servers:        []string{"a.b.c:80", "127.0.0.1:1234"},
+		NodeClass:      "linux-medium-64bit",
 		ServerJoin: &ServerJoin{
 			RetryJoin:        []string{"1.1.1.1", "2.2.2.2"},
 			RetryInterval:    time.Duration(15) * time.Second,
@@ -82,7 +87,7 @@ var basicConfig = &Config{
 		GCDiskUsageThreshold:  82,
 		GCInodeUsageThreshold: 91,
 		GCMaxAllocs:           50,
-		NoHostUUID:            helper.BoolToPtr(false),
+		NoHostUUID:            pointer.Of(false),
 		DisableRemoteExec:     true,
 		HostVolumes: []*structs.ClientHostVolumeConfig{
 			{Name: "tmp", Path: "/tmp"},
@@ -97,16 +102,18 @@ var basicConfig = &Config{
 		BootstrapExpect:           5,
 		DataDir:                   "/tmp/data",
 		RaftProtocol:              3,
-		RaftMultiplier:            helper.IntToPtr(4),
-		NumSchedulers:             helper.IntToPtr(2),
+		RaftMultiplier:            pointer.Of(4),
+		NumSchedulers:             pointer.Of(2),
 		EnabledSchedulers:         []string{"test"},
 		NodeGCThreshold:           "12h",
 		EvalGCThreshold:           "12h",
 		JobGCInterval:             "3m",
 		JobGCThreshold:            "12h",
 		DeploymentGCThreshold:     "12h",
+		CSIVolumeClaimGCInterval:  "3m",
 		CSIVolumeClaimGCThreshold: "12h",
 		CSIPluginGCThreshold:      "12h",
+		ACLTokenGCThreshold:       "12h",
 		HeartbeatGrace:            30 * time.Second,
 		HeartbeatGraceHCL:         "30s",
 		MinHeartbeatTTL:           33 * time.Second,
@@ -124,8 +131,14 @@ var basicConfig = &Config{
 		RedundancyZone:            "foo",
 		UpgradeVersion:            "0.8.0",
 		EncryptKey:                "abc",
-		EnableEventBroker:         helper.BoolToPtr(false),
-		EventBufferSize:           helper.IntToPtr(200),
+		EnableEventBroker:         pointer.Of(false),
+		EventBufferSize:           pointer.Of(200),
+		PlanRejectionTracker: &PlanRejectionTracker{
+			Enabled:       pointer.Of(true),
+			NodeThreshold: 100,
+			NodeWindow:    41 * time.Minute,
+			NodeWindowHCL: "41m",
+		},
 		ServerJoin: &ServerJoin{
 			RetryJoin:        []string{"1.1.1.1", "2.2.2.2"},
 			RetryInterval:    time.Duration(15) * time.Second,
@@ -140,18 +153,26 @@ var basicConfig = &Config{
 				ServiceSchedulerEnabled: true,
 			},
 		},
-		LicensePath: "/tmp/nomad.hclic",
+		LicensePath:        "/tmp/nomad.hclic",
+		JobDefaultPriority: pointer.Of(100),
+		JobMaxPriority:     pointer.Of(200),
 	},
 	ACL: &ACLConfig{
-		Enabled:          true,
-		TokenTTL:         60 * time.Second,
-		TokenTTLHCL:      "60s",
-		PolicyTTL:        60 * time.Second,
-		PolicyTTLHCL:     "60s",
-		ReplicationToken: "foobar",
+		Enabled:                  true,
+		TokenTTL:                 60 * time.Second,
+		TokenTTLHCL:              "60s",
+		PolicyTTL:                60 * time.Second,
+		PolicyTTLHCL:             "60s",
+		RoleTTLHCL:               "60s",
+		RoleTTL:                  60 * time.Second,
+		TokenMinExpirationTTLHCL: "1h",
+		TokenMinExpirationTTL:    1 * time.Hour,
+		TokenMaxExpirationTTLHCL: "100h",
+		TokenMaxExpirationTTL:    100 * time.Hour,
+		ReplicationToken:         "foobar",
 	},
 	Audit: &config.AuditConfig{
-		Enabled: helper.BoolToPtr(true),
+		Enabled: pointer.Of(true),
 		Sinks: []*config.AuditSink{
 			{
 				DeliveryGuarantee: "enforced",
@@ -176,48 +197,72 @@ var basicConfig = &Config{
 		},
 	},
 	Telemetry: &Telemetry{
-		StatsiteAddr:             "127.0.0.1:1234",
-		StatsdAddr:               "127.0.0.1:2345",
-		PrometheusMetrics:        true,
-		DisableHostname:          true,
-		UseNodeName:              false,
-		CollectionInterval:       "3s",
-		collectionInterval:       3 * time.Second,
-		PublishAllocationMetrics: true,
-		PublishNodeMetrics:       true,
+		StatsiteAddr:               "127.0.0.1:1234",
+		StatsdAddr:                 "127.0.0.1:2345",
+		PrometheusMetrics:          true,
+		DisableHostname:            true,
+		UseNodeName:                false,
+		InMemoryCollectionInterval: "1m",
+		inMemoryCollectionInterval: 1 * time.Minute,
+		InMemoryRetentionPeriod:    "24h",
+		inMemoryRetentionPeriod:    24 * time.Hour,
+		CollectionInterval:         "3s",
+		collectionInterval:         3 * time.Second,
+		PublishAllocationMetrics:   true,
+		PublishNodeMetrics:         true,
 	},
 	LeaveOnInt:                true,
 	LeaveOnTerm:               true,
 	EnableSyslog:              true,
 	SyslogFacility:            "LOCAL1",
-	DisableUpdateCheck:        helper.BoolToPtr(true),
+	DisableUpdateCheck:        pointer.Of(true),
 	DisableAnonymousSignature: true,
-	Consul: &config.ConsulConfig{
-		ServerServiceName:    "nomad",
-		ServerHTTPCheckName:  "nomad-server-http-health-check",
-		ServerSerfCheckName:  "nomad-server-serf-health-check",
-		ServerRPCCheckName:   "nomad-server-rpc-health-check",
-		ClientServiceName:    "nomad-client",
-		ClientHTTPCheckName:  "nomad-client-http-health-check",
+	Consuls: []*config.ConsulConfig{{
+		Name:                      structs.ConsulDefaultCluster,
+		ServerServiceName:         "nomad",
+		ServerHTTPCheckName:       "nomad-server-http-health-check",
+		ServerSerfCheckName:       "nomad-server-serf-health-check",
+		ServerRPCCheckName:        "nomad-server-rpc-health-check",
+		ClientServiceName:         "nomad-client",
+		ClientHTTPCheckName:       "nomad-client-http-health-check",
+		Addr:                      "127.0.0.1:9500",
+		AllowUnauthenticated:      &trueValue,
+		Token:                     "token1",
+		Auth:                      "username:pass",
+		EnableSSL:                 &trueValue,
+		VerifySSL:                 &trueValue,
+		CAFile:                    "/path/to/ca/file",
+		CertFile:                  "/path/to/cert/file",
+		KeyFile:                   "/path/to/key/file",
+		ServerAutoJoin:            &trueValue,
+		ClientAutoJoin:            &trueValue,
+		AutoAdvertise:             &trueValue,
+		ChecksUseAdvertise:        &trueValue,
+		Timeout:                   5 * time.Second,
+		TimeoutHCL:                "5s",
+		ServiceIdentityAuthMethod: "nomad-services",
+		ServiceIdentity: &config.WorkloadIdentityConfig{
+			Audience: []string{"consul.io", "nomad.dev"},
+			Env:      pointer.Of(false),
+			File:     pointer.Of(true),
+			TTL:      pointer.Of(1 * time.Hour),
+			TTLHCL:   "1h",
+		},
+		TaskIdentityAuthMethod: "nomad-tasks",
+		TaskIdentity: &config.WorkloadIdentityConfig{
+			Audience: []string{"consul.io"},
+			Env:      pointer.Of(true),
+			File:     pointer.Of(false),
+			TTL:      pointer.Of(2 * time.Hour),
+			TTLHCL:   "2h",
+		},
+	}},
+	Vaults: []*config.VaultConfig{{
+		Name:                 structs.VaultDefaultCluster,
 		Addr:                 "127.0.0.1:9500",
+		JWTAuthBackendPath:   "nomad_jwt",
+		ConnectionRetryIntv:  30 * time.Second,
 		AllowUnauthenticated: &trueValue,
-		Token:                "token1",
-		Auth:                 "username:pass",
-		EnableSSL:            &trueValue,
-		VerifySSL:            &trueValue,
-		CAFile:               "/path/to/ca/file",
-		CertFile:             "/path/to/cert/file",
-		KeyFile:              "/path/to/key/file",
-		ServerAutoJoin:       &trueValue,
-		ClientAutoJoin:       &trueValue,
-		AutoAdvertise:        &trueValue,
-		ChecksUseAdvertise:   &trueValue,
-		Timeout:              5 * time.Second,
-	},
-	Vault: &config.VaultConfig{
-		Addr:                 "127.0.0.1:9500",
-		AllowUnauthenticated: &trueValue,
-		ConnectionRetryIntv:  config.DefaultVaultConnectRetryIntv,
 		Enabled:              &falseValue,
 		Role:                 "test_role",
 		TLSCaFile:            "/path/to/ca/file",
@@ -228,7 +273,14 @@ var basicConfig = &Config{
 		TLSSkipVerify:        &trueValue,
 		TaskTokenTTL:         "1s",
 		Token:                "12345",
-	},
+		DefaultIdentity: &config.WorkloadIdentityConfig{
+			Audience: []string{"vault.io", "nomad.io"},
+			Env:      pointer.Of(false),
+			File:     pointer.Of(true),
+			TTL:      pointer.Of(3 * time.Hour),
+			TTLHCL:   "3h",
+		},
+	}},
 	TLSConfig: &config.TLSConfig{
 		EnableHTTP:                  true,
 		EnableRPC:                   true,
@@ -291,6 +343,11 @@ var basicConfig = &Config{
 			},
 		},
 	},
+	Reporting: &config.ReportingConfig{
+		License: &config.LicenseReportingConfig{
+			Enabled: pointer.Of(true),
+		},
+	},
 }
 
 var pluginConfig = &Config{
@@ -338,8 +395,6 @@ var pluginConfig = &Config{
 	SyslogFacility:            "",
 	DisableUpdateCheck:        nil,
 	DisableAnonymousSignature: false,
-	Consul:                    nil,
-	Vault:                     nil,
 	TLSConfig:                 nil,
 	HTTPAPIResponseHeaders:    map[string]string{},
 	Sentinel:                  nil,
@@ -357,6 +412,11 @@ var pluginConfig = &Config{
 			},
 		},
 	},
+	Reporting: &config.ReportingConfig{
+		&config.LicenseReportingConfig{},
+	},
+	Consuls: []*config.ConsulConfig{},
+	Vaults:  []*config.VaultConfig{},
 }
 
 var nonoptConfig = &Config{
@@ -404,35 +464,37 @@ var nonoptConfig = &Config{
 	SyslogFacility:            "",
 	DisableUpdateCheck:        nil,
 	DisableAnonymousSignature: false,
-	Consul:                    nil,
-	Vault:                     nil,
 	TLSConfig:                 nil,
 	HTTPAPIResponseHeaders:    map[string]string{},
 	Sentinel:                  nil,
+	Reporting: &config.ReportingConfig{
+		&config.LicenseReportingConfig{},
+	},
+	Consuls: []*config.ConsulConfig{},
+	Vaults:  []*config.VaultConfig{},
 }
 
 func TestConfig_ParseMerge(t *testing.T) {
 	ci.Parallel(t)
 
 	path, err := filepath.Abs(filepath.Join(".", "testdata", "basic.hcl"))
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	actual, err := ParseConfigFile(path)
-	require.NoError(t, err)
 
-	require.Equal(t, basicConfig.Client, actual.Client)
+	// The Vault connection retry interval is an internal only configuration
+	// option, and therefore needs to be added here to ensure the test passes.
+	actual.Vaults[0].ConnectionRetryIntv = config.DefaultVaultConnectRetryIntv
+	must.Eq(t, basicConfig, actual)
 
 	oldDefault := &Config{
-		Consul:    config.DefaultConsulConfig(),
-		Vault:     config.DefaultVaultConfig(),
 		Autopilot: config.DefaultAutopilotConfig(),
 		Client:    &ClientConfig{},
 		Server:    &ServerConfig{},
 		Audit:     &config.AuditConfig{},
 	}
 	merged := oldDefault.Merge(actual)
-	require.Equal(t, basicConfig.Client, merged.Client)
-
+	must.Eq(t, basicConfig, merged)
 }
 
 func TestConfig_Parse(t *testing.T) {
@@ -445,56 +507,48 @@ func TestConfig_Parse(t *testing.T) {
 	cases := []struct {
 		File   string
 		Result *Config
-		Err    bool
 	}{
 		{
 			"basic.hcl",
 			basicConfig,
-			false,
 		},
 		{
 			"basic.json",
 			basicConfig,
-			false,
 		},
 		{
 			"plugin.hcl",
 			pluginConfig,
-			false,
 		},
 		{
 			"plugin.json",
 			pluginConfig,
-			false,
 		},
 		{
 			"non-optional.hcl",
 			nonoptConfig,
-			false,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.File, func(t *testing.T) {
-			require := require.New(t)
+
 			path, err := filepath.Abs(filepath.Join("./testdata", tc.File))
-			require.NoError(err)
+			must.NoError(t, err)
 
 			actual, err := ParseConfigFile(path)
-			require.NoError(err)
+			must.NoError(t, err)
 
-			// ParseConfig used to re-merge defaults for these three objects,
-			// despite them already being merged in LoadConfig. The test structs
-			// expect these defaults to be set, but not the DefaultConfig
-			// defaults, which include additional settings
+			// The test assertion structs expect these defaults to be set, but
+			// not the DefaultConfig defaults, which include a large number of
+			// additional settings.
 			oldDefault := &Config{
-				Consul:    config.DefaultConsulConfig(),
-				Vault:     config.DefaultVaultConfig(),
 				Autopilot: config.DefaultAutopilotConfig(),
+				Reporting: config.DefaultReporting(),
 			}
 			actual = oldDefault.Merge(actual)
 
-			require.EqualValues(tc.Result, removeHelperAttributes(actual))
+			must.Eq(t, tc.Result, removeHelperAttributes(actual))
 		})
 	}
 }
@@ -522,14 +576,14 @@ func (c *Config) addDefaults() {
 	if c.Audit == nil {
 		c.Audit = &config.AuditConfig{}
 	}
-	if c.Consul == nil {
-		c.Consul = config.DefaultConsulConfig()
+	if c.Consuls == nil {
+		c.Consuls = []*config.ConsulConfig{config.DefaultConsulConfig()}
 	}
 	if c.Autopilot == nil {
 		c.Autopilot = config.DefaultAutopilotConfig()
 	}
-	if c.Vault == nil {
-		c.Vault = config.DefaultVaultConfig()
+	if c.Vaults == nil {
+		c.Vaults = []*config.VaultConfig{config.DefaultVaultConfig()}
 	}
 	if c.Telemetry == nil {
 		c.Telemetry = &Telemetry{}
@@ -539,6 +593,16 @@ func (c *Config) addDefaults() {
 	}
 	if c.Server.ServerJoin == nil {
 		c.Server.ServerJoin = &ServerJoin{}
+	}
+	if c.Server.PlanRejectionTracker == nil {
+		c.Server.PlanRejectionTracker = &PlanRejectionTracker{}
+	}
+	if c.Reporting == nil {
+		c.Reporting = &config.ReportingConfig{
+			&config.LicenseReportingConfig{
+				Enabled: pointer.Of(false),
+			},
+		}
 	}
 }
 
@@ -558,7 +622,7 @@ func TestConfig_ParsePanic(t *testing.T) {
 		t.Fatalf("parse error: %s\n", err)
 	}
 
-	require.EqualValues(t, c, d)
+	must.Eq(t, c, d)
 }
 
 // Top level keys left by hcl when parsing slices in the config
@@ -567,36 +631,36 @@ func TestConfig_ParseSliceExtra(t *testing.T) {
 	ci.Parallel(t)
 
 	c, err := ParseConfigFile("./testdata/config-slices.json")
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	opt := map[string]string{"o0": "foo", "o1": "bar"}
 	meta := map[string]string{"m0": "foo", "m1": "bar", "m2": "true", "m3": "1.2"}
 	env := map[string]string{"e0": "baz"}
 	srv := []string{"foo", "bar"}
 
-	require.EqualValues(t, opt, c.Client.Options)
-	require.EqualValues(t, meta, c.Client.Meta)
-	require.EqualValues(t, env, c.Client.ChrootEnv)
-	require.EqualValues(t, srv, c.Client.Servers)
-	require.EqualValues(t, srv, c.Server.EnabledSchedulers)
-	require.EqualValues(t, srv, c.Server.StartJoin)
-	require.EqualValues(t, srv, c.Server.RetryJoin)
+	must.Eq(t, opt, c.Client.Options)
+	must.Eq(t, meta, c.Client.Meta)
+	must.Eq(t, env, c.Client.ChrootEnv)
+	must.Eq(t, srv, c.Client.Servers)
+	must.Eq(t, srv, c.Server.EnabledSchedulers)
+	must.Eq(t, srv, c.Server.StartJoin)
+	must.Eq(t, srv, c.Server.RetryJoin)
 
 	// the alt format is also accepted by hcl as valid config data
 	c, err = ParseConfigFile("./testdata/config-slices-alt.json")
-	require.NoError(t, err)
+	must.NoError(t, err)
 
-	require.EqualValues(t, opt, c.Client.Options)
-	require.EqualValues(t, meta, c.Client.Meta)
-	require.EqualValues(t, env, c.Client.ChrootEnv)
-	require.EqualValues(t, srv, c.Client.Servers)
-	require.EqualValues(t, srv, c.Server.EnabledSchedulers)
-	require.EqualValues(t, srv, c.Server.StartJoin)
-	require.EqualValues(t, srv, c.Server.RetryJoin)
+	must.Eq(t, opt, c.Client.Options)
+	must.Eq(t, meta, c.Client.Meta)
+	must.Eq(t, env, c.Client.ChrootEnv)
+	must.Eq(t, srv, c.Client.Servers)
+	must.Eq(t, srv, c.Server.EnabledSchedulers)
+	must.Eq(t, srv, c.Server.StartJoin)
+	must.Eq(t, srv, c.Server.RetryJoin)
 
 	// small files keep more extra keys than large ones
 	_, err = ParseConfigFile("./testdata/obj-len-one-server.json")
-	require.NoError(t, err)
+	must.NoError(t, err)
 }
 
 var sample0 = &Config{
@@ -617,12 +681,17 @@ var sample0 = &Config{
 		RetryJoin:       []string{"10.0.0.101", "10.0.0.102", "10.0.0.103"},
 		EncryptKey:      "sHck3WL6cxuhuY7Mso9BHA==",
 		ServerJoin:      &ServerJoin{},
+		PlanRejectionTracker: &PlanRejectionTracker{
+			NodeThreshold: 100,
+			NodeWindow:    31 * time.Minute,
+			NodeWindowHCL: "31m",
+		},
 	},
 	ACL: &ACLConfig{
 		Enabled: true,
 	},
 	Audit: &config.AuditConfig{
-		Enabled: helper.BoolToPtr(true),
+		Enabled: pointer.Of(true),
 		Sinks: []*config.AuditSink{
 			{
 				DeliveryGuarantee: "enforced",
@@ -658,16 +727,18 @@ var sample0 = &Config{
 	LeaveOnTerm:    true,
 	EnableSyslog:   true,
 	SyslogFacility: "LOCAL0",
-	Consul: &config.ConsulConfig{
+	Consuls: []*config.ConsulConfig{{
+		Name:           structs.ConsulDefaultCluster,
 		Token:          "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-		ServerAutoJoin: helper.BoolToPtr(false),
-		ClientAutoJoin: helper.BoolToPtr(false),
-	},
-	Vault: &config.VaultConfig{
-		Enabled: helper.BoolToPtr(true),
+		ServerAutoJoin: pointer.Of(false),
+		ClientAutoJoin: pointer.Of(false),
+	}},
+	Vaults: []*config.VaultConfig{{
+		Name:    structs.VaultDefaultCluster,
+		Enabled: pointer.Of(true),
 		Role:    "nomad-cluster",
 		Addr:    "http://host.example.com:8200",
-	},
+	}},
 	TLSConfig: &config.TLSConfig{
 		EnableHTTP:           true,
 		EnableRPC:            true,
@@ -677,16 +748,17 @@ var sample0 = &Config{
 		KeyFile:              "/opt/data/nomad/certs/server-key.pem",
 	},
 	Autopilot: &config.AutopilotConfig{
-		CleanupDeadServers: helper.BoolToPtr(true),
+		CleanupDeadServers: pointer.Of(true),
 	},
+	Reporting: config.DefaultReporting(),
 }
 
 func TestConfig_ParseSample0(t *testing.T) {
 	ci.Parallel(t)
 
 	c, err := ParseConfigFile("./testdata/sample0.json")
-	require.NoError(t, err)
-	require.EqualValues(t, sample0, c)
+	must.NoError(t, err)
+	must.Eq(t, sample0, c)
 }
 
 var sample1 = &Config{
@@ -707,12 +779,17 @@ var sample1 = &Config{
 		RetryJoin:       []string{"10.0.0.101", "10.0.0.102", "10.0.0.103"},
 		EncryptKey:      "sHck3WL6cxuhuY7Mso9BHA==",
 		ServerJoin:      &ServerJoin{},
+		PlanRejectionTracker: &PlanRejectionTracker{
+			NodeThreshold: 100,
+			NodeWindow:    31 * time.Minute,
+			NodeWindowHCL: "31m",
+		},
 	},
 	ACL: &ACLConfig{
 		Enabled: true,
 	},
 	Audit: &config.AuditConfig{
-		Enabled: helper.BoolToPtr(true),
+		Enabled: pointer.Of(true),
 		Sinks: []*config.AuditSink{
 			{
 				Name:              "file",
@@ -748,17 +825,36 @@ var sample1 = &Config{
 	LeaveOnTerm:    true,
 	EnableSyslog:   true,
 	SyslogFacility: "LOCAL0",
-	Consul: &config.ConsulConfig{
-		EnableSSL:      helper.BoolToPtr(true),
-		Token:          "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-		ServerAutoJoin: helper.BoolToPtr(false),
-		ClientAutoJoin: helper.BoolToPtr(false),
-	},
-	Vault: &config.VaultConfig{
-		Enabled: helper.BoolToPtr(true),
-		Role:    "nomad-cluster",
-		Addr:    "http://host.example.com:8200",
-	},
+	Consuls: []*config.ConsulConfig{{
+		Name:                      structs.ConsulDefaultCluster,
+		EnableSSL:                 pointer.Of(true),
+		Token:                     "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ServerAutoJoin:            pointer.Of(false),
+		ClientAutoJoin:            pointer.Of(false),
+		ServerServiceName:         "nomad",
+		ServerHTTPCheckName:       "Nomad Server HTTP Check",
+		ServerSerfCheckName:       "Nomad Server Serf Check",
+		ServerRPCCheckName:        "Nomad Server RPC Check",
+		ClientServiceName:         "nomad-client",
+		ClientHTTPCheckName:       "Nomad Client HTTP Check",
+		AutoAdvertise:             pointer.Of(true),
+		ChecksUseAdvertise:        pointer.Of(false),
+		AllowUnauthenticated:      pointer.Of(true),
+		Timeout:                   5 * time.Second,
+		ServiceIdentityAuthMethod: structs.ConsulWorkloadsDefaultAuthMethodName,
+		TaskIdentityAuthMethod:    structs.ConsulWorkloadsDefaultAuthMethodName,
+		Addr:                      "127.0.0.1:8500",
+		VerifySSL:                 pointer.Of(true),
+	}},
+	Vaults: []*config.VaultConfig{{
+		Name:                 structs.VaultDefaultCluster,
+		Enabled:              pointer.Of(true),
+		Role:                 "nomad-cluster",
+		Addr:                 "http://host.example.com:8200",
+		JWTAuthBackendPath:   "jwt-nomad",
+		ConnectionRetryIntv:  30 * time.Second,
+		AllowUnauthenticated: pointer.Of(true),
+	}},
 	TLSConfig: &config.TLSConfig{
 		EnableHTTP:           true,
 		EnableRPC:            true,
@@ -768,7 +864,10 @@ var sample1 = &Config{
 		KeyFile:              "/opt/data/nomad/certs/server-key.pem",
 	},
 	Autopilot: &config.AutopilotConfig{
-		CleanupDeadServers: helper.BoolToPtr(true),
+		CleanupDeadServers: pointer.Of(true),
+	},
+	Reporting: &config.ReportingConfig{
+		&config.LicenseReportingConfig{},
 	},
 }
 
@@ -776,19 +875,19 @@ func TestConfig_ParseDir(t *testing.T) {
 	ci.Parallel(t)
 
 	c, err := LoadConfig("./testdata/sample1")
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	// LoadConfig Merges all the config files in testdata/sample1, which makes empty
 	// maps & slices rather than nil, so set those
-	require.Empty(t, c.Client.Options)
+	must.Zero(t, len(c.Client.Options))
 	c.Client.Options = nil
-	require.Empty(t, c.Client.Meta)
+	must.Zero(t, len(c.Client.Meta))
 	c.Client.Meta = nil
-	require.Empty(t, c.Client.ChrootEnv)
+	must.Zero(t, len(c.Client.ChrootEnv))
 	c.Client.ChrootEnv = nil
-	require.Empty(t, c.Server.StartJoin)
+	must.Zero(t, len(c.Server.StartJoin))
 	c.Server.StartJoin = nil
-	require.Empty(t, c.HTTPAPIResponseHeaders)
+	must.Zero(t, len(c.HTTPAPIResponseHeaders))
 	c.HTTPAPIResponseHeaders = nil
 
 	// LoadDir lists the config files
@@ -797,10 +896,10 @@ func TestConfig_ParseDir(t *testing.T) {
 		"testdata/sample1/sample1.json",
 		"testdata/sample1/sample2.hcl",
 	}
-	require.Equal(t, expectedFiles, c.Files)
+	must.Eq(t, expectedFiles, c.Files)
 	c.Files = nil
 
-	require.EqualValues(t, sample1, c)
+	must.Eq(t, sample1, c)
 }
 
 // TestConfig_ParseDir_Matches_IndividualParsing asserts
@@ -810,7 +909,7 @@ func TestConfig_ParseDir_Matches_IndividualParsing(t *testing.T) {
 	ci.Parallel(t)
 
 	dirConfig, err := LoadConfig("./testdata/sample1")
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	dirConfig = DefaultConfig().Merge(dirConfig)
 
@@ -826,7 +925,7 @@ func TestConfig_ParseDir_Matches_IndividualParsing(t *testing.T) {
 
 			for _, f := range perm {
 				fc, err := LoadConfig(f)
-				require.NoError(t, err)
+				must.NoError(t, err)
 
 				config = config.Merge(fc)
 			}
@@ -835,7 +934,7 @@ func TestConfig_ParseDir_Matches_IndividualParsing(t *testing.T) {
 			sort.Strings(config.Files)
 			sort.Strings(dirConfig.Files)
 
-			require.EqualValues(t, dirConfig, config)
+			must.Eq(t, dirConfig, config)
 		})
 	}
 
@@ -868,4 +967,140 @@ func permutations(arr []string) [][]string {
 	}
 	helper(arr, len(arr))
 	return res
+}
+
+func TestConfig_MultipleVault(t *testing.T) {
+
+	for _, suffix := range []string{"hcl", "json"} {
+		t.Run(suffix, func(t *testing.T) {
+
+			// verify the default Vault config is set from the list
+			cfg := DefaultConfig()
+			must.Len(t, 1, cfg.Vaults)
+			defaultVault := cfg.Vaults[0]
+			must.Eq(t, structs.VaultDefaultCluster, defaultVault.Name)
+			must.Equal(t, config.DefaultVaultConfig(), defaultVault)
+			must.Nil(t, defaultVault.Enabled) // unset
+			must.Eq(t, "https://vault.service.consul:8200", defaultVault.Addr)
+			must.Eq(t, "", defaultVault.Token)
+			must.Eq(t, "jwt-nomad", defaultVault.JWTAuthBackendPath)
+
+			// merge in the user's configuration
+			fc, err := LoadConfig("testdata/basic." + suffix)
+			must.NoError(t, err)
+			cfg = cfg.Merge(fc)
+
+			must.Len(t, 1, cfg.Vaults)
+			defaultVault = cfg.Vaults[0]
+			must.Eq(t, structs.VaultDefaultCluster, defaultVault.Name)
+			must.NotNil(t, defaultVault.Enabled, must.Sprint("override should set to non-nil"))
+			must.False(t, *defaultVault.Enabled)
+			must.Eq(t, "127.0.0.1:9500", defaultVault.Addr)
+			must.Eq(t, "nomad_jwt", defaultVault.JWTAuthBackendPath)
+			must.Eq(t, "12345", defaultVault.Token)
+
+			// add an extra Vault config and override fields in the default
+			fc, err = LoadConfig("testdata/extra-vault." + suffix)
+			must.NoError(t, err)
+
+			cfg = cfg.Merge(fc)
+
+			must.Len(t, 3, cfg.Vaults)
+			defaultVault = cfg.Vaults[0]
+			must.Eq(t, structs.VaultDefaultCluster, defaultVault.Name)
+			must.True(t, *defaultVault.Enabled)
+			must.Eq(t, "127.0.0.1:9500", defaultVault.Addr)
+			must.Eq(t, "abracadabra", defaultVault.Token)
+
+			must.Eq(t, "alternate", cfg.Vaults[1].Name)
+			must.True(t, *cfg.Vaults[1].Enabled)
+			must.Eq(t, "127.0.0.1:9501", cfg.Vaults[1].Addr)
+			must.Eq(t, "xyzzy", cfg.Vaults[1].Token)
+
+			must.Eq(t, "other", cfg.Vaults[2].Name)
+			must.Nil(t, cfg.Vaults[2].Enabled)
+			must.Eq(t, "127.0.0.1:9502", cfg.Vaults[2].Addr)
+			must.Eq(t, pointer.Of(4*time.Hour), cfg.Vaults[2].DefaultIdentity.TTL)
+
+			// check that extra Vault clusters have the defaults applied when not
+			// overridden
+			must.Eq(t, "jwt-nomad", cfg.Vaults[2].JWTAuthBackendPath)
+		})
+	}
+}
+
+func TestConfig_MultipleConsul(t *testing.T) {
+
+	for _, suffix := range []string{"hcl", "json"} {
+		t.Run(suffix, func(t *testing.T) {
+			// verify the default Consul config is set from the list
+			cfg := DefaultConfig()
+
+			must.Len(t, 1, cfg.Consuls)
+			defaultConsul := cfg.Consuls[0]
+			must.Eq(t, structs.ConsulDefaultCluster, defaultConsul.Name)
+			must.Eq(t, config.DefaultConsulConfig(), defaultConsul)
+			must.True(t, *defaultConsul.AllowUnauthenticated)
+			must.Eq(t, "127.0.0.1:8500", defaultConsul.Addr)
+			must.Eq(t, "", defaultConsul.Token)
+
+			// merge in the user's configuration which overrides fields in the
+			// default config
+			fc, err := LoadConfig("testdata/basic." + suffix)
+			must.NoError(t, err)
+			cfg = cfg.Merge(fc)
+
+			must.Len(t, 1, cfg.Consuls)
+			defaultConsul = cfg.Consuls[0]
+			must.Eq(t, structs.ConsulDefaultCluster, defaultConsul.Name)
+			must.True(t, *defaultConsul.AllowUnauthenticated)
+			must.Eq(t, "127.0.0.1:9500", defaultConsul.Addr)
+			must.Eq(t, "token1", defaultConsul.Token)
+
+			// add an extra Consul config and override fields in the default
+			fc, err = LoadConfig("testdata/extra-consul." + suffix)
+			must.NoError(t, err)
+			cfg = cfg.Merge(fc)
+
+			must.Len(t, 3, cfg.Consuls)
+			defaultConsul = cfg.Consuls[0]
+			must.Eq(t, structs.ConsulDefaultCluster, defaultConsul.Name)
+			must.False(t, *defaultConsul.AllowUnauthenticated)
+			must.Eq(t, "127.0.0.1:9501", defaultConsul.Addr)
+			must.Eq(t, "abracadabra", defaultConsul.Token)
+
+			must.Eq(t, "alternate", cfg.Consuls[1].Name)
+			must.True(t, *cfg.Consuls[1].AllowUnauthenticated)
+			must.Eq(t, "127.0.0.2:8501", cfg.Consuls[1].Addr)
+			must.Eq(t, "xyzzy", cfg.Consuls[1].Token)
+
+			must.Eq(t, "other", cfg.Consuls[2].Name)
+			must.Eq(t, pointer.Of(3*time.Hour), cfg.Consuls[2].ServiceIdentity.TTL)
+			must.Eq(t, pointer.Of(5*time.Hour), cfg.Consuls[2].TaskIdentity.TTL)
+
+			// check that extra Consul clusters have the defaults applied when
+			// not overridden
+			must.Eq(t, "nomad-client", cfg.Consuls[2].ClientServiceName)
+		})
+	}
+}
+
+func TestConfig_Telemetry(t *testing.T) {
+	ci.Parallel(t)
+
+	// Ensure merging a mostly empty struct correctly inherits default values
+	// set.
+	inputTelemetry1 := &Telemetry{PrometheusMetrics: true}
+	mergedTelemetry1 := DefaultConfig().Telemetry.Merge(inputTelemetry1)
+	must.Eq(t, mergedTelemetry1.inMemoryCollectionInterval, 10*time.Second)
+	must.Eq(t, mergedTelemetry1.inMemoryRetentionPeriod, 1*time.Minute)
+
+	// Ensure we can then overlay user specified data.
+	inputTelemetry2 := &Telemetry{
+		inMemoryCollectionInterval: 1 * time.Second,
+		inMemoryRetentionPeriod:    10 * time.Second,
+	}
+	mergedTelemetry2 := mergedTelemetry1.Merge(inputTelemetry2)
+	must.Eq(t, mergedTelemetry2.inMemoryCollectionInterval, 1*time.Second)
+	must.Eq(t, mergedTelemetry2.inMemoryRetentionPeriod, 10*time.Second)
 }

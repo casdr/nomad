@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package delayheap
 
 import (
@@ -76,7 +79,7 @@ func TestDelayHeap_PushPop(t *testing.T) {
 
 func TestDelayHeap_Update(t *testing.T) {
 	ci.Parallel(t)
-	
+
 	delayHeap := NewDelayHeap()
 	now := time.Now()
 	require := require.New(t)

@@ -1,13 +1,17 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/nomad/api"
-	flaghelper "github.com/hashicorp/nomad/helper/flags"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/scheduler"
 	"github.com/posener/complete"
 )
@@ -63,6 +67,10 @@ Alias: nomad plan
     * 1: Allocations created or destroyed.
     * 255: Error determining plan results.
 
+  The plan command will set the vault_token of the job based on the following
+  precedence, going from highest to lowest: the -vault-token flag, the
+  $VAULT_TOKEN environment variable and finally the value in the job file.
+
   When ACLs are enabled, this command requires a token with the 'submit-job'
   capability for the job's namespace.
 
@@ -76,16 +84,37 @@ Plan Options:
     Determines whether the diff between the remote job and planned job is shown.
     Defaults to true.
 
+  -json
+    Parses the job file as JSON. If the outer object has a Job field, such as
+    from "nomad job inspect" or "nomad run -output", the value of the field is
+    used as the job.
+
   -hcl1
-    Parses the job file as HCLv1.
+    Parses the job file as HCLv1. Takes precedence over "-hcl2-strict".
 
   -hcl2-strict
     Whether an error should be produced from the HCL2 parser where a variable
     has been supplied which is not defined within the root variables. Defaults
-    to true.
+    to true, but ignored if "-hcl1" is also defined.
 
   -policy-override
     Sets the flag to force override any soft mandatory Sentinel policies.
+
+  -vault-token
+    Used to validate if the user submitting the job has permission to run the job
+    according to its Vault policies. A Vault token must be supplied if the vault
+    block allow_unauthenticated is disabled in the Nomad server configuration.
+    If the -vault-token flag is set, the passed Vault token is added to the jobspec
+    before sending to the Nomad servers. This allows passing the Vault token
+    without storing it in the job file. This overrides the token found in the
+    $VAULT_TOKEN environment variable and the vault_token field in the job file.
+    This token is cleared from the job after validating and cannot be used within
+    the job executing environment. Use the vault block when templating in a job
+    with a Vault token.
+
+  -vault-namespace
+    If set, the passed Vault namespace is stored in the job before sending to the
+    Nomad servers.
 
   -var 'key=value'
     Variable for template, can be used multiple times.
@@ -109,31 +138,41 @@ func (c *JobPlanCommand) AutocompleteFlags() complete.Flags {
 			"-diff":            complete.PredictNothing,
 			"-policy-override": complete.PredictNothing,
 			"-verbose":         complete.PredictNothing,
+			"-json":            complete.PredictNothing,
 			"-hcl1":            complete.PredictNothing,
 			"-hcl2-strict":     complete.PredictNothing,
+			"-vault-token":     complete.PredictAnything,
+			"-vault-namespace": complete.PredictAnything,
 			"-var":             complete.PredictAnything,
 			"-var-file":        complete.PredictFiles("*.var"),
 		})
 }
 
 func (c *JobPlanCommand) AutocompleteArgs() complete.Predictor {
-	return complete.PredictOr(complete.PredictFiles("*.nomad"), complete.PredictFiles("*.hcl"))
+	return complete.PredictOr(
+		complete.PredictFiles("*.nomad"),
+		complete.PredictFiles("*.hcl"),
+		complete.PredictFiles("*.json"),
+	)
 }
 
 func (c *JobPlanCommand) Name() string { return "job plan" }
 func (c *JobPlanCommand) Run(args []string) int {
-	var diff, policyOverride, verbose, hcl2Strict bool
-	var varArgs, varFiles flaghelper.StringFlag
+	var diff, policyOverride, verbose bool
+	var vaultToken, vaultNamespace string
 
 	flagSet := c.Meta.FlagSet(c.Name(), FlagSetClient)
 	flagSet.Usage = func() { c.Ui.Output(c.Help()) }
 	flagSet.BoolVar(&diff, "diff", true, "")
 	flagSet.BoolVar(&policyOverride, "policy-override", false, "")
 	flagSet.BoolVar(&verbose, "verbose", false, "")
-	flagSet.BoolVar(&c.JobGetter.hcl1, "hcl1", false, "")
-	flagSet.BoolVar(&hcl2Strict, "hcl2-strict", true, "")
-	flagSet.Var(&varArgs, "var", "")
-	flagSet.Var(&varFiles, "var-file", "")
+	flagSet.BoolVar(&c.JobGetter.JSON, "json", false, "")
+	flagSet.BoolVar(&c.JobGetter.HCL1, "hcl1", false, "")
+	flagSet.BoolVar(&c.JobGetter.Strict, "hcl2-strict", true, "")
+	flagSet.StringVar(&vaultToken, "vault-token", "", "")
+	flagSet.StringVar(&vaultNamespace, "vault-namespace", "", "")
+	flagSet.Var(&c.JobGetter.Vars, "var", "")
+	flagSet.Var(&c.JobGetter.VarFiles, "var-file", "")
 
 	if err := flagSet.Parse(args); err != nil {
 		return 255
@@ -147,9 +186,18 @@ func (c *JobPlanCommand) Run(args []string) int {
 		return 255
 	}
 
+	if c.JobGetter.HCL1 {
+		c.JobGetter.Strict = false
+	}
+
+	if err := c.JobGetter.Validate(); err != nil {
+		c.Ui.Error(fmt.Sprintf("Invalid job options: %s", err))
+		return 255
+	}
+
 	path := args[0]
 	// Get Job struct from Jobfile
-	job, err := c.JobGetter.ApiJobWithArgs(args[0], varArgs, varFiles, hcl2Strict)
+	_, job, err := c.JobGetter.Get(path)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error getting job struct: %s", err))
 		return 255
@@ -172,10 +220,30 @@ func (c *JobPlanCommand) Run(args []string) int {
 		client.SetNamespace(*n)
 	}
 
+	// Parse the Vault token.
+	if vaultToken == "" {
+		// Check the environment variable
+		vaultToken = os.Getenv("VAULT_TOKEN")
+	}
+
+	if vaultToken != "" {
+		job.VaultToken = pointer.Of(vaultToken)
+	}
+
+	// Set the vault token.
+	if vaultToken != "" {
+		job.VaultToken = pointer.Of(vaultToken)
+	}
+
+	//  Set the vault namespace.
+	if vaultNamespace != "" {
+		job.VaultNamespace = pointer.Of(vaultNamespace)
+	}
+
 	// Setup the options
-	opts := &api.PlanOptions{}
-	if diff {
-		opts.Diff = true
+	opts := &api.PlanOptions{
+		// Always request the diff so we can tell if there are changes.
+		Diff: true,
 	}
 	if policyOverride {
 		opts.PolicyOverride = true
@@ -193,12 +261,16 @@ func (c *JobPlanCommand) Run(args []string) int {
 	}
 
 	runArgs := strings.Builder{}
-	for _, varArg := range varArgs {
+	for _, varArg := range c.JobGetter.Vars {
 		runArgs.WriteString(fmt.Sprintf("-var=%q ", varArg))
 	}
 
-	for _, varFile := range varFiles {
+	for _, varFile := range c.JobGetter.VarFiles {
 		runArgs.WriteString(fmt.Sprintf("-var-file=%q ", varFile))
+	}
+
+	if c.namespace != "" {
+		runArgs.WriteString(fmt.Sprintf("-namespace=%q ", c.namespace))
 	}
 
 	exitCode := c.outputPlannedJob(job, resp, diff, verbose)
@@ -330,6 +402,10 @@ type namespaceIdPair struct {
 // * 0: No allocations created or destroyed.
 // * 1: Allocations created or destroyed.
 func getExitCode(resp *api.JobPlanResponse) int {
+	if resp.Diff.Type == "None" {
+		return 0
+	}
+
 	// Check for changes
 	for _, d := range resp.Annotations.DesiredTGUpdates {
 		if d.Stop+d.Place+d.Migrate+d.DestructiveUpdate+d.Canary > 0 {

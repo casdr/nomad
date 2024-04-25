@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -124,7 +127,12 @@ func (c *DeploymentUnblockCommand) Run(args []string) int {
 	evalCreated := u.EvalID != ""
 
 	// Nothing to do
-	if detach || !evalCreated {
+	if !evalCreated {
+		return 0
+	}
+
+	if detach {
+		c.Ui.Output("Evaluation ID: " + u.EvalID)
 		return 0
 	}
 

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 $size: 12px;
 
 .toggle {
@@ -31,7 +36,9 @@ $size: 12px;
   .toggler {
     display: inline-block;
     position: relative;
-    vertical-align: middle;
+    vertical-align: baseline;
+    position: relative;
+    top: 1px;
     width: $size * 2;
     height: $size;
     border-radius: $size;

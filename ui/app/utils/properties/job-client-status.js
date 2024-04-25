@@ -1,4 +1,10 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { computed } from '@ember/object';
+import matchGlob from '../match-glob';
 
 const STATUS = [
   'queued',
@@ -9,6 +15,7 @@ const STATUS = [
   'degraded',
   'failed',
   'lost',
+  'unknown',
 ];
 
 // An Ember.Computed property that computes the aggregated status of a job in a
@@ -25,7 +32,9 @@ export default function jobClientStatus(nodesKey, jobKey) {
 
       // Filter nodes by the datacenters defined in the job.
       const filteredNodes = nodes.filter((n) => {
-        return job.datacenters.indexOf(n.datacenter) >= 0;
+        return job.datacenters.find((dc) => {
+          return !!matchGlob(dc, n.datacenter);
+        });
       });
 
       if (job.status === 'pending') {
@@ -135,6 +144,10 @@ function jobStatus(allocs, expected) {
 
   if (summary['running'] > 0) {
     return 'running';
+  }
+
+  if (summary['unknown'] > 0) {
+    return 'unknown';
   }
 
   return 'starting';

@@ -1,57 +1,33 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package fingerprint
 
 import (
-	"time"
-
-	"github.com/hashicorp/nomad/client/lib/cgutil"
-
-	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
 )
 
-const (
-	cgroupUnavailable = "unavailable"
-	interval          = 15
-)
-
-type CGroupFingerprint struct {
-	logger             log.Logger
-	lastState          string
-	mountPointDetector MountPointDetector
+type CgroupFingerprint struct {
+	StaticFingerprinter
+	logger hclog.Logger
 }
 
-// An interface to isolate calls to the cgroup library
-// This facilitates testing where we can implement
-// fake mount points to test various code paths
-type MountPointDetector interface {
-	MountPoint() (string, error)
-}
-
-// Implements the interface detector which calls the cgroups library directly
-type DefaultMountPointDetector struct {
-}
-
-// MountPoint calls out to the default cgroup library.
-func (b *DefaultMountPointDetector) MountPoint() (string, error) {
-	return cgutil.FindCgroupMountpointDir()
-}
-
-// NewCGroupFingerprint returns a new cgroup fingerprinter
-func NewCGroupFingerprint(logger log.Logger) Fingerprint {
-	f := &CGroupFingerprint{
-		logger:             logger.Named("cgroup"),
-		lastState:          cgroupUnavailable,
-		mountPointDetector: &DefaultMountPointDetector{},
+func NewCgroupFingerprint(logger hclog.Logger) Fingerprint {
+	return &CgroupFingerprint{
+		logger: logger.Named("cgroup"),
 	}
-	return f
 }
 
-// clearCGroupAttributes clears any node attributes related to cgroups that might
-// have been set in a previous fingerprint run.
-func (f *CGroupFingerprint) clearCGroupAttributes(r *FingerprintResponse) {
-	r.RemoveAttribute("unique.cgroup.mountpoint")
-}
-
-// Periodic determines the interval at which the periodic fingerprinter will run.
-func (f *CGroupFingerprint) Periodic() (bool, time.Duration) {
-	return true, interval * time.Second
+func (f *CgroupFingerprint) Fingerprint(request *FingerprintRequest, response *FingerprintResponse) error {
+	const versionKey = "os.cgroups.version"
+	switch cgroupslib.GetMode() {
+	case cgroupslib.CG1:
+		response.AddAttribute(versionKey, "1")
+		f.logger.Debug("detected cgroups", "version", "1")
+	case cgroupslib.CG2:
+		response.AddAttribute(versionKey, "2")
+		f.logger.Debug("detected cgroups", "version", "2")
+	}
+	return nil
 }

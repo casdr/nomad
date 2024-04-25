@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -105,6 +108,7 @@ func TestJobNamespaceConstraintCheckHook_validate(t *testing.T) {
 	job.TaskGroups[0].Tasks[0].Driver = "docker"
 	job.TaskGroups[0].Tasks[1].Driver = "qemu"
 	job.TaskGroups[0].Tasks[2].Driver = "docker"
+	job.TaskGroups[0].Tasks[3].Driver = "qemu"
 	_, err := hook.Validate(job)
 	require.Nil(t, err)
 

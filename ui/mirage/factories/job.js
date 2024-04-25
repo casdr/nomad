@@ -1,8 +1,14 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { assign } from '@ember/polyfills';
 import { Factory, trait } from 'ember-cli-mirage';
 import faker from 'nomad-ui/mirage/faker';
 import { provide, pickOne } from '../utils';
 import { DATACENTERS } from '../common';
+import { dasherize } from '@ember/string';
 
 const REF_TIME = new Date();
 const JOB_PREFIXES = provide(5, faker.hacker.abbreviation);
@@ -17,9 +23,9 @@ export default Factory.extend({
       return `${this.parentId}/${dispatchId}`;
     }
 
-    return `${faker.helpers.randomize(
-      JOB_PREFIXES
-    )}-${faker.hacker.noun().dasherize()}-${i}`.toLowerCase();
+    return `${faker.helpers.randomize(JOB_PREFIXES)}-${dasherize(
+      faker.hacker.noun()
+    )}-${i}`.toLowerCase();
   },
 
   name() {
@@ -40,7 +46,9 @@ export default Factory.extend({
   resourceSpec: null,
 
   groupsCount() {
-    return this.resourceSpec ? this.resourceSpec.length : faker.random.number({ min: 1, max: 2 });
+    return this.resourceSpec
+      ? this.resourceSpec.length
+      : faker.random.number({ min: 1, max: 2 });
   },
 
   region: () => 'global',
@@ -49,7 +57,9 @@ export default Factory.extend({
   allAtOnce: faker.random.boolean,
   status: () => faker.helpers.randomize(JOB_STATUSES),
   datacenters: () =>
-    faker.helpers.shuffle(DATACENTERS).slice(0, faker.random.number({ min: 1, max: 4 })),
+    faker.helpers
+      .shuffle(DATACENTERS)
+      .slice(0, faker.random.number({ min: 1, max: 4 })),
 
   childrenCount: () => faker.random.number({ min: 1, max: 2 }),
 
@@ -148,7 +158,7 @@ export default Factory.extend({
     }),
   }),
 
-  createIndex: i => i,
+  createIndex: (i) => i,
   modifyIndex: () => faker.random.number({ min: 10, max: 2000 }),
 
   // Directive used to control sub-resources
@@ -180,15 +190,28 @@ export default Factory.extend({
   // When true, task groups will have services
   withGroupServices: false,
 
+  // When true, tasks will have services
+  withTaskServices: false,
+
   // When true, dynamic application sizing recommendations will be made
   createRecommendations: false,
 
   // When true, only task groups and allocations are made
   shallow: false,
 
+  // When true, the job's groups' tasks will have actions blocks
+  withActions: false,
+
   afterCreate(job, server) {
+    Ember.assert(
+      '[Mirage] No node pools! make sure node pools are created before jobs',
+      server.db.nodePools.length
+    );
+
     if (!job.namespaceId) {
-      const namespace = server.db.namespaces.length ? pickOne(server.db.namespaces).id : null;
+      const namespace = server.db.namespaces.length
+        ? pickOne(server.db.namespaces).id
+        : 'default';
       job.update({
         namespace,
         namespaceId: namespace,
@@ -199,17 +222,30 @@ export default Factory.extend({
       });
     }
 
+    if (!job.nodePool) {
+      job.update({
+        nodePool: pickOne(server.db.nodePools).name,
+      });
+    }
+
     const groupProps = {
       job,
       createAllocations: job.createAllocations,
       withRescheduling: job.withRescheduling,
       withServices: job.withGroupServices,
+      withTaskServices: job.withTaskServices,
+      withActions: job.withActions,
       createRecommendations: job.createRecommendations,
       shallow: job.shallow,
+      allocStatusDistribution: job.allocStatusDistribution,
     };
 
     if (job.groupTaskCount) {
-      groupProps.count = job.groupTaskCount;
+      groupProps.taskCount = job.groupTaskCount;
+    }
+
+    if (job.groupAllocCount) {
+      groupProps.count = job.groupAllocCount;
     }
 
     let groups;
@@ -217,14 +253,20 @@ export default Factory.extend({
       groups = provide(job.groupsCount, (_, idx) =>
         server.create('task-group', 'noHostVolumes', {
           ...groupProps,
-          resourceSpec: job.resourceSpec && job.resourceSpec.length && job.resourceSpec[idx],
+          resourceSpec:
+            job.resourceSpec &&
+            job.resourceSpec.length &&
+            job.resourceSpec[idx],
         })
       );
     } else {
       groups = provide(job.groupsCount, (_, idx) =>
         server.create('task-group', {
           ...groupProps,
-          resourceSpec: job.resourceSpec && job.resourceSpec.length && job.resourceSpec[idx],
+          resourceSpec:
+            job.resourceSpec &&
+            job.resourceSpec.length &&
+            job.resourceSpec[idx],
         })
       );
     }
@@ -234,11 +276,15 @@ export default Factory.extend({
     });
 
     const hasChildren = job.periodic || (job.parameterized && !job.parentId);
-    const jobSummary = server.create('job-summary', hasChildren ? 'withChildren' : 'withSummary', {
-      jobId: job.id,
-      groupNames: groups.mapBy('name'),
-      namespace: job.namespace,
-    });
+    const jobSummary = server.create(
+      'job-summary',
+      hasChildren ? 'withChildren' : 'withSummary',
+      {
+        jobId: job.id,
+        groupNames: groups.mapBy('name'),
+        namespace: job.namespace,
+      }
+    );
 
     job.update({
       jobSummaryId: jobSummary.id,
@@ -271,7 +317,7 @@ export default Factory.extend({
 
     if (!job.shallow) {
       const knownEvaluationProperties = {
-        job,
+        jobId: job.id,
         namespace: job.namespace,
       };
       server.createList(
@@ -318,6 +364,7 @@ export default Factory.extend({
         datacenters: job.datacenters,
         createAllocations: job.createAllocations,
         shallow: job.shallow,
+        noActiveDeployment: job.noActiveDeployment,
       });
     }
 
@@ -340,6 +387,7 @@ export default Factory.extend({
         datacenters: job.datacenters,
         createAllocations: job.createAllocations,
         shallow: job.shallow,
+        noActiveDeployment: job.noActiveDeployment,
       });
     }
   },

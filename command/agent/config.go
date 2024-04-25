@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package agent
 
 import (
@@ -5,12 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +24,10 @@ import (
 	sockaddr "github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/go-sockaddr/template"
 	client "github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
+	"github.com/hashicorp/nomad/helper/users"
 	"github.com/hashicorp/nomad/nomad"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
@@ -30,9 +37,9 @@ import (
 // Config is the configuration for the Nomad agent.
 //
 // time.Duration values have two parts:
-// - a string field tagged with an hcl:"foo" and json:"-"
-// - a time.Duration field in the same struct and a call to duration
-//   in config_parse.go ParseConfigFile
+//   - a string field tagged with an hcl:"foo" and json:"-"
+//   - a time.Duration field in the same struct and a call to duration
+//     in config_parse.go ParseConfigFile
 //
 // All config structs should have an ExtraKeysHCL field to check for
 // unexpected keys
@@ -60,6 +67,11 @@ type Config struct {
 
 	// LogFile enables logging to a file
 	LogFile string `hcl:"log_file"`
+
+	// LogIncludeLocation dictates whether the logger includes file and line
+	// information on each log line. This is useful for Nomad development and
+	// debugging.
+	LogIncludeLocation bool `hcl:"log_include_location"`
 
 	// LogRotateDuration is the time period that logs should be rotated in
 	LogRotateDuration string `hcl:"log_rotate_duration"`
@@ -124,14 +136,13 @@ type Config struct {
 	// for security bulletins
 	DisableAnonymousSignature bool `hcl:"disable_anonymous_signature"`
 
-	// Consul contains the configuration for the Consul Agent and
-	// parameters necessary to register services, their checks, and
-	// discover the current Nomad servers.
-	Consul *config.ConsulConfig `hcl:"consul"`
+	// Consuls is a slice derived from multiple `consul` blocks, here to support
+	// features in Nomad Enterprise.
+	Consuls []*config.ConsulConfig `hcl:"-"`
 
-	// Vault contains the configuration for the Vault Agent and
-	// parameters necessary to derive tokens.
-	Vault *config.VaultConfig `hcl:"vault"`
+	// Vaults is a slice derived from multiple `vault` blocks, here to support
+	// features in Nomad Enterprise.
+	Vaults []*config.VaultConfig `hcl:"-"`
 
 	// UI is used to configure the web UI
 	UI *config.UIConfig `hcl:"ui"`
@@ -176,8 +187,29 @@ type Config struct {
 	// Audit contains the configuration for audit logging.
 	Audit *config.AuditConfig `hcl:"audit"`
 
+	// Reporting is used to enable go census reporting
+	Reporting *config.ReportingConfig `hcl:"reporting,block"`
+
 	// ExtraKeysHCL is used by hcl to surface unexpected keys
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+func (c *Config) defaultConsul() *config.ConsulConfig {
+	for _, cfg := range c.Consuls {
+		if cfg.Name == structs.ConsulDefaultCluster {
+			return cfg
+		}
+	}
+	return nil
+}
+
+func (c *Config) defaultVault() *config.VaultConfig {
+	for _, cfg := range c.Vaults {
+		if cfg.Name == structs.VaultDefaultCluster {
+			return cfg
+		}
+	}
+	return nil
 }
 
 // ClientConfig is configuration specific to the client mode
@@ -191,11 +223,22 @@ type ClientConfig struct {
 	// AllocDir is the directory for storing allocation data
 	AllocDir string `hcl:"alloc_dir"`
 
+	// AllocMountsDir is the directory for storing mounts into allocation data
+	AllocMountsDir string `hcl:"alloc_mounts_dir"`
+
 	// Servers is a list of known server addresses. These are as "host:port"
 	Servers []string `hcl:"servers"`
 
 	// NodeClass is used to group the node by class
 	NodeClass string `hcl:"node_class"`
+
+	// NodePool defines the node pool in which the client is registered.
+	//
+	// If the node pool does not exist, it will be created automatically if the
+	// node registers in the authoritative region. In non-authoritative
+	// regions, the node is kept in the 'initializing' status until the node
+	// pool is created and replicated.
+	NodePool string `hcl:"node_pool"`
 
 	// Options is used for configuration of nomad internals,
 	// like fingerprinters and drivers. The format is:
@@ -223,8 +266,14 @@ type ClientConfig struct {
 	// MemoryMB is used to override any detected or default total memory.
 	MemoryMB int `hcl:"memory_total_mb"`
 
+	// DiskTotalMB is used to override any detected or default total disk space.
+	DiskTotalMB int `hcl:"disk_total_mb"`
+
+	// DiskFreeMB is used to override any detected or default free disk space.
+	DiskFreeMB int `hcl:"disk_free_mb"`
+
 	// ReservableCores is used to override detected reservable cpu cores.
-	ReserveableCores string `hcl:"reservable_cores"`
+	ReservableCores string `hcl:"reservable_cores"`
 
 	// MaxKillTimeout allows capping the user-specifiable KillTimeout.
 	MaxKillTimeout string `hcl:"max_kill_timeout"`
@@ -305,6 +354,10 @@ type ClientConfig struct {
 	// the host
 	BridgeNetworkSubnet string `hcl:"bridge_network_subnet"`
 
+	// BridgeNetworkHairpinMode is whether or not to enable hairpin mode on the
+	// internal bridge network
+	BridgeNetworkHairpinMode bool `hcl:"bridge_network_hairpin_mode"`
+
 	// HostNetworks describes the different host networks available to the host
 	// if the host uses multiple interfaces
 	HostNetworks []*structs.ClientHostNetworkConfig `hcl:"host_network"`
@@ -318,8 +371,47 @@ type ClientConfig struct {
 	// doest not exist Nomad will attempt to create it during startup. Defaults to '/nomad'
 	CgroupParent string `hcl:"cgroup_parent"`
 
+	// NomadServiceDiscovery is a boolean parameter which allows operators to
+	// enable/disable to Nomad native service discovery feature on the client.
+	// This parameter is exposed via the Nomad fingerprinter and used to ensure
+	// correct scheduling decisions on allocations which require this.
+	NomadServiceDiscovery *bool `hcl:"nomad_service_discovery"`
+
+	// Artifact contains the configuration for artifacts.
+	Artifact *config.ArtifactConfig `hcl:"artifact"`
+
+	// Drain specifies whether to drain the client on shutdown; ignored in dev mode.
+	Drain *config.DrainConfig `hcl:"drain_on_shutdown"`
+
+	// Users is used to configure parameters around operating system users.
+	Users *config.UsersConfig `hcl:"users"`
+
 	// ExtraKeysHCL is used by hcl to surface unexpected keys
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+func (c *ClientConfig) Copy() *ClientConfig {
+	if c == nil {
+		return c
+	}
+
+	nc := *c
+	nc.Servers = slices.Clone(c.Servers)
+	nc.Options = maps.Clone(c.Options)
+	nc.Meta = maps.Clone(c.Meta)
+	nc.ChrootEnv = maps.Clone(c.ChrootEnv)
+	nc.Reserved = c.Reserved.Copy()
+	nc.NoHostUUID = pointer.Copy(c.NoHostUUID)
+	nc.TemplateConfig = c.TemplateConfig.Copy()
+	nc.ServerJoin = c.ServerJoin.Copy()
+	nc.HostVolumes = helper.CopySlice(c.HostVolumes)
+	nc.HostNetworks = helper.CopySlice(c.HostNetworks)
+	nc.NomadServiceDiscovery = pointer.Copy(c.NomadServiceDiscovery)
+	nc.Artifact = c.Artifact.Copy()
+	nc.Drain = c.Drain.Copy()
+	nc.Users = c.Users.Copy()
+	nc.ExtraKeysHCL = slices.Clone(c.ExtraKeysHCL)
+	return &nc
 }
 
 // ACLConfig is configuration specific to the ACL system
@@ -341,13 +433,41 @@ type ACLConfig struct {
 	PolicyTTL    time.Duration
 	PolicyTTLHCL string `hcl:"policy_ttl" json:"-"`
 
+	// RoleTTL controls how long we cache ACL roles. This controls how stale
+	// they can be when we are enforcing policies. Defaults to "30s".
+	// Reducing this impacts performance by forcing more frequent resolution.
+	RoleTTL    time.Duration
+	RoleTTLHCL string `hcl:"role_ttl" json:"-"`
+
 	// ReplicationToken is used by servers to replicate tokens and policies
 	// from the authoritative region. This must be a valid management token
 	// within the authoritative region.
 	ReplicationToken string `hcl:"replication_token"`
 
+	// TokenMinExpirationTTL is used to enforce the lowest acceptable value for
+	// ACL token expiration. This is used by the Nomad servers to validate ACL
+	// tokens with an expiration value set upon creation.
+	TokenMinExpirationTTL    time.Duration
+	TokenMinExpirationTTLHCL string `hcl:"token_min_expiration_ttl" json:"-"`
+
+	// TokenMaxExpirationTTL is used to enforce the highest acceptable value
+	// for ACL token expiration. This is used by the Nomad servers to validate
+	// ACL tokens with an expiration value set upon creation.
+	TokenMaxExpirationTTL    time.Duration
+	TokenMaxExpirationTTLHCL string `hcl:"token_max_expiration_ttl" json:"-"`
+
 	// ExtraKeysHCL is used by hcl to surface unexpected keys
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+func (a *ACLConfig) Copy() *ACLConfig {
+	if a == nil {
+		return nil
+	}
+
+	na := *a
+	na.ExtraKeysHCL = slices.Clone(a.ExtraKeysHCL)
+	return &na
 }
 
 // ServerConfig is configuration specific to the server mode
@@ -359,7 +479,7 @@ type ServerConfig struct {
 	// the source of truth for global tokens and ACL policies.
 	AuthoritativeRegion string `hcl:"authoritative_region"`
 
-	// BootstrapExpect tries to automatically bootstrap the Consul cluster,
+	// BootstrapExpect tries to automatically bootstrap the Nomad cluster,
 	// by withholding peers until enough servers join.
 	BootstrapExpect int `hcl:"bootstrap_expect"`
 
@@ -404,13 +524,22 @@ type ServerConfig struct {
 
 	// EvalGCThreshold controls how "old" an eval must be to be collected by GC.
 	// Age is not the only requirement for a eval to be GCed but the threshold
-	// can be used to filter by age.
+	// can be used to filter by age. Please note that batch job evaluations are
+	// controlled by 'BatchEvalGCThreshold' instead.
 	EvalGCThreshold string `hcl:"eval_gc_threshold"`
 
+	// BatchEvalGCThreshold controls how "old" an evaluation must be to be eligible
+	// for GC if the eval belongs to a batch job.
+	BatchEvalGCThreshold string `hcl:"batch_eval_gc_threshold"`
+
 	// DeploymentGCThreshold controls how "old" a deployment must be to be
-	// collected by GC.  Age is not the only requirement for a deployment to be
+	// collected by GC. Age is not the only requirement for a deployment to be
 	// GCed but the threshold can be used to filter by age.
 	DeploymentGCThreshold string `hcl:"deployment_gc_threshold"`
+
+	// CSIVolumeClaimGCInterval is how often we dispatch a job to GC
+	// volume claims.
+	CSIVolumeClaimGCInterval string `hcl:"csi_volume_claim_gc_interval"`
 
 	// CSIVolumeClaimGCThreshold controls how "old" a CSI volume must be to
 	// have its claims collected by GC.	Age is not the only requirement for
@@ -421,6 +550,23 @@ type ServerConfig struct {
 	// collected by GC. Age is not the only requirement for a plugin to be
 	// GCed but the threshold can be used to filter by age.
 	CSIPluginGCThreshold string `hcl:"csi_plugin_gc_threshold"`
+
+	// ACLTokenGCThreshold controls how "old" an expired ACL token must be to
+	// be collected by GC.
+	ACLTokenGCThreshold string `hcl:"acl_token_gc_threshold"`
+
+	// RootKeyGCInterval is how often we dispatch a job to GC
+	// encryption key metadata
+	RootKeyGCInterval string `hcl:"root_key_gc_interval"`
+
+	// RootKeyGCThreshold is how "old" encryption key metadata must be
+	// to be eligible for GC.
+	RootKeyGCThreshold string `hcl:"root_key_gc_threshold"`
+
+	// RootKeyRotationThreshold is how "old" an encryption key must be
+	// before it is automatically rotated on the next garbage
+	// collection interval.
+	RootKeyRotationThreshold string `hcl:"root_key_rotation_threshold"`
 
 	// HeartbeatGrace is the grace period beyond the TTL to account for network,
 	// processing delays and clock skew before marking a node as "down".
@@ -467,7 +613,7 @@ type ServerConfig struct {
 	RetryIntervalHCL string `hcl:"retry_interval" json:"-"`
 
 	// RejoinAfterLeave controls our interaction with the cluster after leave.
-	// When set to false (default), a leave causes Consul to not rejoin
+	// When set to false (default), a leave causes Nomad to not rejoin
 	// the cluster until an explicit join is received. If this is set to
 	// true, we ignore the leave, and rejoin the cluster on start.
 	RejoinAfterLeave bool `hcl:"rejoin_after_leave"`
@@ -493,6 +639,10 @@ type ServerConfig struct {
 	// Once the cluster is bootstrapped, and Raft persists the config (from here or through API),
 	// This value is ignored.
 	DefaultSchedulerConfig *structs.SchedulerConfiguration `hcl:"default_scheduler_config"`
+
+	// PlanRejectionTracker configures the node plan rejection tracker that
+	// detects potentially bad nodes.
+	PlanRejectionTracker *PlanRejectionTracker `hcl:"plan_rejection_tracker"`
 
 	// EnableEventBroker configures whether this server's state store
 	// will generate events for its event stream.
@@ -526,6 +676,74 @@ type ServerConfig struct {
 
 	// RaftBoltConfig configures boltdb as used by raft.
 	RaftBoltConfig *RaftBoltConfig `hcl:"raft_boltdb"`
+
+	// RaftSnapshotThreshold controls how many outstanding logs there must be
+	// before we perform a snapshot. This is to prevent excessive snapshotting by
+	// replaying a small set of logs instead. The value passed here is the initial
+	// setting used. This can be tuned during operation with a hot reload.
+	RaftSnapshotThreshold *int `hcl:"raft_snapshot_threshold"`
+
+	// RaftSnapshotInterval controls how often we check if we should perform a
+	// snapshot. We randomly stagger between this value and 2x this value to avoid
+	// the entire cluster from performing a snapshot at once. The value passed
+	// here is the initial setting used. This can be tuned during operation with a
+	// hot reload.
+	RaftSnapshotInterval *string `hcl:"raft_snapshot_interval"`
+
+	// RaftTrailingLogs controls how many logs are left after a snapshot. This is
+	// used so that we can quickly replay logs on a follower instead of being
+	// forced to send an entire snapshot. The value passed here is the initial
+	// setting used. This can be tuned during operation using a hot reload.
+	RaftTrailingLogs *int `hcl:"raft_trailing_logs"`
+
+	// JobDefaultPriority is the default Job priority if not specified.
+	JobDefaultPriority *int `hcl:"job_default_priority"`
+
+	// JobMaxPriority is an upper bound on the Job priority.
+	JobMaxPriority *int `hcl:"job_max_priority"`
+
+	// JobMaxSourceSize limits the maximum size of a jobs source hcl/json
+	// before being discarded automatically. If unset, the maximum size defaults
+	// to 1 MB. If the value is zero, no job sources will be stored.
+	JobMaxSourceSize *string `hcl:"job_max_source_size"`
+
+	// JobTrackedVersions is the number of historic job versions that are kept.
+	JobTrackedVersions *int `hcl:"job_tracked_versions"`
+
+	// OIDCIssuer if set enables OIDC Discovery and uses this value as the
+	// issuer. Third parties such as AWS IAM OIDC Provider expect the issuer to
+	// be a publically accessible HTTPS URL signed by a trusted well-known CA.
+	OIDCIssuer string `hcl:"oidc_issuer"`
+}
+
+func (s *ServerConfig) Copy() *ServerConfig {
+	if s == nil {
+		return nil
+	}
+
+	ns := *s
+	ns.RaftMultiplier = pointer.Copy(s.RaftMultiplier)
+	ns.NumSchedulers = pointer.Copy(s.NumSchedulers)
+	ns.EnabledSchedulers = slices.Clone(s.EnabledSchedulers)
+	ns.StartJoin = slices.Clone(s.StartJoin)
+	ns.RetryJoin = slices.Clone(s.RetryJoin)
+	ns.ServerJoin = s.ServerJoin.Copy()
+	ns.DefaultSchedulerConfig = s.DefaultSchedulerConfig.Copy()
+	ns.PlanRejectionTracker = s.PlanRejectionTracker.Copy()
+	ns.EnableEventBroker = pointer.Copy(s.EnableEventBroker)
+	ns.EventBufferSize = pointer.Copy(s.EventBufferSize)
+	ns.JobMaxSourceSize = pointer.Copy(s.JobMaxSourceSize)
+	ns.licenseAdditionalPublicKeys = slices.Clone(s.licenseAdditionalPublicKeys)
+	ns.ExtraKeysHCL = slices.Clone(s.ExtraKeysHCL)
+	ns.Search = s.Search.Copy()
+	ns.RaftBoltConfig = s.RaftBoltConfig.Copy()
+	ns.RaftSnapshotInterval = pointer.Copy(s.RaftSnapshotInterval)
+	ns.RaftSnapshotThreshold = pointer.Copy(s.RaftSnapshotThreshold)
+	ns.RaftTrailingLogs = pointer.Copy(s.RaftTrailingLogs)
+	ns.JobDefaultPriority = pointer.Copy(s.JobDefaultPriority)
+	ns.JobMaxPriority = pointer.Copy(s.JobMaxPriority)
+	ns.JobTrackedVersions = pointer.Copy(s.JobTrackedVersions)
+	return &ns
 }
 
 // RaftBoltConfig is used in servers to configure parameters of the boltdb
@@ -537,6 +755,73 @@ type RaftBoltConfig struct {
 	//
 	// Default: false.
 	NoFreelistSync bool `hcl:"no_freelist_sync"`
+}
+
+func (r *RaftBoltConfig) Copy() *RaftBoltConfig {
+	if r == nil {
+		return nil
+	}
+
+	nr := *r
+	return &nr
+}
+
+// PlanRejectionTracker is used in servers to configure the plan rejection
+// tracker.
+type PlanRejectionTracker struct {
+	// Enabled controls if the plan rejection tracker is active or not.
+	Enabled *bool `hcl:"enabled"`
+
+	// NodeThreshold is the number of times a node can have plan rejections
+	// before it is marked as ineligible.
+	NodeThreshold int `hcl:"node_threshold"`
+
+	// NodeWindow is the time window used to track active plan rejections for
+	// nodes.
+	NodeWindow    time.Duration
+	NodeWindowHCL string `hcl:"node_window" json:"-"`
+
+	// ExtraKeysHCL is used by hcl to surface unexpected keys
+	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+func (p *PlanRejectionTracker) Copy() *PlanRejectionTracker {
+	if p == nil {
+		return nil
+	}
+
+	np := *p
+	np.Enabled = pointer.Copy(p.Enabled)
+	np.ExtraKeysHCL = slices.Clone(p.ExtraKeysHCL)
+	return &np
+}
+
+func (p *PlanRejectionTracker) Merge(b *PlanRejectionTracker) *PlanRejectionTracker {
+	if p == nil {
+		return b
+	}
+
+	result := *p
+
+	if b == nil {
+		return &result
+	}
+
+	if b.Enabled != nil {
+		result.Enabled = b.Enabled
+	}
+
+	if b.NodeThreshold != 0 {
+		result.NodeThreshold = b.NodeThreshold
+	}
+
+	if b.NodeWindow != 0 {
+		result.NodeWindow = b.NodeWindow
+	}
+	if b.NodeWindowHCL != "" {
+		result.NodeWindowHCL = b.NodeWindowHCL
+	}
+	return &result
 }
 
 // Search is used in servers to configure search API options.
@@ -575,6 +860,15 @@ type Search struct {
 	MinTermLength int `hcl:"min_term_length"`
 }
 
+func (s *Search) Copy() *Search {
+	if s == nil {
+		return nil
+	}
+
+	ns := *s
+	return &ns
+}
+
 // ServerJoin is used in both clients and servers to bootstrap connections to
 // servers
 type ServerJoin struct {
@@ -600,6 +894,18 @@ type ServerJoin struct {
 
 	// ExtraKeysHCL is used by hcl to surface unexpected keys
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+func (s *ServerJoin) Copy() *ServerJoin {
+	if s == nil {
+		return nil
+	}
+
+	ns := *s
+	ns.StartJoin = slices.Clone(s.StartJoin)
+	ns.RetryJoin = slices.Clone(s.RetryJoin)
+	ns.ExtraKeysHCL = slices.Clone(s.ExtraKeysHCL)
+	return &ns
 }
 
 func (s *ServerJoin) Merge(b *ServerJoin) *ServerJoin {
@@ -636,6 +942,20 @@ func (s *ServerConfig) EncryptBytes() ([]byte, error) {
 
 // Telemetry is the telemetry configuration for the server
 type Telemetry struct {
+
+	// InMemoryCollectionInterval configures the in-memory sink collection
+	// interval. This sink is always configured and backs the JSON metrics API
+	// endpoint. This option is particularly useful for debugging or
+	// development.
+	InMemoryCollectionInterval string        `hcl:"in_memory_collection_interval"`
+	inMemoryCollectionInterval time.Duration `hcl:"-"`
+
+	// InMemoryRetentionPeriod configures the in-memory sink retention period
+	// This sink is always configured and backs the JSON metrics API endpoint.
+	// This option is particularly useful for debugging or development.
+	InMemoryRetentionPeriod string        `hcl:"in_memory_retention_period"`
+	inMemoryRetentionPeriod time.Duration `hcl:"-"`
+
 	StatsiteAddr             string        `hcl:"statsite_address"`
 	StatsdAddr               string        `hcl:"statsd_address"`
 	DataDogAddr              string        `hcl:"datadog_address"`
@@ -660,6 +980,12 @@ type Telemetry struct {
 	// high numbers of single count dispatch jobs as the metrics for each take up
 	// a small memory overhead.
 	DisableDispatchedJobSummaryMetrics bool `hcl:"disable_dispatched_job_summary_metrics"`
+
+	// DisableRPCRateMetricsLabels drops the label for the identity of the
+	// requester when publishing metrics on RPC rate on the server. This may be
+	// useful to control metrics collection costs in environments where request
+	// rate is well-controlled but cardinality of requesters is high.
+	DisableRPCRateMetricsLabels bool `hcl:"disable_rpc_rate_metrics_labels"`
 
 	// Circonus: see https://github.com/circonus-labs/circonus-gometrics
 	// for more details on the various configuration options.
@@ -736,9 +1062,22 @@ type Telemetry struct {
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
+func (t *Telemetry) Copy() *Telemetry {
+	if t == nil {
+		return nil
+	}
+
+	nt := *t
+	nt.DataDogTags = slices.Clone(t.DataDogTags)
+	nt.PrefixFilter = slices.Clone(t.PrefixFilter)
+	nt.FilterDefault = pointer.Copy(t.FilterDefault)
+	nt.ExtraKeysHCL = slices.Clone(t.ExtraKeysHCL)
+	return &nt
+}
+
 // PrefixFilters parses the PrefixFilter field and returns a list of allowed and blocked filters
-func (a *Telemetry) PrefixFilters() (allowed, blocked []string, err error) {
-	for _, rule := range a.PrefixFilter {
+func (t *Telemetry) PrefixFilters() (allowed, blocked []string, err error) {
+	for _, rule := range t.PrefixFilter {
 		if rule == "" {
 			continue
 		}
@@ -754,6 +1093,30 @@ func (a *Telemetry) PrefixFilters() (allowed, blocked []string, err error) {
 	return allowed, blocked, nil
 }
 
+// Validate the telemetry configuration options. These are used by the agent,
+// regardless of mode, so can live here rather than a structs package. It is
+// safe to call, without checking whether the config object is nil first.
+func (t *Telemetry) Validate() error {
+	if t == nil {
+		return nil
+	}
+
+	// Ensure we have durations that are greater than zero.
+	if t.inMemoryCollectionInterval <= 0 {
+		return errors.New("telemetry in-memory collection interval must be greater than zero")
+	}
+	if t.inMemoryRetentionPeriod <= 0 {
+		return errors.New("telemetry in-memory retention period must be greater than zero")
+	}
+
+	// Ensure the in-memory durations do not conflict.
+	if t.inMemoryCollectionInterval > t.inMemoryRetentionPeriod {
+		return errors.New("telemetry in-memory collection interval cannot be greater than retention period")
+	}
+
+	return nil
+}
+
 // Ports encapsulates the various ports we bind to for network services. If any
 // are not specified then the defaults are used instead.
 type Ports struct {
@@ -762,6 +1125,16 @@ type Ports struct {
 	Serf int `hcl:"serf"`
 	// ExtraKeysHCL is used by hcl to surface unexpected keys
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
+}
+
+func (p *Ports) Copy() *Ports {
+	if p == nil {
+		return nil
+	}
+
+	np := *p
+	np.ExtraKeysHCL = slices.Clone(p.ExtraKeysHCL)
+	return &np
 }
 
 // Addresses encapsulates all of the addresses we bind to for various
@@ -774,13 +1147,33 @@ type Addresses struct {
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
-// AdvertiseAddrs is used to control the addresses we advertise out for
+func (a *Addresses) Copy() *Addresses {
+	if a == nil {
+		return nil
+	}
+
+	na := *a
+	na.ExtraKeysHCL = slices.Clone(a.ExtraKeysHCL)
+	return &na
+}
+
+// NormalizedAddrs is used to control the addresses we advertise out for
 // different network services. All are optional and default to BindAddr and
 // their default Port.
 type NormalizedAddrs struct {
 	HTTP []string
 	RPC  string
 	Serf string
+}
+
+func (n *NormalizedAddrs) Copy() *NormalizedAddrs {
+	if n == nil {
+		return nil
+	}
+
+	nn := *n
+	nn.HTTP = slices.Clone(n.HTTP)
+	return &nn
 }
 
 // AdvertiseAddrs is used to control the addresses we advertise out for
@@ -794,6 +1187,16 @@ type AdvertiseAddrs struct {
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
+func (a *AdvertiseAddrs) Copy() *AdvertiseAddrs {
+	if a == nil {
+		return nil
+	}
+
+	na := *a
+	na.ExtraKeysHCL = slices.Clone(a.ExtraKeysHCL)
+	return &na
+}
+
 type Resources struct {
 	CPU           int    `hcl:"cpu"`
 	MemoryMB      int    `hcl:"memory"`
@@ -804,52 +1207,58 @@ type Resources struct {
 	ExtraKeysHCL []string `hcl:",unusedKeys" json:"-"`
 }
 
+func (r *Resources) Copy() *Resources {
+	if r == nil {
+		return nil
+	}
+
+	nr := *r
+	nr.ExtraKeysHCL = slices.Clone(r.ExtraKeysHCL)
+	return &nr
+}
+
 // devModeConfig holds the config for the -dev and -dev-connect flags
 type devModeConfig struct {
 	// mode flags are set at the command line via -dev and -dev-connect
 	defaultMode bool
 	connectMode bool
+	consulMode  bool
+	vaultMode   bool
 
 	bindAddr string
 	iface    string
 }
 
-// newDevModeConfig parses the optional string value of the -dev flag
-func newDevModeConfig(devMode, connectMode bool) (*devModeConfig, error) {
-	if !devMode && !connectMode {
-		return nil, nil
-	}
-	mode := &devModeConfig{}
-	mode.defaultMode = devMode
-	if connectMode {
+func (mode *devModeConfig) enabled() bool {
+	return mode.defaultMode || mode.connectMode ||
+		mode.consulMode || mode.vaultMode
+}
+
+func (mode *devModeConfig) validate() error {
+	if mode.connectMode {
 		if runtime.GOOS != "linux" {
 			// strictly speaking -dev-connect only binds to the
 			// non-localhost interface, but given its purpose
 			// is to support a feature with network namespaces
 			// we'll return an error here rather than let the agent
 			// come up and fail unexpectedly to run jobs
-			return nil, fmt.Errorf("-dev-connect is only supported on linux.")
+			return fmt.Errorf("-dev-connect is only supported on linux.")
 		}
-		u, err := user.Current()
+		u, err := users.Current()
 		if err != nil {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"-dev-connect uses network namespaces and is only supported for root: %v", err)
 		}
 		if u.Uid != "0" {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"-dev-connect uses network namespaces and is only supported for root.")
 		}
 		// Ensure Consul is on PATH
 		if _, err := exec.LookPath("consul"); err != nil {
-			return nil, fmt.Errorf("-dev-connect requires a 'consul' binary in Nomad's $PATH")
+			return fmt.Errorf("-dev-connect requires a 'consul' binary in Nomad's $PATH")
 		}
-		mode.connectMode = true
 	}
-	err := mode.networkConfig()
-	if err != nil {
-		return nil, err
-	}
-	return mode, nil
+	return nil
 }
 
 func (mode *devModeConfig) networkConfig() error {
@@ -900,7 +1309,7 @@ func DevConfig(mode *devModeConfig) *Config {
 	conf.Server.BootstrapExpect = 1
 	conf.EnableDebug = true
 	conf.DisableAnonymousSignature = true
-	conf.Consul.AutoAdvertise = helper.BoolToPtr(true)
+	conf.defaultConsul().AutoAdvertise = pointer.Of(true)
 	conf.Client.NetworkInterface = mode.iface
 	conf.Client.Options = map[string]string{
 		"driver.raw_exec.enable": "true",
@@ -910,21 +1319,39 @@ func DevConfig(mode *devModeConfig) *Config {
 	conf.Client.GCDiskUsageThreshold = 99
 	conf.Client.GCInodeUsageThreshold = 99
 	conf.Client.GCMaxAllocs = 50
-	conf.Client.TemplateConfig = &client.ClientTemplateConfig{
-		FunctionDenylist: []string{"plugin"},
-		DisableSandbox:   false,
-	}
+	conf.Client.Options[fingerprint.TightenNetworkTimeoutsConfig] = "true"
 	conf.Client.BindWildcardDefaultHostNetwork = true
+	conf.Client.NomadServiceDiscovery = pointer.Of(true)
+	conf.Client.ReservableCores = "" // inherit all the cores
 	conf.Telemetry.PrometheusMetrics = true
 	conf.Telemetry.PublishAllocationMetrics = true
 	conf.Telemetry.PublishNodeMetrics = true
 
+	if mode.consulMode {
+		conf.Consuls[0].ServiceIdentity = &config.WorkloadIdentityConfig{
+			Audience: []string{"consul.io"},
+			TTL:      pointer.Of(time.Hour),
+		}
+		conf.Consuls[0].TaskIdentity = &config.WorkloadIdentityConfig{
+			Audience: []string{"consul.io"},
+			TTL:      pointer.Of(time.Hour),
+		}
+	}
+
+	if mode.vaultMode {
+		conf.Vaults[0].Enabled = pointer.Of(true)
+		conf.Vaults[0].Addr = "http://localhost:8200"
+		conf.Vaults[0].DefaultIdentity = &config.WorkloadIdentityConfig{
+			Audience: []string{"vault.io"},
+			TTL:      pointer.Of(time.Hour),
+		}
+	}
 	return conf
 }
 
-// DefaultConfig is a the baseline configuration for Nomad
+// DefaultConfig is the baseline configuration for Nomad.
 func DefaultConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		LogLevel:   "INFO",
 		Region:     "global",
 		Datacenter: "dc1",
@@ -936,11 +1363,12 @@ func DefaultConfig() *Config {
 		},
 		Addresses:      &Addresses{},
 		AdvertiseAddrs: &AdvertiseAddrs{},
-		Consul:         config.DefaultConsulConfig(),
-		Vault:          config.DefaultVaultConfig(),
+		Consuls:        []*config.ConsulConfig{config.DefaultConsulConfig()},
+		Vaults:         []*config.VaultConfig{config.DefaultVaultConfig()},
 		UI:             config.DefaultUIConfig(),
 		Client: &ClientConfig{
 			Enabled:               false,
+			NodePool:              structs.NodePoolDefault,
 			MaxKillTimeout:        "30s",
 			ClientMinPort:         14000,
 			ClientMaxPort:         14512,
@@ -952,27 +1380,33 @@ func DefaultConfig() *Config {
 			GCDiskUsageThreshold:  80,
 			GCInodeUsageThreshold: 70,
 			GCMaxAllocs:           50,
-			NoHostUUID:            helper.BoolToPtr(true),
+			NoHostUUID:            pointer.Of(true),
 			DisableRemoteExec:     false,
 			ServerJoin: &ServerJoin{
 				RetryJoin:        []string{},
 				RetryInterval:    30 * time.Second,
 				RetryMaxAttempts: 0,
 			},
-			TemplateConfig: &client.ClientTemplateConfig{
-				FunctionDenylist: []string{"plugin"},
-				DisableSandbox:   false,
-			},
+			TemplateConfig:                 client.DefaultTemplateConfig(),
 			BindWildcardDefaultHostNetwork: true,
 			CNIPath:                        "/opt/cni/bin",
 			CNIConfigDir:                   "/opt/cni/config",
+			NomadServiceDiscovery:          pointer.Of(true),
+			Artifact:                       config.DefaultArtifactConfig(),
+			Drain:                          nil,
+			Users:                          config.DefaultUsersConfig(),
 		},
 		Server: &ServerConfig{
 			Enabled:           false,
-			EnableEventBroker: helper.BoolToPtr(true),
-			EventBufferSize:   helper.IntToPtr(100),
+			EnableEventBroker: pointer.Of(true),
+			EventBufferSize:   pointer.Of(100),
 			RaftProtocol:      3,
 			StartJoin:         []string{},
+			PlanRejectionTracker: &PlanRejectionTracker{
+				Enabled:       pointer.Of(false),
+				NodeThreshold: 100,
+				NodeWindow:    5 * time.Minute,
+			},
 			ServerJoin: &ServerJoin{
 				RetryJoin:        []string{},
 				RetryInterval:    30 * time.Second,
@@ -984,25 +1418,35 @@ func DefaultConfig() *Config {
 				LimitResults:  100,
 				MinTermLength: 2,
 			},
+			JobMaxSourceSize:   pointer.Of("1M"),
+			JobTrackedVersions: pointer.Of(structs.JobDefaultTrackedVersions),
 		},
 		ACL: &ACLConfig{
 			Enabled:   false,
 			TokenTTL:  30 * time.Second,
 			PolicyTTL: 30 * time.Second,
+			RoleTTL:   30 * time.Second,
 		},
 		SyslogFacility: "LOCAL0",
 		Telemetry: &Telemetry{
-			CollectionInterval: "1s",
-			collectionInterval: 1 * time.Second,
+			InMemoryCollectionInterval: "10s",
+			inMemoryCollectionInterval: 10 * time.Second,
+			InMemoryRetentionPeriod:    "1m",
+			inMemoryRetentionPeriod:    1 * time.Minute,
+			CollectionInterval:         "1s",
+			collectionInterval:         1 * time.Second,
 		},
 		TLSConfig:          &config.TLSConfig{},
 		Sentinel:           &config.SentinelConfig{},
 		Version:            version.GetVersion(),
 		Autopilot:          config.DefaultAutopilotConfig(),
 		Audit:              &config.AuditConfig{},
-		DisableUpdateCheck: helper.BoolToPtr(false),
+		DisableUpdateCheck: pointer.Of(false),
 		Limits:             config.DefaultLimits(),
+		Reporting:          config.DefaultReporting(),
 	}
+
+	return cfg
 }
 
 // Listener can be used to get a new listener using a custom bind address.
@@ -1058,6 +1502,9 @@ func (c *Config) Merge(b *Config) *Config {
 	if b.LogFile != "" {
 		result.LogFile = b.LogFile
 	}
+	if b.LogIncludeLocation {
+		result.LogIncludeLocation = true
+	}
 	if b.LogRotateDuration != "" {
 		result.LogRotateDuration = b.LogRotateDuration
 	}
@@ -1086,7 +1533,7 @@ func (c *Config) Merge(b *Config) *Config {
 		result.SyslogFacility = b.SyslogFacility
 	}
 	if b.DisableUpdateCheck != nil {
-		result.DisableUpdateCheck = helper.BoolToPtr(*b.DisableUpdateCheck)
+		result.DisableUpdateCheck = pointer.Of(*b.DisableUpdateCheck)
 	}
 	if b.DisableAnonymousSignature {
 		result.DisableAnonymousSignature = true
@@ -1098,6 +1545,13 @@ func (c *Config) Merge(b *Config) *Config {
 		result.Telemetry = &telemetry
 	} else if b.Telemetry != nil {
 		result.Telemetry = result.Telemetry.Merge(b.Telemetry)
+	}
+
+	// Apply the Reporting Config
+	if result.Reporting == nil && b.Reporting != nil {
+		result.Reporting = b.Reporting.Copy()
+	} else if b.Reporting != nil {
+		result.Reporting = result.Reporting.Merge(b.Reporting)
 	}
 
 	// Apply the TLS Config
@@ -1163,20 +1617,11 @@ func (c *Config) Merge(b *Config) *Config {
 		result.AdvertiseAddrs = result.AdvertiseAddrs.Merge(b.AdvertiseAddrs)
 	}
 
-	// Apply the Consul Configuration
-	if result.Consul == nil && b.Consul != nil {
-		result.Consul = b.Consul.Copy()
-	} else if b.Consul != nil {
-		result.Consul = result.Consul.Merge(b.Consul)
-	}
+	// Apply the Consul Configurations
+	result.Consuls = mergeConsulConfigs(result.Consuls, b.Consuls)
 
-	// Apply the Vault Configuration
-	if result.Vault == nil && b.Vault != nil {
-		vaultConfig := *b.Vault
-		result.Vault = &vaultConfig
-	} else if b.Vault != nil {
-		result.Vault = result.Vault.Merge(b.Vault)
-	}
+	// Apply the Vault Configurations
+	result.Vaults = mergeVaultConfigs(result.Vaults, b.Vaults)
 
 	// Apply the UI Configuration
 	if result.UI == nil && b.UI != nil {
@@ -1225,6 +1670,111 @@ func (c *Config) Merge(b *Config) *Config {
 	result.Limits = c.Limits.Merge(b.Limits)
 
 	return &result
+}
+
+// mergeVaultConfigs takes two slices of VaultConfig and returns a slice
+// containing the superset of all configurations, and with every configuration
+// with the same name merged
+func mergeVaultConfigs(left, right []*config.VaultConfig) []*config.VaultConfig {
+	results := []*config.VaultConfig{}
+
+	doMerge := func(dstConfigs, srcConfigs []*config.VaultConfig) []*config.VaultConfig {
+		for _, src := range srcConfigs {
+			if src.Name == "" {
+				src.Name = "default"
+			}
+			var found bool
+			for i, dst := range dstConfigs {
+				if dst.Name == src.Name {
+					dstConfigs[i] = dst.Merge(src)
+					found = true
+					break
+				}
+			}
+			if !found {
+				dstConfigs = append(dstConfigs, config.DefaultVaultConfig().Merge(src))
+			}
+		}
+		return dstConfigs
+	}
+
+	results = doMerge(results, left)
+	results = doMerge(results, right)
+	return results
+}
+
+// mergeConsulConfigs takes two slices of ConsulConfig and returns a slice
+// containing the superset of all configurations, and with every configuration
+// with the same name merged
+func mergeConsulConfigs(left, right []*config.ConsulConfig) []*config.ConsulConfig {
+	if len(left) == 0 {
+		return right
+	}
+	if len(right) == 0 {
+		return left
+	}
+	results := []*config.ConsulConfig{}
+
+	doMerge := func(dstConfigs, srcConfigs []*config.ConsulConfig) []*config.ConsulConfig {
+		for _, src := range srcConfigs {
+			if src.Name == "" {
+				src.Name = "default"
+			}
+			var found bool
+			for i, dst := range dstConfigs {
+				if dst.Name == src.Name {
+					dstConfigs[i] = dst.Merge(src)
+					found = true
+					break
+				}
+			}
+			if !found {
+				dstConfigs = append(dstConfigs, config.DefaultConsulConfig().Merge(src))
+			}
+		}
+		return dstConfigs
+	}
+
+	results = doMerge(results, left)
+	results = doMerge(results, right)
+	return results
+}
+
+// Copy returns a deep copy safe for mutation.
+func (c *Config) Copy() *Config {
+	if c == nil {
+		return nil
+	}
+	nc := *c
+
+	nc.Ports = c.Ports.Copy()
+	nc.Addresses = c.Addresses.Copy()
+	nc.normalizedAddrs = c.normalizedAddrs.Copy()
+	nc.AdvertiseAddrs = c.AdvertiseAddrs.Copy()
+	nc.Client = c.Client.Copy()
+	nc.Server = c.Server.Copy()
+	nc.ACL = c.ACL.Copy()
+	nc.Telemetry = c.Telemetry.Copy()
+	nc.DisableUpdateCheck = pointer.Copy(c.DisableUpdateCheck)
+	nc.Consuls = helper.CopySlice(c.Consuls)
+	nc.Vaults = helper.CopySlice(c.Vaults)
+	nc.UI = c.UI.Copy()
+
+	nc.NomadConfig = c.NomadConfig.Copy()
+	nc.ClientConfig = c.ClientConfig.Copy()
+
+	nc.Version = c.Version.Copy()
+	nc.Files = slices.Clone(c.Files)
+	nc.TLSConfig = c.TLSConfig.Copy()
+	nc.HTTPAPIResponseHeaders = maps.Clone(c.HTTPAPIResponseHeaders)
+	nc.Sentinel = c.Sentinel.Copy()
+	nc.Autopilot = c.Autopilot.Copy()
+	nc.Plugins = helper.CopySlice(c.Plugins)
+	nc.Limits = c.Limits.Copy()
+	nc.Audit = c.Audit.Copy()
+	nc.Reporting = c.Reporting.Copy()
+	nc.ExtraKeysHCL = slices.Clone(c.ExtraKeysHCL)
+	return &nc
 }
 
 // normalizeAddrs normalizes Addresses and AdvertiseAddrs to always be
@@ -1458,6 +2008,24 @@ func (a *ACLConfig) Merge(b *ACLConfig) *ACLConfig {
 	if b.PolicyTTLHCL != "" {
 		result.PolicyTTLHCL = b.PolicyTTLHCL
 	}
+	if b.RoleTTL != 0 {
+		result.RoleTTL = b.RoleTTL
+	}
+	if b.RoleTTLHCL != "" {
+		result.RoleTTLHCL = b.RoleTTLHCL
+	}
+	if b.TokenMinExpirationTTL != 0 {
+		result.TokenMinExpirationTTL = b.TokenMinExpirationTTL
+	}
+	if b.TokenMinExpirationTTLHCL != "" {
+		result.TokenMinExpirationTTLHCL = b.TokenMinExpirationTTLHCL
+	}
+	if b.TokenMaxExpirationTTL != 0 {
+		result.TokenMaxExpirationTTL = b.TokenMaxExpirationTTL
+	}
+	if b.TokenMaxExpirationTTLHCL != "" {
+		result.TokenMaxExpirationTTLHCL = b.TokenMaxExpirationTTLHCL
+	}
 	if b.ReplicationToken != "" {
 		result.ReplicationToken = b.ReplicationToken
 	}
@@ -1491,7 +2059,7 @@ func (s *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 		result.RaftMultiplier = &c
 	}
 	if b.NumSchedulers != nil {
-		result.NumSchedulers = helper.IntToPtr(*b.NumSchedulers)
+		result.NumSchedulers = pointer.Of(*b.NumSchedulers)
 	}
 	if b.NodeGCThreshold != "" {
 		result.NodeGCThreshold = b.NodeGCThreshold
@@ -1502,17 +2070,41 @@ func (s *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 	if b.JobGCThreshold != "" {
 		result.JobGCThreshold = b.JobGCThreshold
 	}
+	if b.JobDefaultPriority != nil {
+		result.JobDefaultPriority = pointer.Of(*b.JobDefaultPriority)
+	}
+	if b.JobMaxPriority != nil {
+		result.JobMaxPriority = pointer.Of(*b.JobMaxPriority)
+	}
 	if b.EvalGCThreshold != "" {
 		result.EvalGCThreshold = b.EvalGCThreshold
 	}
+	if b.BatchEvalGCThreshold != "" {
+		result.BatchEvalGCThreshold = b.BatchEvalGCThreshold
+	}
 	if b.DeploymentGCThreshold != "" {
 		result.DeploymentGCThreshold = b.DeploymentGCThreshold
+	}
+	if b.CSIVolumeClaimGCInterval != "" {
+		result.CSIVolumeClaimGCInterval = b.CSIVolumeClaimGCInterval
 	}
 	if b.CSIVolumeClaimGCThreshold != "" {
 		result.CSIVolumeClaimGCThreshold = b.CSIVolumeClaimGCThreshold
 	}
 	if b.CSIPluginGCThreshold != "" {
 		result.CSIPluginGCThreshold = b.CSIPluginGCThreshold
+	}
+	if b.ACLTokenGCThreshold != "" {
+		result.ACLTokenGCThreshold = b.ACLTokenGCThreshold
+	}
+	if b.RootKeyGCInterval != "" {
+		result.RootKeyGCInterval = b.RootKeyGCInterval
+	}
+	if b.RootKeyGCThreshold != "" {
+		result.RootKeyGCThreshold = b.RootKeyGCThreshold
+	}
+	if b.RootKeyRotationThreshold != "" {
+		result.RootKeyRotationThreshold = b.RootKeyRotationThreshold
 	}
 	if b.HeartbeatGrace != 0 {
 		result.HeartbeatGrace = b.HeartbeatGrace
@@ -1574,6 +2166,12 @@ func (s *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 		result.EventBufferSize = b.EventBufferSize
 	}
 
+	result.JobMaxSourceSize = pointer.Merge(s.JobMaxSourceSize, b.JobMaxSourceSize)
+
+	if b.PlanRejectionTracker != nil {
+		result.PlanRejectionTracker = result.PlanRejectionTracker.Merge(b.PlanRejectionTracker)
+	}
+
 	if b.DefaultSchedulerConfig != nil {
 		c := *b.DefaultSchedulerConfig
 		result.DefaultSchedulerConfig = &c
@@ -1600,6 +2198,26 @@ func (s *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 		result.RaftBoltConfig = &RaftBoltConfig{
 			NoFreelistSync: b.RaftBoltConfig.NoFreelistSync,
 		}
+	}
+
+	if b.RaftSnapshotThreshold != nil {
+		result.RaftSnapshotThreshold = pointer.Of(*b.RaftSnapshotThreshold)
+	}
+
+	if b.RaftSnapshotInterval != nil {
+		result.RaftSnapshotInterval = pointer.Of(*b.RaftSnapshotInterval)
+	}
+
+	if b.RaftTrailingLogs != nil {
+		result.RaftTrailingLogs = pointer.Of(*b.RaftTrailingLogs)
+	}
+
+	if b.JobTrackedVersions != nil {
+		result.JobTrackedVersions = b.JobTrackedVersions
+	}
+
+	if b.OIDCIssuer != "" {
+		result.OIDCIssuer = b.OIDCIssuer
 	}
 
 	// Add the schedulers
@@ -1631,8 +2249,14 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	if b.AllocDir != "" {
 		result.AllocDir = b.AllocDir
 	}
+	if b.AllocMountsDir != "" {
+		result.AllocMountsDir = b.AllocMountsDir
+	}
 	if b.NodeClass != "" {
 		result.NodeClass = b.NodeClass
+	}
+	if b.NodePool != "" {
+		result.NodePool = b.NodePool
 	}
 	if b.NetworkInterface != "" {
 		result.NetworkInterface = b.NetworkInterface
@@ -1645,6 +2269,12 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	}
 	if b.MemoryMB != 0 {
 		result.MemoryMB = b.MemoryMB
+	}
+	if b.DiskTotalMB != 0 {
+		result.DiskTotalMB = b.DiskTotalMB
+	}
+	if b.DiskFreeMB != 0 {
+		result.DiskFreeMB = b.DiskFreeMB
 	}
 	if b.MaxKillTimeout != "" {
 		result.MaxKillTimeout = b.MaxKillTimeout
@@ -1667,8 +2297,8 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	} else if b.Reserved != nil {
 		result.Reserved = result.Reserved.Merge(b.Reserved)
 	}
-	if b.ReserveableCores != "" {
-		result.ReserveableCores = b.ReserveableCores
+	if b.ReservableCores != "" {
+		result.ReservableCores = b.ReservableCores
 	}
 	if b.GCInterval != 0 {
 		result.GCInterval = b.GCInterval
@@ -1697,10 +2327,7 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 		result.DisableRemoteExec = b.DisableRemoteExec
 	}
 
-	if result.TemplateConfig == nil && b.TemplateConfig != nil {
-		templateConfig := *b.TemplateConfig
-		result.TemplateConfig = &templateConfig
-	} else if b.TemplateConfig != nil {
+	if b.TemplateConfig != nil {
 		result.TemplateConfig = result.TemplateConfig.Merge(b.TemplateConfig)
 	}
 
@@ -1754,6 +2381,10 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 		result.BridgeNetworkSubnet = b.BridgeNetworkSubnet
 	}
 
+	if b.BridgeNetworkHairpinMode {
+		result.BridgeNetworkHairpinMode = true
+	}
+
 	result.HostNetworks = a.HostNetworks
 
 	if len(b.HostNetworks) != 0 {
@@ -1763,13 +2394,40 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	if b.BindWildcardDefaultHostNetwork {
 		result.BindWildcardDefaultHostNetwork = true
 	}
+
+	// This value is a pointer, therefore if it is not nil the user has
+	// supplied an override value.
+	if b.NomadServiceDiscovery != nil {
+		result.NomadServiceDiscovery = b.NomadServiceDiscovery
+	}
+
+	if b.CgroupParent != "" {
+		result.CgroupParent = b.CgroupParent
+	}
+
+	result.Artifact = a.Artifact.Merge(b.Artifact)
+	result.Drain = a.Drain.Merge(b.Drain)
+	result.Users = a.Users.Merge(b.Users)
+
 	return &result
 }
 
 // Merge is used to merge two telemetry configs together
-func (a *Telemetry) Merge(b *Telemetry) *Telemetry {
-	result := *a
+func (t *Telemetry) Merge(b *Telemetry) *Telemetry {
+	result := *t
 
+	if b.InMemoryCollectionInterval != "" {
+		result.InMemoryCollectionInterval = b.InMemoryCollectionInterval
+	}
+	if b.inMemoryCollectionInterval != 0 {
+		result.inMemoryCollectionInterval = b.inMemoryCollectionInterval
+	}
+	if b.InMemoryRetentionPeriod != "" {
+		result.InMemoryRetentionPeriod = b.InMemoryRetentionPeriod
+	}
+	if b.inMemoryRetentionPeriod != 0 {
+		result.inMemoryRetentionPeriod = b.inMemoryRetentionPeriod
+	}
 	if b.StatsiteAddr != "" {
 		result.StatsiteAddr = b.StatsiteAddr
 	}
@@ -1854,6 +2512,9 @@ func (a *Telemetry) Merge(b *Telemetry) *Telemetry {
 
 	if b.DisableDispatchedJobSummaryMetrics {
 		result.DisableDispatchedJobSummaryMetrics = b.DisableDispatchedJobSummaryMetrics
+	}
+	if b.DisableRPCRateMetricsLabels {
+		result.DisableRPCRateMetricsLabels = b.DisableRPCRateMetricsLabels
 	}
 
 	return &result

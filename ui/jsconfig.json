@@ -1,5 +1,7 @@
 {
-    "compilerOptions": {
-      "experimentalDecorators": true
-    }
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "target": "es2015",
+    "moduleResolution": "node"
+  } 
 }

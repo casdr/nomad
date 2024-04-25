@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { inject as service } from '@ember/service';
 import Controller from '@ember/controller';
 import { action, computed } from '@ember/object';
@@ -17,7 +22,7 @@ export default class ExecController extends Controller {
   @service system;
   @service token;
 
-  queryParams = ['allocation'];
+  queryParams = ['allocation', 'namespace'];
 
   @localStorageProperty('nomadExecCommand', '/bin/bash') command;
   socketOpen = false;
@@ -47,7 +52,12 @@ export default class ExecController extends Controller {
     window.execTerminal = this.terminal; // Issue to improve: https://github.com/hashicorp/nomad/issues/7457
 
     this.terminal.write(ANSI_UI_GRAY_400);
-    this.terminal.writeln('Select a task to start your session.');
+
+    if (this.sortedTaskGroups.length > 0) {
+      this.terminal.writeln('Select a task to start your session.');
+    } else {
+      this.terminal.writeln(`There are no tasks running for this job.`);
+    }
   }
 
   @alias('model.allocations') allocations;
@@ -70,7 +80,10 @@ export default class ExecController extends Controller {
     if (this.allocationShortId) {
       allocation = this.allocations.findBy('shortId', this.allocationShortId);
     } else {
-      allocation = this.allocations.find((allocation) =>
+      let allocationPool = this.taskGroupName
+        ? this.allocations.filterBy('taskGroupName', this.taskGroupName)
+        : this.allocations;
+      allocation = allocationPool.find((allocation) =>
         allocation.states
           .filterBy('isActive')
           .mapBy('name')
@@ -108,10 +121,16 @@ export default class ExecController extends Controller {
         'Customize your command, then hit ‘return’ to run.'
       );
       this.terminal.writeln('');
+
+      let namespaceCommandString = '';
+      if (this.namespace && this.namespace !== 'default') {
+        namespaceCommandString = `-namespace ${this.namespace} `;
+      }
+
       this.terminal.write(
-        `$ nomad alloc exec -i -t -task ${escapeTaskName(taskName)} ${
-          this.taskState.allocation.shortId
-        } `
+        `$ nomad alloc exec -i -t ${namespaceCommandString}-task ${escapeTaskName(
+          taskName
+        )} ${this.taskState.allocation.shortId} `
       );
 
       this.terminal.write(ANSI_WHITE);

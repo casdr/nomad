@@ -4,7 +4,10 @@
       "enabled": true,
       "policy_ttl": "60s",
       "replication_token": "foobar",
-      "token_ttl": "60s"
+      "token_ttl": "60s",
+      "role_ttl": "60s",
+      "token_min_expiration_ttl": "1h",
+      "token_max_expiration_ttl": "100h"
     }
   ],
   "audit": {
@@ -26,9 +29,15 @@
       {
         "default": [
           {
-            "endpoints": ["/v1/metrics"],
-            "operations": ["*"],
-            "stages": ["*"],
+            "endpoints": [
+              "/v1/metrics"
+            ],
+            "operations": [
+              "*"
+            ],
+            "stages": [
+              "*"
+            ],
             "type": "HTTPEvent"
           }
         ]
@@ -64,6 +73,7 @@
   "client": [
     {
       "alloc_dir": "/tmp/alloc",
+      "alloc_mounts_dir": "/tmp/mounts",
       "bridge_network_name": "custom_bridge_name",
       "bridge_network_subnet": "custom_bridge_subnet",
       "chroot_env": [
@@ -158,7 +168,27 @@
       "server_rpc_check_name": "nomad-server-rpc-health-check",
       "server_serf_check_name": "nomad-server-serf-health-check",
       "server_service_name": "nomad",
+      "service_auth_method": "nomad-services",
+      "task_auth_method": "nomad-tasks",
+      "service_identity": {
+        "aud": [
+          "consul.io",
+          "nomad.dev"
+        ],
+        "env": false,
+        "file": true,
+        "ttl": "1h"
+      },
       "ssl": true,
+      "task_identity": {
+        "aud": [
+          "consul.io"
+        ],
+        "env": true,
+        "file": false,
+        "ttl": "2h"
+      },
+      "timeout": "5s",
       "token": "token1",
       "verify_ssl": true
     }
@@ -177,6 +207,7 @@
   "leave_on_interrupt": true,
   "leave_on_terminate": true,
   "log_file": "/var/log/nomad.log",
+  "log_include_location": true,
   "log_json": true,
   "log_level": "ERR",
   "name": "my-web",
@@ -254,6 +285,7 @@
   ],
   "server": [
     {
+      "acl_token_gc_threshold": "12h",
       "authoritative_region": "foobar",
       "bootstrap_expect": 5,
       "csi_plugin_gc_threshold": "12h",
@@ -268,6 +300,7 @@
       ],
       "encrypt": "abc",
       "eval_gc_threshold": "12h",
+      "csi_volume_claim_gc_interval": "3m",
       "heartbeat_grace": "30s",
       "job_gc_interval": "3m",
       "job_gc_threshold": "12h",
@@ -277,6 +310,11 @@
       "node_gc_threshold": "12h",
       "non_voting_server": true,
       "num_schedulers": 2,
+      "plan_rejection_tracker": {
+        "enabled": true,
+        "node_threshold": 100,
+        "node_window": "41m"
+      },
       "raft_protocol": 3,
       "raft_multiplier": 4,
       "redundancy_zone": "foo",
@@ -301,21 +339,29 @@
         "1.1.1.1",
         "2.2.2.2"
       ],
-      "default_scheduler_config": [{
-        "scheduler_algorithm": "spread",
-        "preemption_config": [{
-          "batch_scheduler_enabled": true,
-          "system_scheduler_enabled": true,
-          "service_scheduler_enabled": true
-        }]
-      }],
+      "default_scheduler_config": [
+        {
+          "scheduler_algorithm": "spread",
+          "preemption_config": [
+            {
+              "batch_scheduler_enabled": true,
+              "system_scheduler_enabled": true,
+              "service_scheduler_enabled": true
+            }
+          ]
+        }
+      ],
       "upgrade_version": "0.8.0",
-      "license_path": "/tmp/nomad.hclic"
+      "license_path": "/tmp/nomad.hclic",
+      "job_default_priority": 100,
+      "job_max_priority": 200
     }
   ],
   "syslog_facility": "LOCAL1",
   "telemetry": [
     {
+      "in_memory_collection_interval": "1m",
+      "in_memory_retention_period": "24h",
       "collection_interval": "3s",
       "disable_hostname": true,
       "prometheus_metrics": true,
@@ -348,12 +394,27 @@
       "ca_path": "/path/to/ca",
       "cert_file": "/path/to/cert/file",
       "create_from_role": "test_role",
+      "default_identity": {
+        "aud": [
+          "vault.io",
+          "nomad.io"
+        ],
+        "env": false,
+        "file": true,
+        "ttl": "3h"
+      },
       "enabled": false,
+      "jwt_auth_backend_path": "nomad_jwt",
       "key_file": "/path/to/key/file",
       "task_token_ttl": "1s",
       "tls_server_name": "foobar",
       "tls_skip_verify": true,
       "token": "12345"
     }
-  ]
+  ],
+  "reporting": {
+    "license": {
+      "enabled": "true"
+    }
+  }
 }

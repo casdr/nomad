@@ -1,8 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
+	"fmt"
+
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/pkg/errors"
 )
 
 type jobNamespaceConstraintCheckHook struct {
@@ -20,7 +24,7 @@ func (c jobNamespaceConstraintCheckHook) Validate(job *structs.Job) (warnings []
 		return nil, err
 	}
 	if ns == nil {
-		return nil, errors.Errorf("job %q is in nonexistent namespace %q", job.ID, job.Namespace)
+		return nil, fmt.Errorf("job %q is in nonexistent namespace %q", job.ID, job.Namespace)
 	}
 
 	var disallowedDrivers []string
@@ -33,12 +37,14 @@ func (c jobNamespaceConstraintCheckHook) Validate(job *structs.Job) (warnings []
 	}
 	if len(disallowedDrivers) > 0 {
 		if len(disallowedDrivers) == 1 {
-			return nil, errors.Errorf(
-				"used task driver %q is not allowed in namespace %q", disallowedDrivers[0], ns.Name)
+			return nil, fmt.Errorf(
+				"used task driver %q is not allowed in namespace %q", disallowedDrivers[0], ns.Name,
+			)
 
 		} else {
-			return nil, errors.Errorf(
-				"used task drivers %q are not allowed in namespace %q", disallowedDrivers, ns.Name)
+			return nil, fmt.Errorf(
+				"used task drivers %q are not allowed in namespace %q", disallowedDrivers, ns.Name,
+			)
 		}
 	}
 	return nil, nil

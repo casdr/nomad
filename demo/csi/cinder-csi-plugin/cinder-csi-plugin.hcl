@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
 job "cinder-csi-plugin" {
   datacenters = ["dc1"]
   type        = "system"
@@ -34,7 +37,7 @@ EOF
         args = [
           "/bin/cinder-csi-plugin",
           "-v=4",
-          "--endpoint=unix:///csi/csi.sock",
+          "--endpoint=${CSI_ENDPOINT}",
           "--cloud-config=/etc/config/cloud.conf",
           "--nodeid=${node.unique.name}",
         ]
@@ -73,7 +76,7 @@ EOF
         args = [
           "/bin/cinder-csi-plugin",
           "-v=4",
-          "--endpoint=unix:///csi/csi.sock",
+          "--endpoint=${CSI_ENDPOINT}",
           "--cloud-config=/etc/config/cloud.conf",
           "--nodeid=${node.unique.name}",
           "--cluster=${NOMAD_DC}"
@@ -88,4 +91,3 @@ EOF
     }
   }
 }
-

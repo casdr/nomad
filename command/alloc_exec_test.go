@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -13,8 +16,7 @@ import (
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/mitchellh/cli"
 	"github.com/posener/complete"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/shoenig/test/must"
 )
 
 // static check
@@ -58,7 +60,7 @@ func TestAllocExecCommand_Fails(t *testing.T) {
 		{
 			"job not found",
 			[]string{"-address=" + url, "-job", "example", "/bin/bash"},
-			`job "example" doesn't exist`,
+			`No job(s) with prefix or ID "example" found`,
 		},
 		{
 			"command missing",
@@ -83,32 +85,18 @@ func TestAllocExecCommand_Fails(t *testing.T) {
 			cmd := &AllocExecCommand{Meta: Meta{Ui: ui}}
 
 			code := cmd.Run(c.args)
-			require.Equal(t, 1, code)
+			must.One(t, code)
 
-			require.Contains(t, ui.ErrorWriter.String(), c.expectedError)
+			out := ui.ErrorWriter.String()
+			must.StrContains(t, out, c.expectedError)
 
 			ui.ErrorWriter.Reset()
 			ui.OutputWriter.Reset()
-
 		})
 	}
 
 	// Wait for a node to be ready
-	testutil.WaitForResult(func() (bool, error) {
-		nodes, _, err := client.Nodes().List(nil)
-		if err != nil {
-			return false, err
-		}
-		for _, node := range nodes {
-			if _, ok := node.Drivers["mock_driver"]; ok &&
-				node.Status == structs.NodeStatusReady {
-				return true, nil
-			}
-		}
-		return false, fmt.Errorf("no ready nodes")
-	}, func(err error) {
-		require.NoError(t, err)
-	})
+	waitForNodes(t, client)
 
 	t.Run("non existent task", func(t *testing.T) {
 		ui := cli.NewMockUi()
@@ -116,10 +104,12 @@ func TestAllocExecCommand_Fails(t *testing.T) {
 
 		jobID := "job1_sfx"
 		job1 := testJob(jobID)
+
 		resp, _, err := client.Jobs().Register(job1, nil)
-		require.NoError(t, err)
+		must.NoError(t, err)
+
 		code := waitForSuccess(ui, client, fullId, t, resp.EvalID)
-		require.Zero(t, code, "status code not zero")
+		must.Zero(t, code)
 
 		// get an alloc id
 		allocId1 := ""
@@ -128,16 +118,24 @@ func TestAllocExecCommand_Fails(t *testing.T) {
 				allocId1 = allocs[0].ID
 			}
 		}
-		require.NotEmpty(t, allocId1, "unable to find allocation")
+		must.NotEq(t, "", allocId1)
 
 		// by alloc
-		require.Equal(t, 1, cmd.Run([]string{"-address=" + url, "-task=nonexistenttask1", allocId1, "/bin/bash"}))
-		require.Contains(t, ui.ErrorWriter.String(), "Could not find task named: nonexistenttask1")
+		code = cmd.Run([]string{"-address=" + url, "-task=nonexistenttask1", allocId1, "/bin/bash"})
+		must.One(t, code)
+
+		out := ui.ErrorWriter.String()
+		must.StrContains(t, out, "Could not find task named: nonexistenttask1")
+
 		ui.ErrorWriter.Reset()
 
 		// by jobID
-		require.Equal(t, 1, cmd.Run([]string{"-address=" + url, "-task=nonexistenttask2", "-job", jobID, "/bin/bash"}))
-		require.Contains(t, ui.ErrorWriter.String(), "Could not find task named: nonexistenttask2")
+		code = cmd.Run([]string{"-address=" + url, "-task=nonexistenttask2", "-job", jobID, "/bin/bash"})
+		must.One(t, code)
+
+		out = ui.ErrorWriter.String()
+		must.StrContains(t, out, "Could not find task named: nonexistenttask2")
+
 		ui.ErrorWriter.Reset()
 	})
 
@@ -145,7 +143,6 @@ func TestAllocExecCommand_Fails(t *testing.T) {
 
 func TestAllocExecCommand_AutocompleteArgs(t *testing.T) {
 	ci.Parallel(t)
-	assert := assert.New(t)
 
 	srv, _, url := testServer(t, true, nil)
 	defer srv.Shutdown()
@@ -156,15 +153,15 @@ func TestAllocExecCommand_AutocompleteArgs(t *testing.T) {
 	// Create a fake alloc
 	state := srv.Agent.Server().State()
 	a := mock.Alloc()
-	assert.Nil(state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, []*structs.Allocation{a}))
+	must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, []*structs.Allocation{a}))
 
 	prefix := a.ID[:5]
 	args := complete.Args{Last: prefix}
 	predictor := cmd.AutocompleteArgs()
 
 	res := predictor.Predict(args)
-	assert.Equal(1, len(res))
-	assert.Equal(a.ID, res[0])
+	must.Len(t, 1, res)
+	must.Eq(t, a.ID, res[0])
 }
 
 func TestAllocExecCommand_Run(t *testing.T) {
@@ -173,22 +170,7 @@ func TestAllocExecCommand_Run(t *testing.T) {
 	defer srv.Shutdown()
 
 	// Wait for a node to be ready
-	testutil.WaitForResult(func() (bool, error) {
-		nodes, _, err := client.Nodes().List(nil)
-		if err != nil {
-			return false, err
-		}
-
-		for _, node := range nodes {
-			if _, ok := node.Drivers["mock_driver"]; ok &&
-				node.Status == structs.NodeStatusReady {
-				return true, nil
-			}
-		}
-		return false, fmt.Errorf("no ready nodes")
-	}, func(err error) {
-		require.NoError(t, err)
-	})
+	waitForNodes(t, client)
 
 	jobID := uuid.Generate()
 	job := testJob(jobID)
@@ -202,11 +184,11 @@ func TestAllocExecCommand_Run(t *testing.T) {
 		},
 	}
 	resp, _, err := client.Jobs().Register(job, nil)
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	evalUi := cli.NewMockUi()
 	code := waitForSuccess(evalUi, client, fullId, t, resp.EvalID)
-	require.Equal(t, 0, code, "failed to get status - output: %v", evalUi.ErrorWriter.String())
+	must.Zero(t, code)
 
 	allocId := ""
 
@@ -227,10 +209,7 @@ func TestAllocExecCommand_Run(t *testing.T) {
 
 		allocId = alloc.ID
 		return true, nil
-	}, func(err error) {
-		require.NoError(t, err)
-
-	})
+	}, func(err error) { must.NoError(t, err) })
 
 	cases := []struct {
 		name    string
@@ -271,9 +250,9 @@ func TestAllocExecCommand_Run(t *testing.T) {
 			}
 
 			code = cmd.Run([]string{"-address=" + url, allocId, c.command})
-			assert.Equal(t, c.exitCode, code)
-			assert.Equal(t, c.stdout, strings.TrimSpace(stdout.String()))
-			assert.Equal(t, c.stderr, strings.TrimSpace(stderr.String()))
+			must.Eq(t, c.exitCode, code)
+			must.Eq(t, c.stdout, strings.TrimSpace(stdout.String()))
+			must.Eq(t, c.stderr, strings.TrimSpace(stderr.String()))
 		})
 		t.Run("by job: "+c.name, func(t *testing.T) {
 			ui := cli.NewMockUi()
@@ -287,9 +266,9 @@ func TestAllocExecCommand_Run(t *testing.T) {
 			}
 
 			code = cmd.Run([]string{"-address=" + url, "-job", jobID, c.command})
-			assert.Equal(t, c.exitCode, code)
-			assert.Equal(t, c.stdout, strings.TrimSpace(stdout.String()))
-			assert.Equal(t, c.stderr, strings.TrimSpace(stderr.String()))
+			must.Eq(t, c.exitCode, code)
+			must.Eq(t, c.stdout, strings.TrimSpace(stdout.String()))
+			must.Eq(t, c.stderr, strings.TrimSpace(stderr.String()))
 		})
 	}
 }

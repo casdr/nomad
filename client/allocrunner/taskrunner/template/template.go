@@ -1,11 +1,16 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package template
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,14 +19,19 @@ import (
 
 	ctconf "github.com/hashicorp/consul-template/config"
 	"github.com/hashicorp/consul-template/manager"
+	"github.com/hashicorp/consul-template/renderer"
 	"github.com/hashicorp/consul-template/signals"
 	envparse "github.com/hashicorp/go-envparse"
+	"github.com/hashicorp/go-hclog"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/allocrunner/taskrunner/interfaces"
+	trenderer "github.com/hashicorp/nomad/client/allocrunner/taskrunner/template/renderer"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/taskenv"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
+	"github.com/hashicorp/nomad/helper/subproc"
 	"github.com/hashicorp/nomad/nomad/structs"
+	structsc "github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 const (
@@ -53,6 +63,10 @@ type TaskTemplateManager struct {
 
 	// runner is the consul-template runner
 	runner *manager.Runner
+
+	// handle is used to execute scripts
+	handle     interfaces.ScriptExecutor
+	handleLock sync.Mutex
 
 	// signals is a lookup map from the string representation of a signal to its
 	// actual signal
@@ -88,8 +102,20 @@ type TaskTemplateManagerConfig struct {
 	// ConsulNamespace is the Consul namespace for the task
 	ConsulNamespace string
 
+	// ConsulToken is the Consul ACL token fetched by consul_hook using
+	// workload identity
+	ConsulToken string
+
+	// ConsulConfig is the Consul configuration to use for this template. It may
+	// be nil if Nomad has no Consul cofiguration
+	ConsulConfig *structsc.ConsulConfig
+
 	// VaultToken is the Vault token for the task.
 	VaultToken string
+
+	// VaultConfig is the Vault configuration to use for this template. It may
+	// be nil if the task does not use Vault.
+	VaultConfig *structsc.VaultConfig
 
 	// VaultNamespace is the Vault namespace for the task
 	VaultNamespace string
@@ -102,6 +128,18 @@ type TaskTemplateManagerConfig struct {
 
 	// MaxTemplateEventRate is the maximum rate at which we should emit events.
 	MaxTemplateEventRate time.Duration
+
+	// NomadNamespace is the Nomad namespace for the task
+	NomadNamespace string
+
+	// NomadToken is the Nomad token or identity claim for the task
+	NomadToken string
+
+	// TaskID is a unique identifier for this task's template manager, for use
+	// in downstream platform-specific template runner consumers
+	TaskID string
+
+	Logger hclog.Logger
 }
 
 // Validate validates the configuration.
@@ -156,6 +194,13 @@ func NewTaskTemplateManager(config *TaskTemplateManagerConfig) (*TaskTemplateMan
 		tm.signals[tmpl.ChangeSignal] = sig
 	}
 
+	// the platform sandbox needs to be created before we construct the runner
+	// so that reading the template is sandboxed
+	err := createPlatformSandbox(config)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build the consul-template runner
 	runner, lookup, err := templateRunner(config)
 	if err != nil {
@@ -184,6 +229,16 @@ func (tm *TaskTemplateManager) Stop() {
 	if tm.runner != nil {
 		tm.runner.Stop()
 	}
+
+	destroyPlatformSandbox(tm.config)
+}
+
+// SetDriverHandle sets the executor
+func (tm *TaskTemplateManager) SetDriverHandle(executor interfaces.ScriptExecutor) {
+	tm.handleLock.Lock()
+	defer tm.handleLock.Unlock()
+	tm.handle = executor
+
 }
 
 // run is the long lived loop that handles errors and templates being rendered
@@ -195,10 +250,14 @@ func (tm *TaskTemplateManager) run() {
 		return
 	}
 
-	// Start the runner
+	// Start the runner. We don't defer a call to tm.runner.Stop here so that
+	// the runner can keep dynamic secrets alive during the task's
+	// kill_timeout. We stop the runner in the Stop hook, which is guaranteed to
+	// be called during task kill.
 	go tm.runner.Start()
 
-	// Block till all the templates have been rendered
+	// Block till all the templates have been rendered or until an error has
+	// triggered taskrunner Kill, which closes tm.shutdownCh before we return
 	tm.handleFirstRender()
 
 	// Detect if there was a shutdown.
@@ -258,6 +317,9 @@ WAIT:
 				continue
 			}
 
+			// we don't return here so that we wait for tm.shutdownCh in the
+			// next pass thru the loop; this ensures the callers doesn't unblock
+			// prematurely
 			tm.config.Lifecycle.Kill(context.Background(),
 				structs.NewTaskEvent(structs.TaskKilling).
 					SetFailsTask().
@@ -372,6 +434,9 @@ func (tm *TaskTemplateManager) handleTemplateRerenders(allRenderedTime time.Time
 				continue
 			}
 
+			// we don't return here so that we wait for tm.shutdownCh in the
+			// next pass thru the loop; this ensures the callers doesn't unblock
+			// prematurely
 			tm.config.Lifecycle.Kill(context.Background(),
 				structs.NewTaskEvent(structs.TaskKilling).
 					SetFailsTask().
@@ -386,6 +451,7 @@ func (tm *TaskTemplateManager) onTemplateRendered(handledRenders map[string]time
 
 	var handling []string
 	signals := make(map[string]struct{})
+	scripts := []*structs.ChangeScript{}
 	restart := false
 	var splay time.Duration
 
@@ -430,6 +496,8 @@ func (tm *TaskTemplateManager) onTemplateRendered(handledRenders map[string]time
 				signals[tmpl.ChangeSignal] = struct{}{}
 			case structs.TemplateChangeModeRestart:
 				restart = true
+			case structs.TemplateChangeModeScript:
+				scripts = append(scripts, tmpl.ChangeScript)
 			case structs.TemplateChangeModeNoop:
 				continue
 			}
@@ -442,52 +510,131 @@ func (tm *TaskTemplateManager) onTemplateRendered(handledRenders map[string]time
 		handling = append(handling, id)
 	}
 
-	if restart || len(signals) != 0 {
-		if splay != 0 {
-			ns := splay.Nanoseconds()
-			offset := rand.Int63n(ns)
-			t := time.Duration(offset)
+	shouldHandle := restart || len(signals) != 0 || len(scripts) != 0
+	if !shouldHandle {
+		return
+	}
 
-			select {
-			case <-time.After(t):
-			case <-tm.shutdownCh:
-				return
-			}
-		}
+	// Apply splay timeout to avoid applying change_mode too frequently.
+	if splay != 0 {
+		ns := splay.Nanoseconds()
+		offset := rand.Int63n(ns)
+		t := time.Duration(offset)
 
-		// Update handle time
-		for _, id := range handling {
-			handledRenders[id] = events[id].LastDidRender
-		}
-
-		if restart {
-			tm.config.Lifecycle.Restart(context.Background(),
-				structs.NewTaskEvent(structs.TaskRestartSignal).
-					SetDisplayMessage("Template with change_mode restart re-rendered"), false)
-		} else if len(signals) != 0 {
-			var mErr multierror.Error
-			for signal := range signals {
-				s := tm.signals[signal]
-				event := structs.NewTaskEvent(structs.TaskSignaling).SetTaskSignal(s).SetDisplayMessage("Template re-rendered")
-				if err := tm.config.Lifecycle.Signal(event, signal); err != nil {
-					_ = multierror.Append(&mErr, err)
-				}
-			}
-
-			if err := mErr.ErrorOrNil(); err != nil {
-				flat := make([]os.Signal, 0, len(signals))
-				for signal := range signals {
-					flat = append(flat, tm.signals[signal])
-				}
-
-				tm.config.Lifecycle.Kill(context.Background(),
-					structs.NewTaskEvent(structs.TaskKilling).
-						SetFailsTask().
-						SetDisplayMessage(fmt.Sprintf("Template failed to send signals %v: %v", flat, err)))
-			}
+		select {
+		case <-time.After(t):
+		case <-tm.shutdownCh:
+			return
 		}
 	}
 
+	// Update handle time
+	for _, id := range handling {
+		handledRenders[id] = events[id].LastDidRender
+	}
+
+	if restart {
+		tm.config.Lifecycle.Restart(context.Background(),
+			structs.NewTaskEvent(structs.TaskRestartSignal).
+				SetDisplayMessage("Template with change_mode restart re-rendered"), false)
+	} else {
+		// Handle signals and scripts since the task may have multiple
+		// templates with mixed change_mode values.
+		tm.handleChangeModeSignal(signals)
+		tm.handleChangeModeScript(scripts)
+	}
+}
+
+func (tm *TaskTemplateManager) handleChangeModeSignal(signals map[string]struct{}) {
+	var mErr multierror.Error
+	for signal := range signals {
+		s := tm.signals[signal]
+		event := structs.NewTaskEvent(structs.TaskSignaling).SetTaskSignal(s).SetDisplayMessage("Template re-rendered")
+		if err := tm.config.Lifecycle.Signal(event, signal); err != nil {
+			_ = multierror.Append(&mErr, err)
+		}
+	}
+
+	if err := mErr.ErrorOrNil(); err != nil {
+		flat := make([]os.Signal, 0, len(signals))
+		for signal := range signals {
+			flat = append(flat, tm.signals[signal])
+		}
+
+		tm.config.Lifecycle.Kill(context.Background(),
+			structs.NewTaskEvent(structs.TaskKilling).
+				SetFailsTask().
+				SetDisplayMessage(fmt.Sprintf("Template failed to send signals %v: %v", flat, err)))
+	}
+}
+
+func (tm *TaskTemplateManager) handleChangeModeScript(scripts []*structs.ChangeScript) {
+	// process script execution concurrently
+	var wg sync.WaitGroup
+	for _, script := range scripts {
+		wg.Add(1)
+		go tm.processScript(script, &wg)
+	}
+	wg.Wait()
+}
+
+// handleScriptError is a helper function that produces a TaskKilling event and
+// emits a message
+func (tm *TaskTemplateManager) handleScriptError(script *structs.ChangeScript, msg string) {
+	ev := structs.NewTaskEvent(structs.TaskHookFailed).SetDisplayMessage(msg)
+	tm.config.Events.EmitEvent(ev)
+
+	if script.FailOnError {
+		tm.config.Lifecycle.Kill(context.Background(),
+			structs.NewTaskEvent(structs.TaskKilling).
+				SetFailsTask().
+				SetDisplayMessage("Template script failed, task is being killed"))
+	}
+}
+
+// processScript is used for executing change_mode script and handling errors
+func (tm *TaskTemplateManager) processScript(script *structs.ChangeScript, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	if tm.handle == nil {
+		failureMsg := fmt.Sprintf(
+			"Template failed to run script %v with arguments %v because task driver doesn't support the exec operation",
+			script.Command,
+			script.Args,
+		)
+		tm.handleScriptError(script, failureMsg)
+		return
+	}
+	_, exitCode, err := tm.handle.Exec(script.Timeout, script.Command, script.Args)
+	if err != nil {
+		failureMsg := fmt.Sprintf(
+			"Template failed to run script %v with arguments %v on change: %v Exit code: %v",
+			script.Command,
+			script.Args,
+			err,
+			exitCode,
+		)
+		tm.handleScriptError(script, failureMsg)
+		return
+	}
+	if exitCode != 0 {
+		failureMsg := fmt.Sprintf(
+			"Template ran script %v with arguments %v on change but it exited with code code: %v",
+			script.Command,
+			script.Args,
+			exitCode,
+		)
+		tm.handleScriptError(script, failureMsg)
+		return
+	}
+	tm.config.Events.EmitEvent(structs.NewTaskEvent(structs.TaskHookMessage).
+		SetDisplayMessage(
+			fmt.Sprintf(
+				"Template successfully ran script %v with arguments: %v. Exit code: %v",
+				script.Command,
+				script.Args,
+				exitCode,
+			)))
 }
 
 // allTemplatesNoop returns whether all the managed templates have change mode noop.
@@ -594,6 +741,7 @@ func parseTemplateConfigs(config *TaskTemplateManagerConfig) (map[*ctconf.Templa
 		ct.Contents = &tmpl.EmbeddedTmpl
 		ct.LeftDelim = &tmpl.LeftDelim
 		ct.RightDelim = &tmpl.RightDelim
+		ct.ErrMissingKey = &tmpl.ErrMissingKey
 		ct.FunctionDenylist = config.ClientConfig.TemplateConfig.FunctionDenylist
 		if sandboxEnabled {
 			ct.SandboxPath = &config.TaskDir
@@ -605,7 +753,7 @@ func parseTemplateConfigs(config *TaskTemplateManagerConfig) (map[*ctconf.Templa
 			}
 
 			ct.Wait = &ctconf.WaitConfig{
-				Enabled: helper.BoolToPtr(true),
+				Enabled: pointer.Of(true),
 				Min:     tmpl.Wait.Min,
 				Max:     tmpl.Wait.Max,
 			}
@@ -620,6 +768,14 @@ func parseTemplateConfigs(config *TaskTemplateManagerConfig) (map[*ctconf.Templa
 			m := os.FileMode(v)
 			ct.Perms = &m
 		}
+		// Set ownership
+		if tmpl.Uid != nil && *tmpl.Uid >= 0 {
+			ct.Uid = tmpl.Uid
+		}
+		if tmpl.Gid != nil && *tmpl.Gid >= 0 {
+			ct.Gid = tmpl.Gid
+		}
+
 		ct.Finalize()
 
 		ctmpls[ct] = tmpl
@@ -698,35 +854,43 @@ func newRunnerConfig(config *TaskTemplateManagerConfig,
 	}
 
 	// Set up the Consul config
-	if cc.ConsulConfig != nil {
-		conf.Consul.Address = &cc.ConsulConfig.Addr
-		conf.Consul.Token = &cc.ConsulConfig.Token
+	if config.ConsulConfig != nil {
+		conf.Consul.Address = &config.ConsulConfig.Addr
+
+		// if we're using WI, use the token from consul_hook
+		// NOTE: from Nomad 1.9 on, WI will be the only supported way of
+		// getting Consul tokens
+		if config.ConsulToken != "" {
+			conf.Consul.Token = &config.ConsulToken
+		} else {
+			conf.Consul.Token = &config.ConsulConfig.Token
+		}
 
 		// Get the Consul namespace from agent config. This is the lower level
 		// of precedence (beyond default).
-		if cc.ConsulConfig.Namespace != "" {
-			conf.Consul.Namespace = &cc.ConsulConfig.Namespace
+		if config.ConsulConfig.Namespace != "" {
+			conf.Consul.Namespace = &config.ConsulConfig.Namespace
 		}
 
-		if cc.ConsulConfig.EnableSSL != nil && *cc.ConsulConfig.EnableSSL {
-			verify := cc.ConsulConfig.VerifySSL != nil && *cc.ConsulConfig.VerifySSL
+		if config.ConsulConfig.EnableSSL != nil && *config.ConsulConfig.EnableSSL {
+			verify := config.ConsulConfig.VerifySSL != nil && *config.ConsulConfig.VerifySSL
 			conf.Consul.SSL = &ctconf.SSLConfig{
-				Enabled: helper.BoolToPtr(true),
+				Enabled: pointer.Of(true),
 				Verify:  &verify,
-				Cert:    &cc.ConsulConfig.CertFile,
-				Key:     &cc.ConsulConfig.KeyFile,
-				CaCert:  &cc.ConsulConfig.CAFile,
+				Cert:    &config.ConsulConfig.CertFile,
+				Key:     &config.ConsulConfig.KeyFile,
+				CaCert:  &config.ConsulConfig.CAFile,
 			}
 		}
 
-		if cc.ConsulConfig.Auth != "" {
-			parts := strings.SplitN(cc.ConsulConfig.Auth, ":", 2)
+		if config.ConsulConfig.Auth != "" {
+			parts := strings.SplitN(config.ConsulConfig.Auth, ":", 2)
 			if len(parts) != 2 {
 				return nil, fmt.Errorf("Failed to parse Consul Auth config")
 			}
 
 			conf.Consul.Auth = &ctconf.AuthConfig{
-				Enabled:  helper.BoolToPtr(true),
+				Enabled:  pointer.Of(true),
 				Username: &parts[0],
 				Password: &parts[1],
 			}
@@ -755,37 +919,37 @@ func newRunnerConfig(config *TaskTemplateManagerConfig,
 	// Set up the Vault config
 	// Always set these to ensure nothing is picked up from the environment
 	emptyStr := ""
-	conf.Vault.RenewToken = helper.BoolToPtr(false)
+	conf.Vault.RenewToken = pointer.Of(false)
 	conf.Vault.Token = &emptyStr
-	if cc.VaultConfig != nil && cc.VaultConfig.IsEnabled() {
-		conf.Vault.Address = &cc.VaultConfig.Addr
+	if config.VaultConfig != nil && config.VaultConfig.IsEnabled() {
+		conf.Vault.Address = &config.VaultConfig.Addr
 		conf.Vault.Token = &config.VaultToken
 
 		// Set the Vault Namespace. Passed in Task config has
 		// highest precedence.
-		if config.ClientConfig.VaultConfig.Namespace != "" {
-			conf.Vault.Namespace = &config.ClientConfig.VaultConfig.Namespace
+		if config.VaultConfig.Namespace != "" {
+			conf.Vault.Namespace = &config.VaultConfig.Namespace
 		}
 		if config.VaultNamespace != "" {
 			conf.Vault.Namespace = &config.VaultNamespace
 		}
 
-		if strings.HasPrefix(cc.VaultConfig.Addr, "https") || cc.VaultConfig.TLSCertFile != "" {
-			skipVerify := cc.VaultConfig.TLSSkipVerify != nil && *cc.VaultConfig.TLSSkipVerify
+		if strings.HasPrefix(config.VaultConfig.Addr, "https") || config.VaultConfig.TLSCertFile != "" {
+			skipVerify := config.VaultConfig.TLSSkipVerify != nil && *config.VaultConfig.TLSSkipVerify
 			verify := !skipVerify
 			conf.Vault.SSL = &ctconf.SSLConfig{
-				Enabled:    helper.BoolToPtr(true),
+				Enabled:    pointer.Of(true),
 				Verify:     &verify,
-				Cert:       &cc.VaultConfig.TLSCertFile,
-				Key:        &cc.VaultConfig.TLSKeyFile,
-				CaCert:     &cc.VaultConfig.TLSCaFile,
-				CaPath:     &cc.VaultConfig.TLSCaPath,
-				ServerName: &cc.VaultConfig.TLSServerName,
+				Cert:       &config.VaultConfig.TLSCertFile,
+				Key:        &config.VaultConfig.TLSKeyFile,
+				CaCert:     &config.VaultConfig.TLSCaFile,
+				CaPath:     &config.VaultConfig.TLSCaPath,
+				ServerName: &config.VaultConfig.TLSServerName,
 			}
 		} else {
 			conf.Vault.SSL = &ctconf.SSLConfig{
-				Enabled:    helper.BoolToPtr(false),
-				Verify:     helper.BoolToPtr(false),
+				Enabled:    pointer.Of(false),
+				Verify:     pointer.Of(false),
 				Cert:       &emptyStr,
 				Key:        &emptyStr,
 				CaCert:     &emptyStr,
@@ -807,8 +971,131 @@ func newRunnerConfig(config *TaskTemplateManagerConfig,
 		}
 	}
 
+	// Set up Nomad
+	conf.Nomad.Namespace = &config.NomadNamespace
+	conf.Nomad.Transport.CustomDialer = cc.TemplateDialer
+	conf.Nomad.Token = &config.NomadToken
+	if cc.TemplateConfig != nil && cc.TemplateConfig.NomadRetry != nil {
+		// Set the user-specified Nomad RetryConfig
+		var err error
+		if err = cc.TemplateConfig.NomadRetry.Validate(); err != nil {
+			return nil, err
+		}
+		conf.Nomad.Retry, err = cc.TemplateConfig.NomadRetry.ToConsulTemplate()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	sandboxEnabled := isSandboxEnabled(config)
+	sandboxDir := filepath.Dir(config.TaskDir) // alloc working directory
+	conf.ReaderFunc = ReaderFn(config.TaskID, sandboxDir, sandboxEnabled)
+	conf.RendererFunc = RenderFn(config.TaskID, sandboxDir, sandboxEnabled)
 	conf.Finalize()
 	return conf, nil
+}
+
+func isSandboxEnabled(cfg *TaskTemplateManagerConfig) bool {
+	if cfg.ClientConfig != nil && cfg.ClientConfig.TemplateConfig != nil && cfg.ClientConfig.TemplateConfig.DisableSandbox {
+		return false
+	}
+	return true
+}
+
+type sandboxConfig struct {
+	thisBin     string
+	sandboxPath string
+	destPath    string
+	sourcePath  string
+	perms       string
+	user        string
+	group       string
+	taskID      string
+	contents    []byte
+}
+
+func ReaderFn(taskID, taskDir string, sandboxEnabled bool) func(string) ([]byte, error) {
+	if !sandboxEnabled {
+		return nil
+	}
+	thisBin := subproc.Self()
+
+	return func(src string) ([]byte, error) {
+
+		sandboxCfg := &sandboxConfig{
+			thisBin:     thisBin,
+			sandboxPath: taskDir,
+			sourcePath:  src,
+			taskID:      taskID,
+		}
+
+		stdout, stderr, code, err := readTemplateFromSandbox(sandboxCfg)
+		if err != nil && code != 0 {
+			return nil, fmt.Errorf("%v: %s", err, string(stderr))
+		}
+
+		// this will get wrapped in CT log formatter
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s", string(stderr))
+		return stdout, nil
+	}
+}
+
+func RenderFn(taskID, taskDir string, sandboxEnabled bool) func(*renderer.RenderInput) (*renderer.RenderResult, error) {
+	if !sandboxEnabled {
+		return nil
+	}
+	thisBin := subproc.Self()
+
+	return func(i *renderer.RenderInput) (*renderer.RenderResult, error) {
+		wouldRender := false
+		didRender := false
+
+		sandboxCfg := &sandboxConfig{
+			thisBin:     thisBin,
+			sandboxPath: taskDir,
+			destPath:    i.Path,
+			perms:       strconv.FormatUint(uint64(i.Perms), 8),
+			user:        i.User,
+			group:       i.Group,
+			taskID:      taskID,
+			contents:    i.Contents,
+		}
+
+		logs, code, err := renderTemplateInSandbox(sandboxCfg)
+		if err != nil {
+			if len(logs) > 0 {
+				log.Printf("[ERROR] %v: %s", err, logs)
+			} else {
+				log.Printf("[ERROR] %v", err)
+			}
+			return &renderer.RenderResult{
+				DidRender:   false,
+				WouldRender: false,
+				Contents:    []byte{},
+			}, fmt.Errorf("template render subprocess failed: %w", err)
+		}
+		if code == trenderer.ExitWouldRenderButDidnt {
+			didRender = false
+			wouldRender = true
+		} else {
+			didRender = true
+			wouldRender = true
+		}
+
+		// the subprocess emits logs matching the consul-template runner, but we
+		// CT doesn't support hclog, so we just print the whole output here to
+		// stderr the same way CT does so the results look seamless
+		if len(logs) > 0 {
+			log.Printf("[DEBUG] %s", logs)
+		}
+
+		result := &renderer.RenderResult{
+			DidRender:   didRender,
+			WouldRender: wouldRender,
+			Contents:    i.Contents,
+		}
+		return result, nil
+	}
 }
 
 // loadTemplateEnv loads task environment variables from all templates.

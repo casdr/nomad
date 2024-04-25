@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { click, find } from '@ember/test-helpers';
 
 export function jobURL(job, path = '') {
@@ -20,19 +25,19 @@ export async function startJob() {
   await click('[data-test-start] [data-test-confirm-button]');
 }
 
+export async function purgeJob() {
+  await click('[data-test-purge] [data-test-idle-button]');
+  await click('[data-test-purge] [data-test-confirm-button]');
+}
+
 export function expectStartRequest(assert, server, job) {
   const expectedURL = jobURL(job);
+
   const request = server.pretender.handledRequests
     .filterBy('method', 'POST')
     .find((req) => req.url === expectedURL);
 
-  const requestPayload = JSON.parse(request.requestBody).Job;
-
   assert.ok(request, 'POST URL was made correctly');
-  assert.ok(
-    requestPayload.Stop == null,
-    'The Stop signal is not sent in the POST request'
-  );
 }
 
 export async function expectError(assert, title) {
@@ -55,6 +60,17 @@ export async function expectError(assert, title) {
 
 export function expectDeleteRequest(assert, server, job) {
   const expectedURL = jobURL(job);
+
+  assert.ok(
+    server.pretender.handledRequests
+      .filterBy('method', 'DELETE')
+      .find((req) => req.url === expectedURL),
+    'DELETE URL was made correctly'
+  );
+}
+
+export function expectPurgeRequest(assert, server, job) {
+  const expectedURL = jobURL(job) + '?purge=true';
 
   assert.ok(
     server.pretender.handledRequests

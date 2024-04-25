@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package taskenv
 
 import (
@@ -159,7 +162,10 @@ func TestEnvironment_AsList(t *testing.T) {
 	a := mock.Alloc()
 	a.Job.ParentID = fmt.Sprintf("mock-parent-service-%s", uuid.Generate())
 	a.AllocatedResources.Tasks["web"] = &structs.AllocatedTaskResources{
-		Cpu: structs.AllocatedCpuResources{CpuShares: 500},
+		Cpu: structs.AllocatedCpuResources{
+			CpuShares:     500,
+			ReservedCores: []uint16{0, 5, 6, 7},
+		},
 		Memory: structs.AllocatedMemoryResources{
 			MemoryMB:    256,
 			MemoryMaxMB: 512,
@@ -182,6 +188,18 @@ func TestEnvironment_AsList(t *testing.T) {
 				ReservedPorts: []structs.Port{
 					{Label: "ssh", Value: 22},
 					{Label: "other", Value: 1234},
+				},
+			},
+		},
+	}
+	a.AllocatedResources.Tasks["mail"] = &structs.AllocatedTaskResources{
+		Networks: []*structs.NetworkResource{
+			{
+				Device: "eth0",
+				IP:     "fd12:3456:789a:1::1",
+				MBits:  50,
+				ReservedPorts: []structs.Port{
+					{Label: "ipv6", Value: 2222},
 				},
 			},
 		},
@@ -214,7 +232,11 @@ func TestEnvironment_AsList(t *testing.T) {
 		"NOMAD_IP_ssh_ssh=192.168.0.100",
 		"NOMAD_PORT_ssh_other=1234",
 		"NOMAD_PORT_ssh_ssh=22",
+		"NOMAD_ADDR_mail_ipv6=[fd12:3456:789a:1::1]:2222",
+		"NOMAD_IP_mail_ipv6=fd12:3456:789a:1::1",
+		"NOMAD_PORT_mail_ipv6=2222",
 		"NOMAD_CPU_LIMIT=500",
+		"NOMAD_CPU_CORES=0,5-7",
 		"NOMAD_DC=dc1",
 		"NOMAD_NAMESPACE=not-default",
 		"NOMAD_REGION=global",
@@ -234,6 +256,7 @@ func TestEnvironment_AsList(t *testing.T) {
 		"NOMAD_JOB_NAME=my-job",
 		fmt.Sprintf("NOMAD_JOB_PARENT_ID=%s", a.Job.ParentID),
 		fmt.Sprintf("NOMAD_ALLOC_ID=%s", a.ID),
+		fmt.Sprintf("NOMAD_SHORT_ALLOC_ID=%s", a.ID[:8]),
 		"NOMAD_ALLOC_INDEX=0",
 	}
 	sort.Strings(act)
@@ -250,6 +273,7 @@ func TestEnvironment_AllValues(t *testing.T) {
 		"nested.meta.key":   "a",
 		"invalid...metakey": "b",
 	}
+	n.CgroupParent = "abc.slice"
 	a := mock.ConnectAlloc()
 	a.Job.ParentID = fmt.Sprintf("mock-parent-service-%s", uuid.Generate())
 	a.AllocatedResources.Tasks["web"].Networks[0] = &structs.NetworkResource{
@@ -259,6 +283,7 @@ func TestEnvironment_AllValues(t *testing.T) {
 		MBits:         50,
 		DynamicPorts:  []structs.Port{{Label: "http", Value: 80}},
 	}
+	a.AllocatedResources.Tasks["web"].Cpu.ReservedCores = []uint16{0, 5, 6, 7}
 	a.AllocatedResources.Tasks["ssh"] = &structs.AllocatedTaskResources{
 		Networks: []*structs.NetworkResource{
 			{
@@ -377,7 +402,9 @@ func TestEnvironment_AllValues(t *testing.T) {
 		"NOMAD_PORT_ssh_other":                      "1234",
 		"NOMAD_PORT_ssh_ssh":                        "22",
 		"NOMAD_CPU_LIMIT":                           "500",
+		"NOMAD_CPU_CORES":                           "0,5-7",
 		"NOMAD_DC":                                  "dc1",
+		"NOMAD_PARENT_CGROUP":                       "abc.slice",
 		"NOMAD_NAMESPACE":                           "default",
 		"NOMAD_REGION":                              "global",
 		"NOMAD_MEMORY_LIMIT":                        "256",
@@ -396,6 +423,7 @@ func TestEnvironment_AllValues(t *testing.T) {
 		"NOMAD_JOB_NAME":                            "my-job",
 		"NOMAD_JOB_PARENT_ID":                       a.Job.ParentID,
 		"NOMAD_ALLOC_ID":                            a.ID,
+		"NOMAD_SHORT_ALLOC_ID":                      a.ID[:8],
 		"NOMAD_ALLOC_INDEX":                         "0",
 		"NOMAD_PORT_connect_proxy_testconnect":      "9999",
 		"NOMAD_HOST_PORT_connect_proxy_testconnect": "9999",

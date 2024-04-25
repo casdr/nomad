@@ -1,8 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package volumewatcher
 
 import (
 	"context"
 	"sync"
+	"time"
 
 	log "github.com/hashicorp/go-hclog"
 	memdb "github.com/hashicorp/go-memdb"
@@ -34,8 +38,14 @@ type Watcher struct {
 	ctx    context.Context
 	exitFn context.CancelFunc
 
+	// quiescentTimeout is the time we wait until the volume has "settled"
+	// before stopping the child watcher goroutines
+	quiescentTimeout time.Duration
+
 	wlock sync.RWMutex
 }
+
+var defaultQuiescentTimeout = time.Minute * 5
 
 // NewVolumesWatcher returns a volumes watcher that is used to watch
 // volumes and trigger the scheduler as needed.
@@ -47,11 +57,12 @@ func NewVolumesWatcher(logger log.Logger, rpc CSIVolumeRPC, leaderAcl string) *W
 	ctx, exitFn := context.WithCancel(context.Background())
 
 	return &Watcher{
-		rpc:       rpc,
-		logger:    logger.Named("volumes_watcher"),
-		ctx:       ctx,
-		exitFn:    exitFn,
-		leaderAcl: leaderAcl,
+		rpc:              rpc,
+		logger:           logger.Named("volumes_watcher"),
+		ctx:              ctx,
+		exitFn:           exitFn,
+		leaderAcl:        leaderAcl,
+		quiescentTimeout: defaultQuiescentTimeout,
 	}
 }
 
@@ -157,10 +168,10 @@ func (w *Watcher) getVolumesImpl(ws memdb.WatchSet, state *state.StateStore) (in
 }
 
 // add adds a volume to the watch list
-func (w *Watcher) add(d *structs.CSIVolume) error {
+func (w *Watcher) add(v *structs.CSIVolume) error {
 	w.wlock.Lock()
 	defer w.wlock.Unlock()
-	_, err := w.addLocked(d)
+	_, err := w.addLocked(v)
 	return err
 }
 
@@ -180,5 +191,20 @@ func (w *Watcher) addLocked(v *structs.CSIVolume) (*volumeWatcher, error) {
 
 	watcher := newVolumeWatcher(w, v)
 	w.watchers[v.ID+v.Namespace] = watcher
+
+	// Sending the first volume update here before we return ensures we've hit
+	// the run loop in the goroutine before freeing the lock. This prevents a
+	// race between shutting down the watcher and the blocking query.
+	//
+	// It also ensures that we don't drop events that happened during leadership
+	// transitions and didn't get completed by the prior leader
+	watcher.updateCh <- v
 	return watcher, nil
+}
+
+// removes a volume from the watch list
+func (w *Watcher) remove(volID string) {
+	w.wlock.Lock()
+	defer w.wlock.Unlock()
+	delete(w.watchers, volID)
 }

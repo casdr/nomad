@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package jobspec
 
 import (
@@ -53,7 +56,7 @@ func ParseNetwork(o *ast.ObjectList) (*api.NetworkResource, error) {
 	// Filter dns
 	if dns := networkObj.Filter("dns"); len(dns.Items) > 0 {
 		if len(dns.Items) > 1 {
-			return nil, multierror.Prefix(fmt.Errorf("cannot have more than 1 dns stanza"), "network ->")
+			return nil, multierror.Prefix(fmt.Errorf("cannot have more than 1 dns block"), "network ->")
 		}
 
 		d, err := parseDNS(dns.Items[0])
@@ -93,14 +96,12 @@ func parsePorts(networkObj *ast.ObjectList, nw *api.NetworkResource) error {
 		if knownPortLabels[l] {
 			return fmt.Errorf("found a port label collision: %s", label)
 		}
-		var p map[string]interface{}
+
 		var res api.Port
-		if err := hcl.DecodeObject(&p, port.Val); err != nil {
+		if err := hcl.DecodeObject(&res, port.Val); err != nil {
 			return err
 		}
-		if err := mapstructure.WeakDecode(p, &res); err != nil {
-			return err
-		}
+
 		res.Label = label
 		if res.Value > 0 {
 			nw.ReservedPorts = append(nw.ReservedPorts, res)

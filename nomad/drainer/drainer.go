@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package drainer
 
 import (
@@ -7,7 +10,7 @@ import (
 
 	log "github.com/hashicorp/go-hclog"
 
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -396,7 +399,7 @@ func (n *NodeDrainer) drainAllocs(future *structs.BatchFuture, allocs []*structs
 	transitions := make(map[string]*structs.DesiredTransition, len(allocs))
 	for _, alloc := range allocs {
 		transitions[alloc.ID] = &structs.DesiredTransition{
-			Migrate: helper.BoolToPtr(true),
+			Migrate: pointer.Of(true),
 		}
 		jobs[alloc.JobNamespacedID()] = alloc
 	}

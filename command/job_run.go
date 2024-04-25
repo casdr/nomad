@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -10,8 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
-	"github.com/hashicorp/nomad/helper"
-	flaghelper "github.com/hashicorp/nomad/helper/flags"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/posener/complete"
 )
 
@@ -90,13 +92,18 @@ Run Options:
     Override the priority of the evaluations produced as a result of this job
     submission. By default, this is set to the priority of the job.
 
+  -json
+    Parses the job file as JSON. If the outer object has a Job field, such as
+    from "nomad job inspect" or "nomad run -output", the value of the field is
+    used as the job.
+
   -hcl1
-    Parses the job file as HCLv1.
+    Parses the job file as HCLv1. Takes precedence over "-hcl2-strict".
 
   -hcl2-strict
     Whether an error should be produced from the HCL2 parser where a variable
     has been supplied which is not defined within the root variables. Defaults
-    to true.
+    to true, but ignored if "-hcl1" is also defined.
 
   -output
     Output the JSON that would be submitted to the HTTP API without submitting
@@ -114,11 +121,25 @@ Run Options:
     the job file. This overrides the token found in $CONSUL_HTTP_TOKEN environment
     variable and that found in the job.
 
+  -consul-namespace
+    (Enterprise only) If set, any services in the job will be registered into
+    the specified Consul namespace. Any template block reading from Consul KV
+    will be scoped to the specified Consul namespace. If Consul ACLs are
+    enabled and the "consul" block "allow_unauthenticated" is disabled in the
+    Nomad server configuration, then a Consul token must be supplied with
+    appropriate service and KV Consul ACL policy permissions.
+
   -vault-token
-    If set, the passed Vault token is stored in the job before sending to the
-    Nomad servers. This allows passing the Vault token without storing it in
-    the job file. This overrides the token found in $VAULT_TOKEN environment
-    variable and that found in the job.
+    Used to validate if the user submitting the job has permission to run the job
+    according to its Vault policies. A Vault token must be supplied if the vault
+    block allow_unauthenticated is disabled in the Nomad server configuration.
+    If the -vault-token flag is set, the passed Vault token is added to the jobspec
+    before sending to the Nomad servers. This allows passing the Vault token
+    without storing it in the job file. This overrides the token found in the
+    $VAULT_TOKEN environment variable and the vault_token field in the job file.
+    This token is cleared from the job after validating and cannot be used within
+    the job executing environment. Use the vault block when templating in a job
+    with a Vault token.
 
   -vault-namespace
     If set, the passed Vault namespace is stored in the job before sending to the
@@ -143,33 +164,38 @@ func (c *JobRunCommand) Synopsis() string {
 func (c *JobRunCommand) AutocompleteFlags() complete.Flags {
 	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
 		complete.Flags{
-			"-check-index":     complete.PredictNothing,
-			"-detach":          complete.PredictNothing,
-			"-verbose":         complete.PredictNothing,
-			"-consul-token":    complete.PredictNothing,
-			"-vault-token":     complete.PredictAnything,
-			"-vault-namespace": complete.PredictAnything,
-			"-output":          complete.PredictNothing,
-			"-policy-override": complete.PredictNothing,
-			"-preserve-counts": complete.PredictNothing,
-			"-hcl1":            complete.PredictNothing,
-			"-hcl2-strict":     complete.PredictNothing,
-			"-var":             complete.PredictAnything,
-			"-var-file":        complete.PredictFiles("*.var"),
-			"-eval-priority":   complete.PredictNothing,
+			"-check-index":      complete.PredictNothing,
+			"-detach":           complete.PredictNothing,
+			"-verbose":          complete.PredictNothing,
+			"-consul-token":     complete.PredictNothing,
+			"-consul-namespace": complete.PredictAnything,
+			"-vault-token":      complete.PredictAnything,
+			"-vault-namespace":  complete.PredictAnything,
+			"-output":           complete.PredictNothing,
+			"-policy-override":  complete.PredictNothing,
+			"-preserve-counts":  complete.PredictNothing,
+			"-json":             complete.PredictNothing,
+			"-hcl1":             complete.PredictNothing,
+			"-hcl2-strict":      complete.PredictNothing,
+			"-var":              complete.PredictAnything,
+			"-var-file":         complete.PredictFiles("*.var"),
+			"-eval-priority":    complete.PredictNothing,
 		})
 }
 
 func (c *JobRunCommand) AutocompleteArgs() complete.Predictor {
-	return complete.PredictOr(complete.PredictFiles("*.nomad"), complete.PredictFiles("*.hcl"))
+	return complete.PredictOr(
+		complete.PredictFiles("*.nomad"),
+		complete.PredictFiles("*.hcl"),
+		complete.PredictFiles("*.json"),
+	)
 }
 
 func (c *JobRunCommand) Name() string { return "job run" }
 
 func (c *JobRunCommand) Run(args []string) int {
-	var detach, verbose, output, override, preserveCounts, hcl2Strict bool
+	var detach, verbose, output, override, preserveCounts bool
 	var checkIndexStr, consulToken, consulNamespace, vaultToken, vaultNamespace string
-	var varArgs, varFiles flaghelper.StringFlag
 	var evalPriority int
 
 	flagSet := c.Meta.FlagSet(c.Name(), FlagSetClient)
@@ -179,15 +205,16 @@ func (c *JobRunCommand) Run(args []string) int {
 	flagSet.BoolVar(&output, "output", false, "")
 	flagSet.BoolVar(&override, "policy-override", false, "")
 	flagSet.BoolVar(&preserveCounts, "preserve-counts", false, "")
-	flagSet.BoolVar(&c.JobGetter.hcl1, "hcl1", false, "")
-	flagSet.BoolVar(&hcl2Strict, "hcl2-strict", true, "")
+	flagSet.BoolVar(&c.JobGetter.JSON, "json", false, "")
+	flagSet.BoolVar(&c.JobGetter.HCL1, "hcl1", false, "")
+	flagSet.BoolVar(&c.JobGetter.Strict, "hcl2-strict", true, "")
 	flagSet.StringVar(&checkIndexStr, "check-index", "", "")
 	flagSet.StringVar(&consulToken, "consul-token", "", "")
 	flagSet.StringVar(&consulNamespace, "consul-namespace", "", "")
 	flagSet.StringVar(&vaultToken, "vault-token", "", "")
 	flagSet.StringVar(&vaultNamespace, "vault-namespace", "", "")
-	flagSet.Var(&varArgs, "var", "")
-	flagSet.Var(&varFiles, "var-file", "")
+	flagSet.Var(&c.JobGetter.Vars, "var", "")
+	flagSet.Var(&c.JobGetter.VarFiles, "var-file", "")
 	flagSet.IntVar(&evalPriority, "eval-priority", 0, "")
 
 	if err := flagSet.Parse(args); err != nil {
@@ -208,8 +235,17 @@ func (c *JobRunCommand) Run(args []string) int {
 		return 1
 	}
 
+	if c.JobGetter.HCL1 {
+		c.JobGetter.Strict = false
+	}
+
+	if err := c.JobGetter.Validate(); err != nil {
+		c.Ui.Error(fmt.Sprintf("Invalid job options: %s", err))
+		return 1
+	}
+
 	// Get Job struct from Jobfile
-	job, err := c.JobGetter.ApiJobWithArgs(args[0], varArgs, varFiles, hcl2Strict)
+	sub, job, err := c.JobGetter.Get(args[0])
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error getting job struct: %s", err))
 		return 1
@@ -244,11 +280,11 @@ func (c *JobRunCommand) Run(args []string) int {
 	}
 
 	if consulToken != "" {
-		job.ConsulToken = helper.StringToPtr(consulToken)
+		job.ConsulToken = pointer.Of(consulToken)
 	}
 
 	if consulNamespace != "" {
-		job.ConsulNamespace = helper.StringToPtr(consulNamespace)
+		job.ConsulNamespace = pointer.Of(consulNamespace)
 	}
 
 	// Parse the Vault token
@@ -258,11 +294,11 @@ func (c *JobRunCommand) Run(args []string) int {
 	}
 
 	if vaultToken != "" {
-		job.VaultToken = helper.StringToPtr(vaultToken)
+		job.VaultToken = pointer.Of(vaultToken)
 	}
 
 	if vaultNamespace != "" {
-		job.VaultNamespace = helper.StringToPtr(vaultNamespace)
+		job.VaultNamespace = pointer.Of(vaultNamespace)
 	}
 
 	if output {
@@ -293,6 +329,7 @@ func (c *JobRunCommand) Run(args []string) int {
 		PolicyOverride: override,
 		PreserveCounts: preserveCounts,
 		EvalPriority:   evalPriority,
+		Submission:     sub,
 	}
 	if enforce {
 		opts.EnforceIndex = true

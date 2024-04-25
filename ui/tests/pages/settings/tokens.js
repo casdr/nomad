@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import {
   create,
   collection,
@@ -18,6 +23,8 @@ export default create({
   errorMessage: isVisible('[data-test-token-error]'),
   successMessage: isVisible('[data-test-token-success]'),
   managementMessage: isVisible('[data-test-token-management-message]'),
+  ssoErrorMessage: isVisible('[data-test-sso-error]'),
+  clearSSOError: clickable('[data-test-sso-error] .hds-dismiss-button'),
 
   policies: collection('[data-test-token-policy]', {
     name: text('[data-test-policy-name]'),

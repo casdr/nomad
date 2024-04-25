@@ -1,8 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,8 +15,7 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/api/contexts"
-	"github.com/hashicorp/nomad/helper"
-	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/posener/complete"
 )
 
@@ -28,11 +31,16 @@ type NodeStatusCommand struct {
 	Meta
 	length      int
 	short       bool
+	os          bool
+	quiet       bool
 	verbose     bool
 	list_allocs bool
 	self        bool
 	stats       bool
 	json        bool
+	perPage     int
+	pageToken   string
+	filter      string
 	tmpl        string
 }
 
@@ -74,6 +82,21 @@ Node Status Options:
   -verbose
     Display full information.
 
+  -per-page
+    How many results to show per page.
+
+  -page-token
+    Where to start pagination.
+
+  -filter
+    Specifies an expression used to filter query results.
+
+  -os
+    Display operating system name.
+
+  -quiet
+    Display only node IDs.
+
   -json
     Output the node in its JSON format.
 
@@ -90,13 +113,18 @@ func (c *NodeStatusCommand) Synopsis() string {
 func (c *NodeStatusCommand) AutocompleteFlags() complete.Flags {
 	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
 		complete.Flags{
-			"-allocs":  complete.PredictNothing,
-			"-json":    complete.PredictNothing,
-			"-self":    complete.PredictNothing,
-			"-short":   complete.PredictNothing,
-			"-stats":   complete.PredictNothing,
-			"-t":       complete.PredictAnything,
-			"-verbose": complete.PredictNothing,
+			"-allocs":     complete.PredictNothing,
+			"-filter":     complete.PredictAnything,
+			"-json":       complete.PredictNothing,
+			"-per-page":   complete.PredictAnything,
+			"-page-token": complete.PredictAnything,
+			"-self":       complete.PredictNothing,
+			"-short":      complete.PredictNothing,
+			"-stats":      complete.PredictNothing,
+			"-t":          complete.PredictAnything,
+			"-os":         complete.PredictAnything,
+			"-quiet":      complete.PredictAnything,
+			"-verbose":    complete.PredictNothing,
 		})
 }
 
@@ -115,19 +143,24 @@ func (c *NodeStatusCommand) AutocompleteArgs() complete.Predictor {
 	})
 }
 
-func (c *NodeStatusCommand) Name() string { return "node-status" }
+func (c *NodeStatusCommand) Name() string { return "node status" }
 
 func (c *NodeStatusCommand) Run(args []string) int {
 
 	flags := c.Meta.FlagSet(c.Name(), FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.BoolVar(&c.short, "short", false, "")
+	flags.BoolVar(&c.os, "os", false, "")
+	flags.BoolVar(&c.quiet, "quiet", false, "")
 	flags.BoolVar(&c.verbose, "verbose", false, "")
 	flags.BoolVar(&c.list_allocs, "allocs", false, "")
 	flags.BoolVar(&c.self, "self", false, "")
 	flags.BoolVar(&c.stats, "stats", false, "")
 	flags.BoolVar(&c.json, "json", false, "")
 	flags.StringVar(&c.tmpl, "t", "", "")
+	flags.StringVar(&c.filter, "filter", "", "")
+	flags.IntVar(&c.perPage, "per-page", 0, "")
+	flags.StringVar(&c.pageToken, "page-token", "", "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -156,9 +189,27 @@ func (c *NodeStatusCommand) Run(args []string) int {
 
 	// Use list mode if no node name was provided
 	if len(args) == 0 && !c.self {
+		if c.quiet && (c.verbose || c.json) {
+			c.Ui.Error("-quiet cannot be used with -verbose or -json")
+			return 1
+		}
+
+		// Set up the options to capture any filter passed and pagination
+		// details.
+		opts := api.QueryOptions{
+			Filter:    c.filter,
+			PerPage:   int32(c.perPage),
+			NextToken: c.pageToken,
+		}
+
+		// If the user requested showing the node OS, include this within the
+		// query params.
+		if c.os {
+			opts.Params = map[string]string{"os": "true"}
+		}
 
 		// Query the node info
-		nodes, _, err := client.Nodes().List(nil)
+		nodes, qm, err := client.Nodes().List(&opts)
 		if err != nil {
 			c.Ui.Error(fmt.Sprintf("Error querying node status: %s", err))
 			return 1
@@ -178,13 +229,33 @@ func (c *NodeStatusCommand) Run(args []string) int {
 
 		// Return nothing if no nodes found
 		if len(nodes) == 0 {
+			c.Ui.Output("No nodes registered")
 			return 0
 		}
 
-		// Format the nodes list
-		out := make([]string, len(nodes)+1)
+		var size int
+		if c.quiet {
+			size = len(nodes)
+		} else {
+			size = len(nodes) + 1
+		}
 
-		out[0] = "ID|DC|Name|Class|"
+		// Format the nodes list
+		out := make([]string, size)
+
+		if c.quiet {
+			for i, node := range nodes {
+				out[i] = node.ID
+			}
+			c.Ui.Output(formatList(out))
+			return 0
+		}
+
+		out[0] = "ID|Node Pool|DC|Name|Class|"
+
+		if c.os {
+			out[0] += "OS|"
+		}
 
 		if c.verbose {
 			out[0] += "Address|Version|"
@@ -197,11 +268,15 @@ func (c *NodeStatusCommand) Run(args []string) int {
 		}
 
 		for i, node := range nodes {
-			out[i+1] = fmt.Sprintf("%s|%s|%s|%s",
+			out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%s",
 				limit(node.ID, c.length),
+				node.NodePool,
 				node.Datacenter,
 				node.Name,
 				node.NodeClass)
+			if c.os {
+				out[i+1] += fmt.Sprintf("|%s", node.Attributes["os.name"])
+			}
 			if c.verbose {
 				out[i+1] += fmt.Sprintf("|%s|%s",
 					node.Address, node.Version)
@@ -224,6 +299,14 @@ func (c *NodeStatusCommand) Run(args []string) int {
 
 		// Dump the output
 		c.Ui.Output(formatList(out))
+
+		if qm.NextToken != "" {
+			c.Ui.Output(fmt.Sprintf(`
+Results have been paginated. To get the next page run:
+
+%s -page-token %s`, argsWithoutPageToken(os.Args), qm.NextToken))
+		}
+
 		return 0
 	}
 
@@ -321,7 +404,7 @@ func nodeCSINodeNames(n *api.Node) []string {
 	return names
 }
 
-func nodeCSIVolumeNames(n *api.Node, allocs []*api.Allocation) []string {
+func nodeCSIVolumeNames(allocs []*api.Allocation) []string {
 	var names []string
 	for _, alloc := range allocs {
 		tg := alloc.GetTaskGroup()
@@ -330,7 +413,7 @@ func nodeCSIVolumeNames(n *api.Node, allocs []*api.Allocation) []string {
 		}
 
 		for _, v := range tg.Volumes {
-			if v.Type == structs.VolumeTypeCSI {
+			if v.Type == api.CSIVolumeTypeCSI {
 				names = append(names, v.Name)
 			}
 		}
@@ -399,6 +482,7 @@ func (c *NodeStatusCommand) formatNode(client *api.Client, node *api.Node) int {
 	basic := []string{
 		fmt.Sprintf("ID|%s", node.ID),
 		fmt.Sprintf("Name|%s", node.Name),
+		fmt.Sprintf("Node Pool|%s", node.NodePool),
 		fmt.Sprintf("Class|%s", node.NodeClass),
 		fmt.Sprintf("DC|%s", node.Datacenter),
 		fmt.Sprintf("Drain|%v", formatDrain(node)),
@@ -411,7 +495,7 @@ func (c *NodeStatusCommand) formatNode(client *api.Client, node *api.Node) int {
 	if c.short {
 		basic = append(basic, fmt.Sprintf("Host Volumes|%s", strings.Join(nodeVolumeNames(node), ",")))
 		basic = append(basic, fmt.Sprintf("Host Networks|%s", strings.Join(nodeNetworkNames(node), ",")))
-		basic = append(basic, fmt.Sprintf("CSI Volumes|%s", strings.Join(nodeCSIVolumeNames(node, runningAllocs), ",")))
+		basic = append(basic, fmt.Sprintf("CSI Volumes|%s", strings.Join(nodeCSIVolumeNames(runningAllocs), ",")))
 		basic = append(basic, fmt.Sprintf("Drivers|%s", strings.Join(nodeDrivers(node), ",")))
 		c.Ui.Output(c.Colorize().Color(formatKV(basic)))
 
@@ -440,7 +524,7 @@ func (c *NodeStatusCommand) formatNode(client *api.Client, node *api.Node) int {
 	if !c.verbose {
 		basic = append(basic, fmt.Sprintf("Host Volumes|%s", strings.Join(nodeVolumeNames(node), ",")))
 		basic = append(basic, fmt.Sprintf("Host Networks|%s", strings.Join(nodeNetworkNames(node), ",")))
-		basic = append(basic, fmt.Sprintf("CSI Volumes|%s", strings.Join(nodeCSIVolumeNames(node, runningAllocs), ",")))
+		basic = append(basic, fmt.Sprintf("CSI Volumes|%s", strings.Join(nodeCSIVolumeNames(runningAllocs), ",")))
 		driverStatus := fmt.Sprintf("Driver Status| %s", c.outputTruncatedNodeDriverInfo(node))
 		basic = append(basic, driverStatus)
 	}
@@ -590,7 +674,7 @@ func (c *NodeStatusCommand) outputNodeCSIVolumeInfo(client *api.Client, node *ap
 		}
 
 		for _, v := range tg.Volumes {
-			if v.Type == structs.VolumeTypeCSI {
+			if v.Type == api.CSIVolumeTypeCSI {
 				names = append(names, v.Name)
 				requests[v.Source] = v
 			}
@@ -604,7 +688,9 @@ func (c *NodeStatusCommand) outputNodeCSIVolumeInfo(client *api.Client, node *ap
 	// Fetch the volume objects with current status
 	// Ignore an error, all we're going to do is omit the volumes
 	volumes := map[string]*api.CSIVolumeListStub{}
-	vs, _ := client.Nodes().CSIVolumes(node.ID, nil)
+	vs, _ := client.Nodes().CSIVolumes(node.ID, &api.QueryOptions{
+		Namespace: "*",
+	})
 	for _, v := range vs {
 		n, ok := requests[v.ID]
 		if ok {
@@ -617,14 +703,15 @@ func (c *NodeStatusCommand) outputNodeCSIVolumeInfo(client *api.Client, node *ap
 
 		// Output the volumes in name order
 		output := make([]string, 0, len(names)+1)
-		output = append(output, "ID|Name|Plugin ID|Schedulable|Provider|Access Mode")
+		output = append(output, "ID|Name|Namespace|Plugin ID|Schedulable|Provider|Access Mode")
 		for _, name := range names {
 			v, ok := volumes[name]
 			if ok {
 				output = append(output, fmt.Sprintf(
-					"%s|%s|%s|%t|%s|%s",
+					"%s|%s|%s|%s|%t|%s|%s",
 					v.ID,
 					name,
+					v.Namespace,
 					v.PluginID,
 					v.Schedulable,
 					v.Provider,
@@ -743,7 +830,7 @@ func (c *NodeStatusCommand) formatDeviceAttributes(node *api.Node) {
 		}
 
 		if first {
-			c.Ui.Output("\nDevice Group Attributes")
+			c.Ui.Output("\n[bold]Device Group Attributes[reset]")
 			first = false
 		} else {
 			c.Ui.Output("")
@@ -753,21 +840,8 @@ func (c *NodeStatusCommand) formatDeviceAttributes(node *api.Node) {
 }
 
 func (c *NodeStatusCommand) formatMeta(node *api.Node) {
-	// Print the meta
-	keys := make([]string, 0, len(node.Meta))
-	for k := range node.Meta {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var meta []string
-	for _, k := range keys {
-		if k != "" {
-			meta = append(meta, fmt.Sprintf("%s|%s", k, node.Meta[k]))
-		}
-	}
 	c.Ui.Output(c.Colorize().Color("\n[bold]Meta[reset]"))
-	c.Ui.Output(formatKV(meta))
+	c.Ui.Output(formatNodeMeta(node.Meta))
 }
 
 func (c *NodeStatusCommand) printCpuStats(hostStats *api.HostStats) {
@@ -859,14 +933,12 @@ func getAllocatedResources(client *api.Client, runningAllocs []*api.Allocation, 
 func computeNodeTotalResources(node *api.Node) api.Resources {
 	total := api.Resources{}
 
-	r := node.Resources
-	res := node.Reserved
-	if res == nil {
-		res = &api.Resources{}
-	}
-	total.CPU = helper.IntToPtr(*r.CPU - *res.CPU)
-	total.MemoryMB = helper.IntToPtr(*r.MemoryMB - *res.MemoryMB)
-	total.DiskMB = helper.IntToPtr(*r.DiskMB - *res.DiskMB)
+	r := node.NodeResources
+	res := node.ReservedResources
+
+	total.CPU = pointer.Of[int](int(r.Cpu.CpuShares) - int(res.Cpu.CpuShares))
+	total.MemoryMB = pointer.Of[int](int(r.Memory.MemoryMB) - int(res.Memory.MemoryMB))
+	total.DiskMB = pointer.Of[int](int(r.Disk.DiskMB) - int(res.Disk.DiskMB))
 	return total
 }
 
@@ -886,7 +958,11 @@ func getActualResources(client *api.Client, runningAllocs []*api.Allocation, nod
 		}
 
 		cpu += stats.ResourceUsage.CpuStats.TotalTicks
-		mem += stats.ResourceUsage.MemoryStats.RSS
+		if stats.ResourceUsage.MemoryStats.Usage > 0 {
+			mem += stats.ResourceUsage.MemoryStats.Usage
+		} else {
+			mem += stats.ResourceUsage.MemoryStats.RSS
+		}
 	}
 
 	resources := make([]string, 2)
@@ -924,7 +1000,7 @@ func getHostResources(hostStats *api.HostStats, node *api.Node) ([]string, error
 	if physical {
 		resources[1] = fmt.Sprintf("%v/%d MHz|%s/%s|%s/%s",
 			math.Floor(hostStats.CPUTicksConsumed),
-			*node.Resources.CPU,
+			node.NodeResources.Cpu.CpuShares,
 			humanize.IBytes(hostStats.Memory.Used),
 			humanize.IBytes(hostStats.Memory.Total),
 			humanize.IBytes(diskUsed),
@@ -935,7 +1011,7 @@ func getHostResources(hostStats *api.HostStats, node *api.Node) ([]string, error
 		// since nomad doesn't collect the stats data.
 		resources[1] = fmt.Sprintf("%v/%d MHz|%s/%s|(%s)",
 			math.Floor(hostStats.CPUTicksConsumed),
-			*node.Resources.CPU,
+			node.NodeResources.Cpu.CpuShares,
 			humanize.IBytes(hostStats.Memory.Used),
 			humanize.IBytes(hostStats.Memory.Total),
 			storageDevice,

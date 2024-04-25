@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable ember/no-observers */
 /* eslint-disable ember/no-incorrect-calls-with-inline-anonymous-functions */
 import { alias } from '@ember/object/computed';
@@ -15,12 +20,17 @@ import {
   deserializedQueryParam as selection,
 } from 'nomad-ui/utils/qp-serialize';
 import classic from 'ember-classic-decorator';
+import localStorageProperty from 'nomad-ui/utils/properties/local-storage';
+import { inject as service } from '@ember/service';
+import { tracked } from '@glimmer/tracking';
 
 @classic
 export default class ClientController extends Controller.extend(
   Sortable,
   Searchable
 ) {
+  @service notifications;
+
   queryParams = [
     {
       currentPage: 'page',
@@ -46,6 +56,7 @@ export default class ClientController extends Controller.extend(
     {
       qpStatus: 'status',
     },
+    'activeTask',
   ];
 
   // Set in the route
@@ -56,9 +67,18 @@ export default class ClientController extends Controller.extend(
   qpStatus = '';
   currentPage = 1;
   pageSize = 8;
+  activeTask = null;
 
   sortProperty = 'modifyIndex';
   sortDescending = true;
+
+  @localStorageProperty('nomadShowSubTasks', false) showSubTasks;
+
+  @action
+  toggleShowSubTasks(e) {
+    e.preventDefault();
+    this.set('showSubTasks', !this.get('showSubTasks'));
+  }
 
   @computed()
   get searchProps() {
@@ -185,7 +205,7 @@ export default class ClientController extends Controller.extend(
 
   @action
   gotoAllocation(allocation) {
-    this.transitionToRoute('allocations.allocation', allocation);
+    this.transitionToRoute('allocations.allocation', allocation.id);
   }
 
   @action
@@ -211,6 +231,7 @@ export default class ClientController extends Controller.extend(
       { key: 'complete', label: 'Complete' },
       { key: 'failed', label: 'Failed' },
       { key: 'lost', label: 'Lost' },
+      { key: 'unknown', label: 'Unknown' },
     ];
   }
 
@@ -256,4 +277,65 @@ export default class ClientController extends Controller.extend(
   setFacetQueryParam(queryParam, selection) {
     this.set(queryParam, serialize(selection));
   }
+
+  @action
+  setActiveTaskQueryParam(task) {
+    if (task) {
+      this.set('activeTask', `${task.allocation.id}-${task.name}`);
+    } else {
+      this.set('activeTask', null);
+    }
+  }
+
+  // #region metadata
+
+  @tracked editingMetadata = false;
+
+  get hasMeta() {
+    return (
+      this.model.meta?.structured && Object.keys(this.model.meta?.structured)
+    );
+  }
+
+  @tracked newMetaData = {
+    key: '',
+    value: '',
+  };
+
+  @action resetNewMetaData() {
+    this.newMetaData = {
+      key: '',
+      value: '',
+    };
+  }
+
+  @action validateMetadata(event) {
+    if (event.key === 'Escape') {
+      this.resetNewMetaData();
+      this.editingMetadata = false;
+    }
+  }
+
+  @action async addDynamicMetaData({ key, value }, e) {
+    try {
+      e.preventDefault();
+      await this.model.addMeta({ [key]: value });
+
+      this.notifications.add({
+        title: 'Metadata added',
+        message: `${key} successfully saved`,
+        color: 'success',
+      });
+    } catch (err) {
+      const error =
+        messageFromAdapterError(err) || 'Could not save new dynamic metadata';
+      this.notifications.add({
+        title: `Error saving Metadata`,
+        message: error,
+        color: 'critical',
+        sticky: true,
+      });
+    }
+  }
+  // #endregion metadata
 }

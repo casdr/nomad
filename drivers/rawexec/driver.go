@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package rawexec
 
 import (
@@ -5,18 +8,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/hashicorp/consul-template/signals"
-	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/lib/cpustats"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/helper/pluginutils/loader"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 )
@@ -57,9 +60,6 @@ func PluginLoader(opts map[string]string) (map[string]interface{}, error) {
 	if v, err := strconv.ParseBool(opts["driver.raw_exec.enable"]); err == nil {
 		conf["enabled"] = v
 	}
-	if v, err := strconv.ParseBool(opts["driver.raw_exec.no_cgroups"]); err == nil {
-		conf["no_cgroups"] = v
-	}
 	return conf, nil
 }
 
@@ -78,10 +78,6 @@ var (
 			hclspec.NewAttr("enabled", "bool", false),
 			hclspec.NewLiteral("false"),
 		),
-		"no_cgroups": hclspec.NewDefault(
-			hclspec.NewAttr("no_cgroups", "bool", false),
-			hclspec.NewLiteral("false"),
-		),
 	})
 
 	// taskConfigSpec is the hcl specification for the driver config section of
@@ -96,7 +92,7 @@ var (
 	capabilities = &drivers.Capabilities{
 		SendSignals: true,
 		Exec:        true,
-		FSIsolation: drivers.FSIsolationNone,
+		FSIsolation: fsisolation.None,
 		NetIsolationModes: []drivers.NetIsolationMode{
 			drivers.NetIsolationModeHost,
 			drivers.NetIsolationModeGroup,
@@ -128,14 +124,13 @@ type Driver struct {
 
 	// logger will log to the Nomad agent
 	logger hclog.Logger
+
+	// compute contains cpu compute information
+	compute cpustats.Compute
 }
 
 // Config is the driver configuration set by the SetConfig RPC call
 type Config struct {
-	// NoCgroups tracks whether we should use a cgroup to manage the process
-	// tree
-	NoCgroups bool `codec:"no_cgroups"`
-
 	// Enabled is set to true to enable the raw_exec driver
 	Enabled bool `codec:"enabled"`
 }
@@ -187,6 +182,7 @@ func (d *Driver) SetConfig(cfg *base.Config) error {
 	d.config = &config
 	if cfg.AgentConfig != nil {
 		d.nomadConfig = cfg.AgentConfig.Driver
+		d.compute = cfg.AgentConfig.Compute()
 	}
 	return nil
 }
@@ -246,11 +242,6 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		return fmt.Errorf("handle cannot be nil")
 	}
 
-	// COMPAT(0.10): pre 0.9 upgrade path check
-	if handle.Version == 0 {
-		return d.recoverPre09Task(handle)
-	}
-
 	// If already attached to handle there's nothing to recover.
 	if _, ok := d.tasks.Get(handle.Config.ID); ok {
 		d.logger.Trace("nothing to recover; task already exists",
@@ -274,8 +265,11 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 	}
 
 	// Create client for reattached executor
-	exec, pluginClient, err := executor.ReattachToExecutor(plugRC,
-		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID))
+	exec, pluginClient, err := executor.ReattachToExecutor(
+		plugRC,
+		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
+		d.compute,
+	)
 	if err != nil {
 		d.logger.Error("failed to reattach to executor", "error", err, "task_id", handle.Config.ID)
 		return fmt.Errorf("failed to reattach to executor: %v", err)
@@ -321,29 +315,25 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	executorConfig := &executor.ExecutorConfig{
 		LogFile:  pluginLogFile,
 		LogLevel: "debug",
+		Compute:  d.compute,
 	}
 
-	exec, pluginClient, err := executor.CreateExecutor(
-		d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID),
-		d.nomadConfig, executorConfig)
+	logger := d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID)
+	exec, pluginClient, err := executor.CreateExecutor(logger, d.nomadConfig, executorConfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create executor: %v", err)
 	}
 
-	// Only use cgroups when running as root on linux - Doing so in other cases
-	// will cause an error.
-	useCgroups := !d.config.NoCgroups && runtime.GOOS == "linux" && syscall.Geteuid() == 0
-
 	execCmd := &executor.ExecCommand{
-		Cmd:                driverConfig.Command,
-		Args:               driverConfig.Args,
-		Env:                cfg.EnvList(),
-		User:               cfg.User,
-		BasicProcessCgroup: useCgroups,
-		TaskDir:            cfg.TaskDir().Dir,
-		StdoutPath:         cfg.StdoutPath,
-		StderrPath:         cfg.StderrPath,
-		NetworkIsolation:   cfg.NetworkIsolation,
+		Cmd:              driverConfig.Command,
+		Args:             driverConfig.Args,
+		Env:              cfg.EnvList(),
+		User:             cfg.User,
+		TaskDir:          cfg.TaskDir().Dir,
+		StdoutPath:       cfg.StdoutPath,
+		StderrPath:       cfg.StderrPath,
+		NetworkIsolation: cfg.NetworkIsolation,
+		Resources:        cfg.Resources.Copy(),
 	}
 
 	ps, err := exec.Launch(execCmd)
@@ -372,7 +362,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	if err := handle.SetDriverState(&driverState); err != nil {
 		d.logger.Error("failed to start task, error setting driver state", "error", err)
-		exec.Shutdown("", 0)
+		_ = exec.Shutdown("", 0)
 		pluginClient.Kill()
 		return nil, nil, fmt.Errorf("failed to set driver state: %v", err)
 	}
@@ -404,8 +394,9 @@ func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *dr
 		}
 	} else {
 		result = &drivers.ExitResult{
-			ExitCode: ps.ExitCode,
-			Signal:   ps.Signal,
+			ExitCode:  ps.ExitCode,
+			Signal:    ps.Signal,
+			OOMKilled: ps.OOMKilled,
 		}
 	}
 
@@ -452,7 +443,7 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 
 	if !handle.pluginClient.Exited() {
 		if err := handle.exec.Shutdown("", 0); err != nil {
-			handle.logger.Error("destroying executor failed", "err", err)
+			handle.logger.Error("destroying executor failed", "error", err)
 		}
 
 		handle.pluginClient.Kill()

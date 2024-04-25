@@ -1,27 +1,20 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package escapingfs
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
-func setup(t *testing.T) string {
-	p, err := ioutil.TempDir("", "escapist")
-	require.NoError(t, err)
-	return p
-}
-
-func cleanup(t *testing.T, root string) {
-	err := os.RemoveAll(root)
-	require.NoError(t, err)
-}
-
 func write(t *testing.T, file, data string) {
-	err := ioutil.WriteFile(file, []byte(data), 0600)
+	err := os.WriteFile(file, []byte(data), 0600)
 	require.NoError(t, err)
 }
 
@@ -58,8 +51,7 @@ func Test_PathEscapesAllocViaRelative(t *testing.T) {
 
 func Test_pathEscapesBaseViaSymlink(t *testing.T) {
 	t.Run("symlink-escape", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		// link from dir/link
 		link := filepath.Join(dir, "link")
@@ -75,8 +67,7 @@ func Test_pathEscapesBaseViaSymlink(t *testing.T) {
 	})
 
 	t.Run("symlink-noescape", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		// create a file within dir
 		target := filepath.Join(dir, "foo")
@@ -97,8 +88,7 @@ func Test_pathEscapesBaseViaSymlink(t *testing.T) {
 func Test_PathEscapesAllocDir(t *testing.T) {
 
 	t.Run("no-escape-root", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		escape, err := PathEscapesAllocDir(dir, "", "/")
 		require.NoError(t, err)
@@ -106,8 +96,7 @@ func Test_PathEscapesAllocDir(t *testing.T) {
 	})
 
 	t.Run("no-escape", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		write(t, filepath.Join(dir, "foo"), "hi")
 
@@ -117,8 +106,7 @@ func Test_PathEscapesAllocDir(t *testing.T) {
 	})
 
 	t.Run("no-escape-no-exist", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		escape, err := PathEscapesAllocDir(dir, "", "/no-exist")
 		require.NoError(t, err)
@@ -126,8 +114,7 @@ func Test_PathEscapesAllocDir(t *testing.T) {
 	})
 
 	t.Run("symlink-escape", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		// link from dir/link
 		link := filepath.Join(dir, "link")
@@ -143,8 +130,7 @@ func Test_PathEscapesAllocDir(t *testing.T) {
 	})
 
 	t.Run("relative-escape", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		escape, err := PathEscapesAllocDir(dir, "", "../../foo")
 		require.NoError(t, err)
@@ -152,11 +138,147 @@ func Test_PathEscapesAllocDir(t *testing.T) {
 	})
 
 	t.Run("relative-escape-prefix", func(t *testing.T) {
-		dir := setup(t)
-		defer cleanup(t, dir)
+		dir := t.TempDir()
 
 		escape, err := PathEscapesAllocDir(dir, "/foo/bar", "../../../foo")
 		require.NoError(t, err)
 		require.True(t, escape)
 	})
+}
+
+func TestPathEscapesSandbox(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		dir      string
+		expected bool
+	}{
+		{
+			// this is the ${NOMAD_SECRETS_DIR} case
+			name:     "ok joined absolute path inside sandbox",
+			path:     filepath.Join("/alloc", "/secrets"),
+			dir:      "/alloc",
+			expected: false,
+		},
+		{
+			name:     "fail unjoined absolute path outside sandbox",
+			path:     "/secrets",
+			dir:      "/alloc",
+			expected: true,
+		},
+		{
+			name:     "ok joined relative path inside sandbox",
+			path:     filepath.Join("/alloc", "./safe"),
+			dir:      "/alloc",
+			expected: false,
+		},
+		{
+			name:     "fail unjoined relative path outside sandbox",
+			path:     "./safe",
+			dir:      "/alloc",
+			expected: true,
+		},
+		{
+			name:     "ok relative path traversal constrained to sandbox",
+			path:     filepath.Join("/alloc", "../../alloc/safe"),
+			dir:      "/alloc",
+			expected: false,
+		},
+		{
+			name:     "ok unjoined absolute path traversal constrained to sandbox",
+			path:     filepath.Join("/alloc", "/../alloc/safe"),
+			dir:      "/alloc",
+			expected: false,
+		},
+		{
+			name:     "ok unjoined absolute path traversal constrained to sandbox",
+			path:     "/../alloc/safe",
+			dir:      "/alloc",
+			expected: false,
+		},
+		{
+			name:     "fail joined relative path traverses outside sandbox",
+			path:     filepath.Join("/alloc", "../../../unsafe"),
+			dir:      "/alloc",
+			expected: true,
+		},
+		{
+			name:     "fail unjoined relative path traverses outside sandbox",
+			path:     "../../../unsafe",
+			dir:      "/alloc",
+			expected: true,
+		},
+		{
+			name:     "fail joined absolute path tries to transverse outside sandbox",
+			path:     filepath.Join("/alloc", "/alloc/../../unsafe"),
+			dir:      "/alloc",
+			expected: true,
+		},
+		{
+			name:     "fail unjoined absolute path tries to transverse outside sandbox",
+			path:     "/alloc/../../unsafe",
+			dir:      "/alloc",
+			expected: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			caseMsg := fmt.Sprintf("path: %v\ndir: %v", tc.path, tc.dir)
+			escapes := PathEscapesSandbox(tc.dir, tc.path)
+			require.Equal(t, tc.expected, escapes, caseMsg)
+		})
+	}
+}
+
+func TestHasPrefixCaseInsensitive(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		prefix   string
+		expected bool
+	}{
+		{
+			name:     "has prefix",
+			path:     "/foo/bar",
+			prefix:   "/foo",
+			expected: true,
+		},
+		{
+			name:     "has prefix different case",
+			path:     "/FOO/bar",
+			prefix:   "/foo",
+			expected: true,
+		},
+		{
+			name:     "short path",
+			path:     "/foo",
+			prefix:   "/foo/bar",
+			expected: false,
+		},
+		{
+			name:     "exact match",
+			path:     "/foo",
+			prefix:   "/foo",
+			expected: true,
+		},
+		{
+			name:     "no prefix",
+			path:     "/baz/bar",
+			prefix:   "/foo",
+			expected: false,
+		},
+		{
+			name:     "no prefix different case",
+			path:     "/BAZ/bar",
+			prefix:   "/foo",
+			expected: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasPrefixCaseInsensitive(tc.path, tc.prefix)
+			must.Eq(t, tc.expected, got)
+		})
+	}
 }

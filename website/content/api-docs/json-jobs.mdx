@@ -8,146 +8,225 @@ description: |-
 
 # JSON Job Specification
 
-This guide covers the JSON syntax for submitting jobs to Nomad. A useful command
-for generating valid JSON versions of HCL jobs is:
+Nomad's HTTP API uses JSON formatted job specifications except for the
+[`/job/parse` API][job-parse] which exists to convert HCL to JSON.
+
+The Nomad CLI includes a number of useful commands for working with JSON jobs.
+
+The [`nomad job run -output`][job-output] flag converts HCL jobs to JSON
+without submitting the job:
 
 ```shell-session
 $ nomad job run -output my-job.nomad
 ```
 
+The [`nomad job inspect`][job-inspect] command retrieves the JSON specification
+for an existing job:
+
+```shell-session
+$ nomad job inspect example
+```
+
+The [`nomad job run -json`][job-run-json] flag submits a JSON formatted job:
+
+```shell-session
+$ nomad job run -json example.json
+```
+
+[job-inspect]: /nomad/docs/commands/job/inspect
+[job-output]: /nomad/docs/commands/job/run#output
+[job-parse]: /nomad/api-docs/jobs#parse-job
+[job-run-json]: /nomad/docs/commands/job/run#json
+
 ## Syntax
 
-Below is the JSON representation of the job outputted by `$ nomad init`:
+Below is the JSON representation of the example job as well as the commands to
+reproduce it:
+
+```shell-session
+$ nomad init
+Example job file written to example.nomad.hcl
+$ nomad job run -output example.nomad.hcl
+```
 
 ```json
 {
   "Job": {
+    "Region": null,
+    "Namespace": null,
     "ID": "example",
     "Name": "example",
     "Type": "service",
-    "Priority": 50,
-    "Datacenters": ["dc1"],
+    "Priority": null,
+    "AllAtOnce": null,
+    "Datacenters": [
+      "dc1"
+    ],
+    "NodePool": "prod",
+    "Constraints": null,
+    "Affinities": null,
     "TaskGroups": [
       {
         "Name": "cache",
         "Count": 1,
-        "Migrate": {
-          "HealthCheck": "checks",
-          "HealthyDeadline": 300000000000,
-          "MaxParallel": 1,
-          "MinHealthyTime": 10000000000
-        },
+        "Constraints": null,
+        "Affinities": null,
         "Tasks": [
           {
             "Name": "redis",
             "Driver": "docker",
             "User": "",
+            "Lifecycle": null,
             "Config": {
-              "image": "redis:3.2",
-              "port_map": [
-                {
-                  "db": 6379
-                }
+              "auth_soft_fail": true,
+              "image": "redis:7",
+              "ports": [
+                "db"
               ]
             },
-            "Services": [
-              {
-                "Id": "",
-                "Name": "redis-cache",
-                "Tags": ["global", "cache"],
-                "Meta": {
-                  "meta": "for my service"
-                },
-                "PortLabel": "db",
-                "AddressMode": "",
-                "Checks": [
-                  {
-                    "Id": "",
-                    "Name": "alive",
-                    "Type": "tcp",
-                    "Command": "",
-                    "Args": null,
-                    "Header": {},
-                    "Method": "",
-                    "Path": "",
-                    "Protocol": "",
-                    "PortLabel": "",
-                    "Interval": 10000000000,
-                    "Timeout": 2000000000,
-                    "InitialStatus": "",
-                    "TLSSkipVerify": false,
-                    "CheckRestart": {
-                      "Limit": 3,
-                      "Grace": 30000000000,
-                      "IgnoreWarnings": false
-                    }
-                  }
-                ]
-              }
-            ],
+            "Constraints": null,
+            "Affinities": null,
+            "Env": null,
+            "Services": null,
             "Resources": {
               "CPU": 500,
+              "Cores": null,
               "MemoryMB": 256,
-              "Networks": [
-                {
-                  "Device": "",
-                  "CIDR": "",
-                  "IP": "",
-                  "MBits": 10,
-                  "DynamicPorts": [
-                    {
-                      "Label": "db",
-                      "Value": 0
-                    }
-                  ]
-                }
-              ]
+              "MemoryMaxMB": null,
+              "DiskMB": null,
+              "Networks": null,
+              "Devices": null,
+              "IOPS": null
             },
-            "Leader": false
+            "RestartPolicy": null,
+            "Meta": null,
+            "KillTimeout": null,
+            "LogConfig": null,
+            "Artifacts": null,
+            "Vault": null,
+            "Templates": null,
+            "DispatchPayload": null,
+            "VolumeMounts": null,
+            "Leader": false,
+            "ShutdownDelay": 0,
+            "KillSignal": "",
+            "Kind": "",
+            "ScalingPolicies": null,
+            "Identity": {
+              "Env": true,
+              "File": true
+            }
           }
         ],
+        "Spreads": null,
+        "Volumes": null,
         "RestartPolicy": {
           "Interval": 1800000000000,
           "Attempts": 2,
           "Delay": 15000000000,
           "Mode": "fail"
         },
-        "ReschedulePolicy": {
-          "Attempts": 10,
-          "Delay": 30000000000,
-          "DelayFunction": "exponential",
-          "Interval": 0,
-          "MaxDelay": 3600000000000,
-          "Unlimited": true
-        },
+        "ReschedulePolicy": null,
         "EphemeralDisk": {
+          "Sticky": null,
+          "Migrate": null,
           "SizeMB": 300
-        }
+        },
+        "Update": null,
+        "Migrate": null,
+        "Networks": [
+          {
+            "Mode": "",
+            "Device": "",
+            "CIDR": "",
+            "IP": "",
+            "DNS": null,
+            "ReservedPorts": null,
+            "DynamicPorts": [
+              {
+                "Label": "db",
+                "Value": 0,
+                "To": 6379,
+                "HostNetwork": ""
+              }
+            ],
+            "Hostname": "",
+            "MBits": null
+          }
+        ],
+        "Meta": null,
+        "Services": [
+          {
+            "Name": "redis-cache",
+            "Tags": [
+              "global",
+              "cache"
+            ],
+            "CanaryTags": null,
+            "EnableTagOverride": false,
+            "PortLabel": "db",
+            "AddressMode": "",
+            "Address": "",
+            "Checks": null,
+            "CheckRestart": null,
+            "Connect": null,
+            "Meta": null,
+            "CanaryMeta": null,
+            "TaggedAddresses": null,
+            "TaskName": "",
+            "OnUpdate": "",
+            "Provider": "nomad"
+          }
+        ],
+        "ShutdownDelay": null,
+        "StopAfterClientDisconnect": null,
+        "MaxClientDisconnect": null,
+        "Scaling": null,
+        "Consul": null
       }
     ],
     "Update": {
+      "Stagger": null,
       "MaxParallel": 1,
+      "HealthCheck": null,
       "MinHealthyTime": 10000000000,
       "HealthyDeadline": 180000000000,
+      "ProgressDeadline": 600000000000,
+      "Canary": 0,
       "AutoRevert": false,
-      "Canary": 0
-    }
+      "AutoPromote": null
+    },
+    "Multiregion": null,
+    "Spreads": null,
+    "Periodic": null,
+    "ParameterizedJob": null,
+    "Reschedule": null,
+    "Migrate": {
+      "MaxParallel": 1,
+      "HealthCheck": "checks",
+      "MinHealthyTime": 10000000000,
+      "HealthyDeadline": 300000000000
+    },
+    "Meta": null,
+    "ConsulToken": null,
+    "VaultToken": null,
+    "Stop": null,
+    "ParentID": null,
+    "Dispatched": false,
+    "DispatchIdempotencyToken": null,
+    "Payload": null,
+    "ConsulNamespace": null,
+    "VaultNamespace": null,
+    "NomadTokenID": null,
+    "Status": null,
+    "StatusDescription": null,
+    "Stable": null,
+    "Version": null,
+    "SubmitTime": null,
+    "CreateIndex": null,
+    "ModifyIndex": null,
+    "JobModifyIndex": null
   }
-}
-```
-
-The example JSON could be submitted as a job using the following:
-
-```shell-session
-$ curl -XPUT -d @example.json http://127.0.0.1:4646/v1/job/example
-{
-  "EvalID": "5d6ded54-0b2a-8858-6583-be5f476dec9d",
-  "EvalCreateIndex": 12,
-  "JobModifyIndex": 11,
-  "Warnings": "",
-  "Index": 12,
-  "LastContact": 0,
-  "KnownLeader": false
 }
 ```
 
@@ -178,10 +257,21 @@ The `Job` object supports the following keys:
 - `Datacenters` - A list of datacenters in the region which are eligible
   for task placement. This must be provided, and does not have a default.
 
+- `NodePool` - The node pool in which the job can be placed. Defaults to `"default"`.
+
 - `TaskGroups` - A list to define additional task groups. See the task group
   reference for more details.
 
 - `Meta` - Annotates the job with opaque metadata.
+
+- `ConsulToken` - Specifies the Consul token that proves the submitter of the
+  job has access to the Service Identity policies associated with the job's
+  Consul Connect enabled services. This field is only used to transfer the
+  token and is not stored after job submission.
+
+- `VaultToken` - Specifies the Vault token that proves the submitter of the job
+  has access to the specified policies in the `vault` block. This field is
+  only used to transfer the token and is not stored after job submission.
 
 - `Namespace` - The namespace to execute the job in, defaults to "default".
   Prior to Nomad 1.0 namespaces were Enterprise-only.
@@ -200,6 +290,9 @@ The `Job` object supports the following keys:
     dispatching against the parameterized job. The options for this field are
     "optional", "required" and "forbidden". The default value is "optional".
 
+- `DispatchIdempotencyToken` - Optional identifier used to prevent more than one
+  instance of the job from being dispatched.
+
 - `Payload` - The payload may not be set when submitting a job but may appear in
   a dispatched job. The `Payload` will be a base64 encoded string containing the
   payload that the job was dispatched with. The `payload` has a **maximum size
@@ -214,12 +307,12 @@ The `Job` object supports the following keys:
 - `Type` - Specifies the job type and switches which scheduler
   is used. Nomad provides the `service`, `system` and `batch` schedulers,
   and defaults to `service`. To learn more about each scheduler type visit
-  [here](/docs/schedulers)
+  [here](/nomad/docs/schedulers)
 
 - `Update` - Specifies an update strategy to be applied to all task groups
   within the job. When specified both at the job level and the task group level,
   the update blocks are merged with the task group's taking precedence. For more
-  details on the update stanza, please see below.
+  details on the update block, please see below.
 
 - `Periodic` - `Periodic` allows the job to be scheduled at fixed times, dates
   or intervals. The periodic expression is always evaluated in the UTC
@@ -242,6 +335,14 @@ The `Job` object supports the following keys:
     at. Supports predefined expressions such as "@daily" and "@weekly" See
     [here](https://github.com/gorhill/cronexpr#implementation) for full
     documentation of supported cron specs and the predefined expressions.
+
+  - `Specs` - A list of cron expressions configuring the intervals the job is
+    launched at. The job runs at the next earliest time that matches any of the
+    expressions. Supports predefined expressions such as `@daily` and
+    `@weekly`. Refer to [the
+    documentation](https://github.com/gorhill/cronexpr#implementation) for full
+    details about the supported cron specs and the predefined expressions.
+    Conflicts with `Spec`.
 
   - <a id="prohibit_overlap">`ProhibitOverlap`</a> - `ProhibitOverlap` can be set
     to true to enforce that the periodic job doesn't spawn a new instance of the
@@ -319,7 +420,7 @@ attributes:
 - `Update` - Specifies an update strategy to be applied to all task groups
   within the job. When specified both at the job level and the task group level,
   the update blocks are merged with the task group's taking precedence. For more
-  details on the update stanza, please see below.
+  details on the update block, please see below.
 
 - `Tasks` - A list of `Task` object that are part of the task group.
 
@@ -351,13 +452,13 @@ The `Task` object supports the following keys:
     to. The file is written relative to the task's local directory.
 
 - `Driver` - Specifies the task driver that should be used to run the
-  task. See the [driver documentation](/docs/drivers) for what
+  task. See the [driver documentation](/nomad/docs/drivers) for what
   is available. Examples include `docker`, `qemu`, `java`, and `exec`.
 
 - `Env` - A map of key-value representing environment variables that
   will be passed along to the running process. Nomad variables are
   interpreted when set in the environment variable values. See the table of
-  interpreted variables [here](/docs/runtime/interpolation).
+  interpreted variables [here](/nomad/docs/runtime/interpolation).
 
   For example the below environment map will be reinterpreted:
 
@@ -368,6 +469,13 @@ The `Task` object supports the following keys:
     }
   }
   ```
+
+- `Identity` - Specifies whether to expose Nomad's [Workload Identity][]
+  to the task.
+
+  - `Env` - If `true` the `NOMAD_TOKEN` environment variable will be set.
+
+  - `File` - If `true` the `secrets/nomad_token` file will be created.
 
 - `KillSignal` - Specifies a configurable kill signal for a task, where the
   default is SIGINT. Note that this is only supported for drivers which accept
@@ -402,7 +510,7 @@ The `Task` object supports the following keys:
   Consul for service discovery. A `Service` object represents a routable and
   discoverable service on the network. Nomad automatically registers when a task
   is started and de-registers it when the task transitions to the dead state.
-  [Click here](/docs/integrations/consul-integration#service-discovery) to learn more about
+  [Click here](/nomad/docs/integrations/consul-integration#service-discovery) to learn more about
   services. Below is the fields in the `Service` object:
 
   - `Name`: An explicit name for the Service. Nomad will replace `${JOB}`,
@@ -437,6 +545,15 @@ The `Task` object supports the following keys:
     a port with the service. If specified, the port label must match one
     defined in the resources block. This could be a label of either a
     dynamic or a static port.
+
+  - `Provider`: Specifies the service registration provider to use for service
+    registrations. Valid options are either `consul` or `nomad`. All services
+    within a single task group must utilise the same provider value.
+
+  - `Address`: Specifies a custom address to advertise in Consul or Nomad
+    service registration. If set, `AddressMode` must be in `auto` mode. Useful
+    with interpolation - for example to advertise the public IP address of an
+    AWS EC2 instance set this to `${attr.unique.platform.aws.public-ipv4}`.
 
   - `AddressMode`: Specifies what address (host or driver-specific) this
     service should advertise. This setting is supported in Docker since
@@ -476,7 +593,7 @@ The `Task` object supports the following keys:
     - `PortLabel`: Specifies the label of the port on which the check will
       be performed. Note this is the _label_ of the port and not the port
       number unless `AddressMode: "driver"`. The port label must match one
-      defined in the Network stanza. If a port value was declared on the
+      defined in the Network block. If a port value was declared on the
       `Service`, this will inherit from that value if not supplied. If
       supplied, this value takes precedence over the `Service.PortLabel`
       value. This is useful for services which operate on multiple ports.
@@ -666,9 +783,9 @@ The `RestartPolicy` object supports the following keys:
 ### Update
 
 Specifies the task group update strategy. When omitted, rolling updates are
-disabled. The update stanza can be specified at the job or task group level.
-When specified at the job, the update stanza is inherited by all task groups.
-When specified in both the job and in a task group, the stanzas are merged with
+disabled. The update block can be specified at the job or task group level.
+When specified at the job, the update block is inherited by all task groups.
+When specified in both the job and in a task group, the blocks are merged with
 the task group's taking precedence. The `Update` object supports the following
 attributes:
 
@@ -688,7 +805,7 @@ attributes:
 
   - "manual" - Specifies that Nomad should not automatically determine health
     and that the operator will specify allocation health using the [HTTP
-    API](/api-docs/deployments#set-allocation-health-in-deployment).
+    API](/nomad/api-docs/deployments#set-allocation-health-in-deployment).
 
 - `MinHealthyTime` - Specifies the minimum time the allocation must be in the
   healthy state before it is marked as healthy and unblocks further allocations
@@ -743,7 +860,7 @@ An example `Update` block:
 The `Constraint` object supports the following keys:
 
 - `LTarget` - Specifies the attribute to examine for the
-  constraint. See the table of attributes [here](/docs/runtime/interpolation#interpreted_node_vars).
+  constraint. See the table of attributes [here](/nomad/docs/runtime/interpolation#interpreted_node_vars).
 
 - `RTarget` - Specifies the value to compare the attribute against.
   This can be a literal value, another attribute or a regular expression if
@@ -788,12 +905,12 @@ The `Constraint` object supports the following keys:
 ### Affinity
 
 Affinities allow operators to express placement preferences. More details on how they work
-are described in [affinities](/docs/job-specification/affinity)
+are described in [affinities](/nomad/docs/job-specification/affinity)
 
 The `Affinity` object supports the following keys:
 
 - `LTarget` - Specifies the attribute to examine for the
-  affinity. See the table of attributes [here](/docs/runtime/interpolation#interpreted_node_vars).
+  affinity. See the table of attributes [here](/nomad/docs/runtime/interpolation#interpreted_node_vars).
 
 - `RTarget` - Specifies the value to compare the attribute against.
   This can be a literal value, another attribute or a regular expression if
@@ -821,6 +938,8 @@ The `Affinity` object supports the following keys:
 The `LogConfig` object configures the log rotation policy for a task's `stdout` and
 `stderr`. The `LogConfig` object supports the following attributes:
 
+- `Disabled` - Disables log collection.
+
 - `MaxFiles` - The maximum number of rotated files Nomad will retain for
   `stdout` and `stderr`, each tracked individually.
 
@@ -834,6 +953,7 @@ a validation error when a job is submitted.
 ```json
 {
   "LogConfig": {
+    "Disabled": false,
     "MaxFiles": 3,
     "MaxFileSizeMB": 10
   }
@@ -962,10 +1082,31 @@ README][ct].
   - `"noop"` - take no action (continue running the task)
   - `"restart"` - restart the task
   - `"signal"` - send a configurable signal to the task
+  - `"script"` - run a script
 
 - `ChangeSignal` - Specifies the signal to send to the task as a string like
   "SIGUSR1" or "SIGINT". This option is required if the `ChangeMode` is
   `signal`.
+
+- `ChangeScript` - Configures the script triggered on template change.  This
+  option is required if the `ChangeMode` is `script`.
+
+  The `ChangeScript` object supports the following attributes:
+
+  - `Command` - Specifies the full path to a script or executable that is to be
+    executed on template change. Path is relative to the driver, e.g., if running
+    with a container driver the path must be existing in the container. This
+    option is required is the `change_mode` is `script`.
+
+  - `Args` - List of arguments that are passed to the script that is to be
+    executed on template change.
+
+  - `Timeout` - Timeout for script execution specified using a label suffix like
+    "30s" or "1h". Default value is `"5s"`.
+
+  - `FailOnError` - If `true`, Nomad will kill the task if the script execution
+    fails. If `false`, script failure will be logged but the task will continue
+    uninterrupted. Default value is `false`.
 
 - `DestPath` - Specifies the location where the resulting template should be
   rendered, relative to the task directory.
@@ -983,6 +1124,20 @@ README][ct].
 
 - `Perms` - Specifies the rendered template's permissions. File permissions are
   given as octal of the Unix file permissions `rwxrwxrwx`.
+
+- `Uid` - Specifies the rendered template owner's user ID.
+
+  ~> **Caveat:** Works only on Unix-based systems. Be careful when using
+  containerized drivers, such as `docker` or `podman`, as groups and users
+  inside the container may have different IDs than on the host system. This
+  feature will also **not** work with Docker Desktop.
+
+- `Gid` - Specifies the rendered template owner's group ID.
+
+  ~> **Caveat:** Works only on Unix-based systems. Be careful when using
+  containerized drivers, such as `docker` or `podman`, as groups and users
+  inside the container may have different IDs than on the host system. This
+  feature will also **not** work with Docker Desktop.
 
 - `RightDelim` - Specifies the right delimiter to use in the template. The default
   is "}}" for some templates, it may be easier to use a different delimiter that
@@ -1019,12 +1174,12 @@ README][ct].
 
 Spread allow operators to target specific percentages of allocations based on
 any node attribute or metadata. More details on how they work are described
-in [spread](/docs/job-specification/spread).
+in [spread](/nomad/docs/job-specification/spread).
 
 The `Spread` object supports the following keys:
 
 - `Attribute` - Specifies the attribute to examine for the
-  spread. See the [table of attributes](/docs/runtime/interpolation#interpreted_node_vars) for examples.
+  spread. See the [table of attributes](/nomad/docs/runtime/interpolation#interpreted_node_vars) for examples.
 
 - `SpreadTarget` - Specifies a list of attribute values and percentages. This is an optional field, when
   left empty Nomad will evenly spread allocations across values of the attribute.
@@ -1061,5 +1216,6 @@ The `Scaling` object supports the following keys:
   autoscaler (e.g., [nomad-autoscaler](https://github.com/hashicorp/nomad-autoscaler)).
 
 [ct]: https://github.com/hashicorp/consul-template 'Consul Template by HashiCorp'
-[drain]: /docs/commands/node/drain
-[env]: /docs/runtime/environment 'Nomad Runtime Environment'
+[drain]: /nomad/docs/commands/node/drain
+[env]: /nomad/docs/runtime/environment 'Nomad Runtime Environment'
+[Workload Identity]: /nomad/docs/concepts/workload-identity 'Nomad Workload Identity'

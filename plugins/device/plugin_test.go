@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package device
 
 import (
@@ -9,7 +12,7 @@ import (
 	pb "github.com/golang/protobuf/proto"
 	plugin "github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
@@ -59,7 +62,7 @@ func TestDevicePlugin_PluginInfo(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -102,7 +105,7 @@ func TestDevicePlugin_ConfigSchema(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -149,7 +152,7 @@ func TestDevicePlugin_SetConfig(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -195,7 +198,7 @@ func TestDevicePlugin_Fingerprint(t *testing.T) {
 			Name:   "foo",
 			Attributes: map[string]*psstructs.Attribute{
 				"memory": {
-					Int:  helper.Int64ToPtr(4),
+					Int:  pointer.Of(int64(4)),
 					Unit: "GiB",
 				},
 			},
@@ -233,7 +236,7 @@ func TestDevicePlugin_Fingerprint(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -311,7 +314,7 @@ func TestDevicePlugin_Fingerprint_StreamErr(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -364,7 +367,7 @@ func TestDevicePlugin_Fingerprint_CancelCtx(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -440,7 +443,7 @@ func TestDevicePlugin_Reserve(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -476,8 +479,8 @@ func TestDevicePlugin_Stats(t *testing.T) {
 			InstanceStats: map[string]*DeviceStats{
 				"1": {
 					Summary: &psstructs.StatValue{
-						IntNumeratorVal:   helper.Int64ToPtr(10),
-						IntDenominatorVal: helper.Int64ToPtr(20),
+						IntNumeratorVal:   pointer.Of(int64(10)),
+						IntDenominatorVal: pointer.Of(int64(20)),
 						Unit:              "MB",
 						Desc:              "Unit test",
 					},
@@ -493,8 +496,8 @@ func TestDevicePlugin_Stats(t *testing.T) {
 			InstanceStats: map[string]*DeviceStats{
 				"1": {
 					Summary: &psstructs.StatValue{
-						FloatNumeratorVal:   helper.Float64ToPtr(10.0),
-						FloatDenominatorVal: helper.Float64ToPtr(20.0),
+						FloatNumeratorVal:   pointer.Of(float64(10.0)),
+						FloatDenominatorVal: pointer.Of(float64(20.0)),
 						Unit:                "MB",
 						Desc:                "Unit test",
 					},
@@ -508,7 +511,7 @@ func TestDevicePlugin_Stats(t *testing.T) {
 			InstanceStats: map[string]*DeviceStats{
 				"1": {
 					Summary: &psstructs.StatValue{
-						StringVal: helper.StringToPtr("foo"),
+						StringVal: pointer.Of("foo"),
 						Unit:      "MB",
 						Desc:      "Unit test",
 					},
@@ -522,7 +525,7 @@ func TestDevicePlugin_Stats(t *testing.T) {
 			InstanceStats: map[string]*DeviceStats{
 				"1": {
 					Summary: &psstructs.StatValue{
-						BoolVal: helper.BoolToPtr(true),
+						BoolVal: pointer.Of(true),
 						Unit:    "MB",
 						Desc:    "Unit test",
 					},
@@ -550,7 +553,7 @@ func TestDevicePlugin_Stats(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -628,7 +631,7 @@ func TestDevicePlugin_Stats_StreamErr(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})
@@ -681,7 +684,7 @@ func TestDevicePlugin_Stats_CancelCtx(t *testing.T) {
 		},
 	}
 
-	client, server := plugin.TestPluginGRPCConn(t, map[string]plugin.Plugin{
+	client, server := plugin.TestPluginGRPCConn(t, true, map[string]plugin.Plugin{
 		base.PluginTypeBase:   &base.PluginBase{Impl: mock},
 		base.PluginTypeDevice: &PluginDevice{Impl: mock},
 	})

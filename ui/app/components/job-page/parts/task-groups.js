@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Component from '@ember/component';
 import { action, computed } from '@ember/object';
 import { inject as service } from '@ember/service';
@@ -19,7 +24,7 @@ export default class TaskGroups extends Component.extend(Sortable) {
 
   @action
   gotoTaskGroup(taskGroup) {
-    this.router.transitionTo('jobs.job.task-group', this.job, taskGroup);
+    this.router.transitionTo('jobs.job.task-group', this.job, taskGroup.name);
   }
 
   @computed('job.taskGroups.[]')

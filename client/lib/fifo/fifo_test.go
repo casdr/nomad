@@ -1,10 +1,11 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package fifo
 
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -24,11 +25,7 @@ func TestFIFO(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		path = "//./pipe/fifo"
 	} else {
-		dir, err := ioutil.TempDir("", "")
-		require.NoError(err)
-		defer os.RemoveAll(dir)
-
-		path = filepath.Join(dir, "fifo")
+		path = filepath.Join(t.TempDir(), "fifo")
 	}
 
 	readerOpenFn, err := CreateAndRead(path)
@@ -88,11 +85,7 @@ func TestWriteClose(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		path = "//./pipe/" + uuid.Generate()[:4]
 	} else {
-		dir, err := ioutil.TempDir("", "")
-		require.NoError(err)
-		defer os.RemoveAll(dir)
-
-		path = filepath.Join(dir, "fifo")
+		path = filepath.Join(t.TempDir(), "fifo")
 	}
 
 	readerOpenFn, err := CreateAndRead(path)

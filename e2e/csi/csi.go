@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package csi
 
 import (
@@ -5,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"regexp"
@@ -34,8 +36,9 @@ func init() {
 
 const ns = ""
 
-var pluginWait = &e2e.WaitConfig{Interval: 5 * time.Second, Retries: 36} // 3min
-var reapWait = &e2e.WaitConfig{Interval: 5 * time.Second, Retries: 36}   // 3min
+var pluginAllocWait = &e2e.WaitConfig{Interval: 5 * time.Second, Retries: 12} // 1min
+var pluginWait = &e2e.WaitConfig{Interval: 5 * time.Second, Retries: 36}      // 3min
+var reapWait = &e2e.WaitConfig{Interval: 5 * time.Second, Retries: 36}        // 3min
 
 // assertNoErrorElseDump calls a non-halting assert on the error and dumps the
 // plugin logs if it fails.
@@ -64,7 +67,7 @@ func dumpLogs(pluginIDs []string) error {
 		}
 		for _, alloc := range allocs {
 			allocID := alloc["ID"]
-			out, err := e2e.AllocLogs(allocID, e2e.LogsStdErr)
+			out, err := e2e.AllocLogs(allocID, "", e2e.LogsStdErr)
 			if err != nil {
 				return fmt.Errorf("could not get logs for alloc: %v\n%s", err, out)
 			}
@@ -231,7 +234,7 @@ func volumeRegister(volID, volFilePath, createOrRegister string) error {
 		return fmt.Errorf("could not open stdin?: %w", err)
 	}
 
-	content, err := ioutil.ReadFile(volFilePath)
+	content, err := os.ReadFile(volFilePath)
 	if err != nil {
 		return fmt.Errorf("could not open vol file: %w", err)
 	}

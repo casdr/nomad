@@ -7,7 +7,7 @@ description: |
 
 # Command: volume snapshot list
 
-The `volume snapshot list` command lists volume snapshots known to to a
+The `volume snapshot list` command lists volume snapshots known to a
 [Container Storage Interface (CSI)][csi] storage provider. Only CSI plugins
 that implement the [Controller][csi_plugins_internals] interface support this
 command.
@@ -29,6 +29,8 @@ Nomad.
 
 ## Snapshot List Options
 
+- `-page-token`: Where to start pagination.
+- `-per-page`: How many results to show per page.
 - `-plugin`: Display only snapshots managed by a particular [CSI
   plugin][csi_plugin]. This flag is required and accepts a plugin ID
   or prefix. If there is an exact match based on the provided plugin,
@@ -36,8 +38,7 @@ Nomad.
   matching plugins will be displayed.
 - `-secret`: Secrets to pass to the plugin to list snapshots. Accepts
   multiple flags in the form `-secret key=value`
-- `-per-page`: How many results to show per page.
-- `-page-token`: Where to start pagination.
+- `-verbose`: Display full information for the resulting snapshot.
 
 When ACLs are enabled, this command requires a token with the
 `csi-list-volumes` capability for the plugin's namespace.
@@ -61,6 +62,6 @@ snap-12345   vol-abcdef   50GiB  2021-01-03T12:15:02Z  true
 ```
 
 [csi]: https://github.com/container-storage-interface/spec
-[csi_plugin]: /docs/job-specification/csi_plugin
-[registered]: /docs/commands/volume/register
-[csi_plugins_internals]: /docs/internals/plugins/csi#csi-plugins
+[csi_plugin]: /nomad/docs/job-specification/csi_plugin
+[registered]: /nomad/docs/commands/volume/register
+[csi_plugins_internals]: /nomad/docs/concepts/plugins/csi#csi-plugins

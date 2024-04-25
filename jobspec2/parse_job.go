@@ -1,9 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package jobspec2
 
 import (
+	"slices"
 	"time"
 
 	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/helper/pointer"
 )
 
 func normalizeJob(jc *jobConfig) {
@@ -15,7 +20,7 @@ func normalizeJob(jc *jobConfig) {
 		j.ID = &jc.JobID
 	}
 
-	if j.Periodic != nil && j.Periodic.Spec != nil {
+	if j.Periodic != nil && (j.Periodic.Spec != nil || j.Periodic.Specs != nil) {
 		v := "cron"
 		j.Periodic.SpecType = &v
 	}
@@ -49,6 +54,23 @@ func normalizeJob(jc *jobConfig) {
 			if t.Vault == nil {
 				t.Vault = jc.Vault
 			}
+
+			//COMPAT To preserve compatibility with pre-1.7 agents, move the default
+			//       identity to Task.Identity.
+			defaultIdx := -1
+			for i, wid := range t.Identities {
+				if wid.Name == "" || wid.Name == "default" {
+					t.Identity = wid
+					defaultIdx = i
+					break
+				}
+			}
+
+			// If the default identity was found in Identities above, remove it from the
+			// slice.
+			if defaultIdx >= 0 {
+				t.Identities = slices.Delete(t.Identities, defaultIdx, defaultIdx+1)
+			}
 		}
 	}
 }
@@ -59,10 +81,13 @@ func normalizeVault(v *api.Vault) {
 	}
 
 	if v.Env == nil {
-		v.Env = boolToPtr(true)
+		v.Env = pointer.Of(true)
+	}
+	if v.DisableFile == nil {
+		v.DisableFile = pointer.Of(false)
 	}
 	if v.ChangeMode == nil {
-		v.ChangeMode = stringToPtr("restart")
+		v.ChangeMode = pointer.Of("restart")
 	}
 }
 
@@ -102,29 +127,35 @@ func normalizeTemplates(templates []*api.Template) {
 
 	for _, t := range templates {
 		if t.ChangeMode == nil {
-			t.ChangeMode = stringToPtr("restart")
+			t.ChangeMode = pointer.Of("restart")
 		}
 		if t.Perms == nil {
-			t.Perms = stringToPtr("0644")
+			t.Perms = pointer.Of("0644")
 		}
 		if t.Splay == nil {
-			t.Splay = durationToPtr(5 * time.Second)
+			t.Splay = pointer.Of(5 * time.Second)
 		}
+		if t.ErrMissingKey == nil {
+			t.ErrMissingKey = pointer.Of(false)
+		}
+		normalizeChangeScript(t.ChangeScript)
 	}
 }
 
-func int8ToPtr(v int8) *int8 {
-	return &v
-}
+func normalizeChangeScript(ch *api.ChangeScript) {
+	if ch == nil {
+		return
+	}
 
-func boolToPtr(v bool) *bool {
-	return &v
-}
+	if ch.Args == nil {
+		ch.Args = []string{}
+	}
 
-func stringToPtr(v string) *string {
-	return &v
-}
+	if ch.Timeout == nil {
+		ch.Timeout = pointer.Of(5 * time.Second)
+	}
 
-func durationToPtr(v time.Duration) *time.Duration {
-	return &v
+	if ch.FailOnError == nil {
+		ch.FailOnError = pointer.Of(false)
+	}
 }

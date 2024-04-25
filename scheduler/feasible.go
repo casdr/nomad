@@ -1,14 +1,18 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package scheduler
 
 import (
+	"cmp"
 	"fmt"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 
-	memdb "github.com/hashicorp/go-memdb"
-	version "github.com/hashicorp/go-version"
+	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/nomad/helper/constraints/semver"
 	"github.com/hashicorp/nomad/nomad/structs"
 	psstructs "github.com/hashicorp/nomad/plugins/shared/structs"
@@ -57,7 +61,7 @@ type FeasibleIterator interface {
 	Reset()
 }
 
-// JobContextualIterator is an iterator that can have the job and task group set
+// ContextualIterator is an iterator that can have the job and task group set
 // on it.
 type ContextualIterator interface {
 	SetJob(*structs.Job)
@@ -148,7 +152,7 @@ func NewHostVolumeChecker(ctx Context) *HostVolumeChecker {
 }
 
 // SetVolumes takes the volumes required by a task group and updates the checker.
-func (h *HostVolumeChecker) SetVolumes(volumes map[string]*structs.VolumeRequest) {
+func (h *HostVolumeChecker) SetVolumes(allocName string, volumes map[string]*structs.VolumeRequest) {
 	lookupMap := make(map[string][]*structs.VolumeRequest)
 	// Convert the map from map[DesiredName]Request to map[Source][]Request to improve
 	// lookup performance. Also filter non-host volumes.
@@ -157,7 +161,14 @@ func (h *HostVolumeChecker) SetVolumes(volumes map[string]*structs.VolumeRequest
 			continue
 		}
 
-		lookupMap[req.Source] = append(lookupMap[req.Source], req)
+		if req.PerAlloc {
+			// provide a unique volume source per allocation
+			copied := req.Copy()
+			copied.Source = copied.Source + structs.AllocSuffix(allocName)
+			lookupMap[copied.Source] = append(lookupMap[copied.Source], copied)
+		} else {
+			lookupMap[req.Source] = append(lookupMap[req.Source], req)
+		}
 	}
 	h.volumes = lookupMap
 }
@@ -381,6 +392,11 @@ func (c *NetworkChecker) SetNetwork(network *structs.NetworkResource) {
 }
 
 func (c *NetworkChecker) Feasible(option *structs.Node) bool {
+	// Allow jobs not requiring any network resources
+	if c.networkMode == "none" {
+		return true
+	}
+
 	if !c.hasNetwork(option) {
 
 		// special case - if the client is running a version older than 0.12 but
@@ -417,13 +433,13 @@ func (c *NetworkChecker) hasHostNetworks(option *structs.Node) bool {
 			}
 			found := false
 			for _, net := range option.NodeResources.NodeNetworks {
-				if net.HasAlias(hostNetworkValue.(string)) {
+				if net.HasAlias(hostNetworkValue) {
 					found = true
 					break
 				}
 			}
 			if !found {
-				c.ctx.Metrics().FilterNode(option, fmt.Sprintf("missing host network %q for port %q", hostNetworkValue.(string), port.Label))
+				c.ctx.Metrics().FilterNode(option, fmt.Sprintf("missing host network %q for port %q", hostNetworkValue, port.Label))
 				return false
 			}
 		}
@@ -556,7 +572,14 @@ func (iter *DistinctHostsIterator) SetJob(job *structs.Job) {
 func (iter *DistinctHostsIterator) hasDistinctHostsConstraint(constraints []*structs.Constraint) bool {
 	for _, con := range constraints {
 		if con.Operand == structs.ConstraintDistinctHosts {
-			return true
+			// distinct_hosts defaults to true
+			if con.RTarget == "" {
+				return true
+			}
+			enabled, err := strconv.ParseBool(con.RTarget)
+			// If the value is unparsable as a boolean, fall back to the old behavior
+			// of enforcing the constraint when it appears.
+			return err != nil || enabled
 		}
 	}
 
@@ -602,11 +625,12 @@ func (iter *DistinctHostsIterator) satisfiesDistinctHosts(option *structs.Node) 
 
 	// Skip the node if the task group has already been allocated on it.
 	for _, alloc := range proposed {
-		// If the job has a distinct_hosts constraint we only need an alloc
-		// collision on the JobID but if the constraint is on the TaskGroup then
+		// If the job has a distinct_hosts constraint we need an alloc collision
+		// on the Namespace,JobID but if the constraint is on the TaskGroup then
 		// we need both a job and TaskGroup collision.
-		jobCollision := alloc.JobID == iter.job.ID
+		jobCollision := alloc.JobID == iter.job.ID && alloc.Namespace == iter.job.Namespace
 		taskCollision := alloc.TaskGroup == iter.tg.Name
+
 		if iter.jobDistinctHosts && jobCollision || jobCollision && taskCollision {
 			return false
 		}
@@ -766,7 +790,7 @@ func (c *ConstraintChecker) meetsConstraint(constraint *structs.Constraint, opti
 }
 
 // resolveTarget is used to resolve the LTarget and RTarget of a Constraint.
-func resolveTarget(target string, node *structs.Node) (interface{}, bool) {
+func resolveTarget(target string, node *structs.Node) (string, bool) {
 	// If no prefix, this must be a literal value
 	if !strings.HasPrefix(target, "${") {
 		return target, true
@@ -786,6 +810,9 @@ func resolveTarget(target string, node *structs.Node) (interface{}, bool) {
 	case "${node.class}" == target:
 		return node.NodeClass, true
 
+	case "${node.pool}" == target:
+		return node.NodePool, true
+
 	case strings.HasPrefix(target, "${attr."):
 		attr := strings.TrimSuffix(strings.TrimPrefix(target, "${attr."), "}")
 		val, ok := node.Attributes[attr]
@@ -797,7 +824,7 @@ func resolveTarget(target string, node *structs.Node) (interface{}, bool) {
 		return val, ok
 
 	default:
-		return nil, false
+		return "", false
 	}
 }
 
@@ -818,7 +845,7 @@ func checkConstraint(ctx Context, operand string, lVal, rVal interface{}, lFound
 	case "!=", "not":
 		return !reflect.DeepEqual(lVal, rVal)
 	case "<", "<=", ">", ">=":
-		return lFound && rFound && checkLexicalOrder(operand, lVal, rVal)
+		return lFound && rFound && checkOrder(operand, lVal, rVal)
 	case structs.ConstraintAttributeIsSet:
 		return lFound
 	case structs.ConstraintAttributeIsNotSet:
@@ -850,27 +877,65 @@ func checkAttributeAffinity(ctx Context, operand string, lVal, rVal *psstructs.A
 	return checkAttributeConstraint(ctx, operand, lVal, rVal, lFound, rFound)
 }
 
-// checkLexicalOrder is used to check for lexical ordering
-func checkLexicalOrder(op string, lVal, rVal interface{}) bool {
-	// Ensure the values are strings
-	lStr, ok := lVal.(string)
-	if !ok {
+// checkOrder returns the result of (lVal operand rVal). The comparison is
+// done as integers if possible, or floats if possible, and lexically otherwise.
+func checkOrder(operand string, lVal, rVal any) bool {
+	left, leftOK := lVal.(string)
+	right, rightOK := rVal.(string)
+	if !leftOK || !rightOK {
 		return false
 	}
-	rStr, ok := rVal.(string)
-	if !ok {
-		return false
+	if result, ok := checkIntegralOrder(operand, left, right); ok {
+		return result
 	}
+	if result, ok := checkFloatOrder(operand, left, right); ok {
+		return result
+	}
+	return checkLexicalOrder(operand, left, right)
+}
 
+// checkIntegralOrder compares lVal and rVal as integers if possible, or false otherwise.
+func checkIntegralOrder(op, lVal, rVal string) (bool, bool) {
+	left, lErr := strconv.ParseInt(lVal, 10, 64)
+	if lErr != nil {
+		return false, false
+	}
+	right, rErr := strconv.ParseInt(rVal, 10, 64)
+	if rErr != nil {
+		return false, false
+	}
+	return compareOrder(op, left, right), true
+}
+
+// checkFloatOrder compares lVal and rVal as floats if possible, or false otherwise.
+func checkFloatOrder(op, lVal, rVal string) (bool, bool) {
+	left, lErr := strconv.ParseFloat(lVal, 64)
+	if lErr != nil {
+		return false, false
+	}
+	right, rErr := strconv.ParseFloat(rVal, 64)
+	if rErr != nil {
+		return false, false
+	}
+	return compareOrder(op, left, right), true
+}
+
+// checkLexicalOrder compares lVal and rVal lexically.
+func checkLexicalOrder(op string, lVal, rVal string) bool {
+	return compareOrder[string](op, lVal, rVal)
+}
+
+// compareOrder returns the result of the expression (left op right)
+func compareOrder[T cmp.Ordered](op string, left, right T) bool {
 	switch op {
 	case "<":
-		return lStr < rStr
+		return left < right
 	case "<=":
-		return lStr <= rStr
+		return left <= right
 	case ">":
-		return lStr > rStr
+		return left > right
 	case ">=":
-		return lStr >= rStr
+		return left >= right
 	default:
 		return false
 	}
@@ -878,7 +943,7 @@ func checkLexicalOrder(op string, lVal, rVal interface{}) bool {
 
 // checkVersionMatch is used to compare a version on the
 // left hand side with a set of constraints on the right hand side
-func checkVersionMatch(ctx Context, parse verConstraintParser, lVal, rVal interface{}) bool {
+func checkVersionMatch(_ Context, parse verConstraintParser, lVal, rVal interface{}) bool {
 	// Parse the version
 	var versionStr string
 	switch v := lVal.(type) {
@@ -903,18 +968,18 @@ func checkVersionMatch(ctx Context, parse verConstraintParser, lVal, rVal interf
 	}
 
 	// Parse the constraints
-	constraints := parse(constraintStr)
-	if constraints == nil {
+	c := parse(constraintStr)
+	if c == nil {
 		return false
 	}
 
 	// Check the constraints against the version
-	return constraints.Check(vers)
+	return c.Check(vers)
 }
 
 // checkAttributeVersionMatch is used to compare a version on the
 // left hand side with a set of constraints on the right hand side
-func checkAttributeVersionMatch(ctx Context, parse verConstraintParser, lVal, rVal *psstructs.Attribute) bool {
+func checkAttributeVersionMatch(_ Context, parse verConstraintParser, lVal, rVal *psstructs.Attribute) bool {
 	// Parse the version
 	var versionStr string
 	if s, ok := lVal.GetString(); ok {
@@ -938,13 +1003,13 @@ func checkAttributeVersionMatch(ctx Context, parse verConstraintParser, lVal, rV
 	}
 
 	// Parse the constraints
-	constraints := parse(constraintStr)
-	if constraints == nil {
+	c := parse(constraintStr)
+	if c == nil {
 		return false
 	}
 
 	// Check the constraints against the version
-	return constraints.Check(vers)
+	return c.Check(vers)
 }
 
 // checkRegexpMatch is used to compare a value on the
@@ -982,7 +1047,7 @@ func checkRegexpMatch(ctx Context, lVal, rVal interface{}) bool {
 
 // checkSetContainsAll is used to see if the left hand side contains the
 // string on the right hand side
-func checkSetContainsAll(ctx Context, lVal, rVal interface{}) bool {
+func checkSetContainsAll(_ Context, lVal, rVal interface{}) bool {
 	// Ensure left-hand is string
 	lStr, ok := lVal.(string)
 	if !ok {
@@ -1135,9 +1200,8 @@ OUTER:
 			if w.available(option) {
 				return option
 			}
-			// We match the class but are temporarily unavailable, the eval
-			// should be blocked
-			return nil
+			// We match the class but are temporarily unavailable
+			continue OUTER
 		case EvalComputedClassEscaped:
 			tgEscaped = true
 		case EvalComputedClassUnknown:
@@ -1174,7 +1238,8 @@ OUTER:
 }
 
 // available checks transient feasibility checkers which depend on changing conditions,
-// e.g. the health status of a plugin or driver
+// e.g. the health status of a plugin or driver, or that are not considered in node
+// computed class, e.g. host volumes.
 func (w *FeasibilityWrapper) available(option *structs.Node) bool {
 	// If we don't have any availability checks, we're available
 	if len(w.tgAvailable) == 0 {
@@ -1330,6 +1395,13 @@ func resolveDeviceTarget(target string, d *structs.NodeDeviceResource) (*psstruc
 
 	// Handle the interpolations
 	switch {
+	case "${device.ids}" == target:
+		ids := make([]string, len(d.Instances))
+		for i, device := range d.Instances {
+			ids[i] = device.ID
+		}
+		return psstructs.NewStringAttribute(strings.Join(ids, ",")), true
+
 	case "${device.model}" == target:
 		return psstructs.NewStringAttribute(d.Name), true
 
@@ -1486,13 +1558,13 @@ func newVersionConstraintParser(ctx Context) verConstraintParser {
 			return c
 		}
 
-		constraints, err := version.NewConstraint(cstr)
+		constraint, err := version.NewConstraint(cstr)
 		if err != nil {
 			return nil
 		}
-		cache[cstr] = constraints
+		cache[cstr] = constraint
 
-		return constraints
+		return constraint
 	}
 }
 
@@ -1504,12 +1576,12 @@ func newSemverConstraintParser(ctx Context) verConstraintParser {
 			return c
 		}
 
-		constraints, err := semver.NewConstraint(cstr)
+		constraint, err := semver.NewConstraint(cstr)
 		if err != nil {
 			return nil
 		}
-		cache[cstr] = constraints
+		cache[cstr] = constraint
 
-		return constraints
+		return constraint
 	}
 }

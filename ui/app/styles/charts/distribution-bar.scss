@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 .chart.distribution-bar {
   display: block;
   height: 100%;
@@ -25,7 +30,8 @@
         opacity: 0;
       }
 
-      $color-sequence: $orange, $yellow, $green, $turquoise, $blue, $purple, $red;
+      $color-sequence: $orange, $yellow, $green, $turquoise, $blue, $purple,
+        $red;
 
       @for $i from 1 through length($color-sequence) {
         .slice-#{$i - 1} {
@@ -112,6 +118,12 @@
           .label {
             color: darken($grey-blue, 20%);
           }
+        }
+
+        // Prevent Orphaned last-elements in the list
+        // from being visually centered
+        &:nth-child(2n + 1):last-child {
+          margin-right: calc(35% + 0.75em);
         }
       }
     }

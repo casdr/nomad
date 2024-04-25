@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -201,6 +204,8 @@ func (q *PlanQueue) EmitStats(period time.Duration, stopCh <-chan struct{}) {
 	defer stop()
 
 	for {
+		timer.Reset(period)
+
 		select {
 		case <-timer.C:
 			stats := q.Stats()

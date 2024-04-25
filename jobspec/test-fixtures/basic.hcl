@@ -1,6 +1,10 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
 job "binstore-storagelocker" {
   region       = "fooregion"
   namespace    = "foonamespace"
+  node_pool    = "dev"
   type         = "batch"
   priority     = 52
   all_at_once  = true
@@ -99,10 +103,11 @@ job "binstore-storagelocker" {
     }
 
     restart {
-      attempts = 5
-      interval = "10m"
-      delay    = "15s"
-      mode     = "delay"
+      attempts         = 5
+      interval         = "10m"
+      delay            = "15s"
+      mode             = "delay"
+      render_templates = false
     }
 
     reschedule {
@@ -158,6 +163,14 @@ job "binstore-storagelocker" {
     }
 
     stop_after_client_disconnect = "120s"
+    max_client_disconnect        = "120h"
+
+    disconnect {
+      lost_after           = "120h"
+      stop_on_client_after = "120s"
+      replace              = true
+      reconcile            = "best_score"
+    }
 
     task "binstore" {
       driver = "docker"
@@ -190,6 +203,7 @@ job "binstore-storagelocker" {
       }
 
       logs {
+        disabled      = false
         max_files     = 14
         max_file_size = 101
       }
@@ -304,19 +318,29 @@ job "binstore-storagelocker" {
       }
 
       template {
-        source        = "foo"
-        destination   = "foo"
-        change_mode   = "foo"
-        change_signal = "foo"
-        splay         = "10s"
-        env           = true
-        vault_grace   = "33s"
+        source               = "foo"
+        destination          = "foo"
+        change_mode          = "foo"
+        change_signal        = "foo"
+        splay                = "10s"
+        env                  = true
+        vault_grace          = "33s"
+        error_on_missing_key = true
       }
 
       template {
-        source          = "bar"
-        destination     = "bar"
+        source      = "bar"
+        destination = "bar"
+        change_mode = "script"
+        change_script {
+          command       = "/bin/foo"
+          args          = ["-debug", "-verbose"]
+          timeout       = "5s"
+          fail_on_error = false
+        }
         perms           = "777"
+        uid             = 1001
+        gid             = 20
         left_delimiter  = "--"
         right_delimiter = "__"
       }
@@ -347,6 +371,7 @@ job "binstore-storagelocker" {
       vault {
         policies      = ["foo", "bar"]
         env           = false
+        disable_file  = false
         change_mode   = "signal"
         change_signal = "SIGUSR1"
       }

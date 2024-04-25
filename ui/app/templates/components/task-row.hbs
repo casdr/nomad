@@ -1,12 +1,13 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 <td class="is-narrow">
   {{#unless this.task.driverStatus.healthy}}
-    <span
-      data-test-icon="unhealthy-driver"
-      class="tooltip text-center"
-      aria-label="{{this.task.driver}} is unhealthy"
-    >
-      {{x-icon "alert-triangle" class="is-warning"}}
-    </span>
+    <Hds::TooltipButton data-test-icon="unhealthy-driver" @text="{{this.task.driver}} is unhealthy" aria-label="More information">
+      <FlightIcon @name="alert-triangle" />
+    </Hds::TooltipButton>
   {{/unless}}
 </td>
 <td data-test-name class="nowrap">
@@ -47,9 +48,19 @@
         {{#if volume.isCSI}}
           <LinkTo
             @route="csi.volumes.volume"
-            @model={{concat volume.source "@" volume.namespace.id}}
+            @model={{concat
+              (format-volume-name
+                source=volume.source
+                isPerAlloc=volume.volumeDeclaration.perAlloc
+                volumeExtension=this.task.allocation.volumeExtension)
+              "@"
+              volume.namespace.id
+            }}
           >
-            {{volume.source}}
+          {{format-volume-name
+            source=volume.source
+            isPerAlloc=volume.volumeDeclaration.perAlloc
+            volumeExtension=this.task.allocation.volumeExtension}}
           </LinkTo>
         {{else}}
           {{volume.source}}

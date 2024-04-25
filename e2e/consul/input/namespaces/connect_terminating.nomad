@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "connect_terminating" {
   datacenters = ["dc1"]
   type        = "service"
@@ -29,7 +32,7 @@ job "connect_terminating" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/counter-api:v3"
+        image        = "hashicorpdev/counter-api:v3"
         network_mode = "host"
       }
 
@@ -59,7 +62,7 @@ job "connect_terminating" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/counter-api:v3"
+        image        = "hashicorpdev/counter-api:v3"
         network_mode = "host"
       }
 
@@ -156,7 +159,7 @@ job "connect_terminating" {
       }
 
       config {
-        image = "hashicorpnomad/counter-dashboard:v3"
+        image = "hashicorpdev/counter-dashboard:v3"
       }
     }
   }
@@ -198,7 +201,7 @@ job "connect_terminating" {
       }
 
       config {
-        image = "hashicorpnomad/counter-dashboard:v3"
+        image = "hashicorpdev/counter-dashboard:v3"
       }
     }
   }

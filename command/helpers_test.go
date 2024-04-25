@@ -1,12 +1,15 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,11 +17,12 @@ import (
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/client/testutil"
 	"github.com/hashicorp/nomad/helper/flatmap"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/kr/pretty"
 	"github.com/mitchellh/cli"
-	"github.com/stretchr/testify/require"
+	"github.com/shoenig/test/must"
 )
 
 func TestHelpers_FormatKV(t *testing.T) {
@@ -130,9 +134,9 @@ test`,
 	}
 
 	for i, c := range cases {
-		in := ioutil.NopCloser(strings.NewReader(c.Input))
+		in := io.NopCloser(strings.NewReader(c.Input))
 		limit := NewLineLimitReader(in, c.Lines, c.SearchLimit, 0)
-		outBytes, err := ioutil.ReadAll(limit)
+		outBytes, err := io.ReadAll(limit)
 		if err != nil {
 			t.Fatalf("case %d failed: %v", i, err)
 		}
@@ -182,7 +186,7 @@ func TestHelpers_LineLimitReader_TimeLimit(t *testing.T) {
 	go func() {
 		defer close(resultCh)
 		defer close(errCh)
-		outBytes, err := ioutil.ReadAll(limit)
+		outBytes, err := io.ReadAll(limit)
 		if err != nil {
 			errCh <- fmt.Errorf("ReadAll failed: %v", err)
 			return
@@ -209,7 +213,7 @@ func TestHelpers_LineLimitReader_TimeLimit(t *testing.T) {
 }
 
 const (
-	job = `job "job1" {
+	job1 = `job "job1" {
   type        = "service"
   datacenters = ["dc1"]
   group "group1" {
@@ -219,9 +223,10 @@ const (
       resources {}
     }
     restart {
-      attempts = 10
-      mode     = "delay"
-      interval = "15s"
+      attempts         = 10
+      mode             = "delay"
+      interval         = "15s"
+      render_templates = false
     }
   }
 }`
@@ -229,18 +234,19 @@ const (
 
 var (
 	expectedApiJob = &api.Job{
-		ID:          helper.StringToPtr("job1"),
-		Name:        helper.StringToPtr("job1"),
-		Type:        helper.StringToPtr("service"),
+		ID:          pointer.Of("job1"),
+		Name:        pointer.Of("job1"),
+		Type:        pointer.Of("service"),
 		Datacenters: []string{"dc1"},
 		TaskGroups: []*api.TaskGroup{
 			{
-				Name:  helper.StringToPtr("group1"),
-				Count: helper.IntToPtr(1),
+				Name:  pointer.Of("group1"),
+				Count: pointer.Of(1),
 				RestartPolicy: &api.RestartPolicy{
-					Attempts: helper.IntToPtr(10),
-					Interval: helper.TimeToPtr(15 * time.Second),
-					Mode:     helper.StringToPtr("delay"),
+					Attempts:        pointer.Of(10),
+					Interval:        pointer.Of(15 * time.Second),
+					Mode:            pointer.Of("delay"),
+					RenderTemplates: pointer.Of(false),
 				},
 
 				Tasks: []*api.Task{
@@ -258,18 +264,18 @@ var (
 // Test APIJob with local jobfile
 func TestJobGetter_LocalFile(t *testing.T) {
 	ci.Parallel(t)
-	fh, err := ioutil.TempFile("", "nomad")
+	fh, err := os.CreateTemp("", "nomad")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 	defer os.Remove(fh.Name())
-	_, err = fh.WriteString(job)
+	_, err = fh.WriteString(job1)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
 	j := &JobGetter{}
-	aj, err := j.ApiJob(fh.Name())
+	_, aj, err := j.ApiJob(fh.Name())
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -307,23 +313,23 @@ func TestJobGetter_LocalFile_InvalidHCL2(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fh, err := ioutil.TempFile("", "nomad")
-			require.NoError(t, err)
+			fh, err := os.CreateTemp("", "nomad")
+			must.NoError(t, err)
 			defer os.Remove(fh.Name())
 			defer fh.Close()
 
 			_, err = fh.WriteString(c.hcl)
-			require.NoError(t, err)
+			must.NoError(t, err)
 
 			j := &JobGetter{}
-			_, err = j.ApiJob(fh.Name())
-			require.Error(t, err)
+			_, _, err = j.ApiJob(fh.Name())
+			must.Error(t, err)
 
 			exptMessage := "Failed to parse using HCL 2. Use the HCL 1"
 			if c.expectHCL1Message {
-				require.Contains(t, err.Error(), exptMessage)
+				must.ErrorContains(t, err, exptMessage)
 			} else {
-				require.NotContains(t, err.Error(), exptMessage)
+				must.StrNotContains(t, err.Error(), exptMessage)
 			}
 		})
 	}
@@ -332,7 +338,6 @@ func TestJobGetter_LocalFile_InvalidHCL2(t *testing.T) {
 // TestJobGetter_HCL2_Variables asserts variable arguments from CLI
 // and varfiles are both honored
 func TestJobGetter_HCL2_Variables(t *testing.T) {
-	ci.Parallel(t)
 
 	hcl := `
 variables {
@@ -346,38 +351,42 @@ job "example" {
   datacenters = ["${var.var1}", "${var.var2}", "${var.var3}", "${var.var4}"]
 }
 `
-
-	setEnv(t, "NOMAD_VAR_var4", "from-envvar")
+	t.Setenv("NOMAD_VAR_var4", "from-envvar")
 
 	cliArgs := []string{`var2=from-cli`}
 	fileVars := `var3 = "from-varfile"`
 	expected := []string{"default-val", "from-cli", "from-varfile", "from-envvar"}
 
-	hclf, err := ioutil.TempFile("", "hcl")
-	require.NoError(t, err)
+	hclf, err := os.CreateTemp("", "hcl")
+	must.NoError(t, err)
 	defer os.Remove(hclf.Name())
 	defer hclf.Close()
 
 	_, err = hclf.WriteString(hcl)
-	require.NoError(t, err)
+	must.NoError(t, err)
 
-	vf, err := ioutil.TempFile("", "var.hcl")
-	require.NoError(t, err)
+	vf, err := os.CreateTemp("", "var.hcl")
+	must.NoError(t, err)
 	defer os.Remove(vf.Name())
 	defer vf.Close()
 
 	_, err = vf.WriteString(fileVars + "\n")
-	require.NoError(t, err)
+	must.NoError(t, err)
 
-	j, err := (&JobGetter{}).ApiJobWithArgs(hclf.Name(), cliArgs, []string{vf.Name()}, true)
-	require.NoError(t, err)
+	jg := &JobGetter{
+		Vars:     cliArgs,
+		VarFiles: []string{vf.Name()},
+		Strict:   true,
+	}
 
-	require.NotNil(t, j)
-	require.Equal(t, expected, j.Datacenters)
+	_, j, err := jg.Get(hclf.Name())
+	must.NoError(t, err)
+
+	must.NotNil(t, j)
+	must.Eq(t, expected, j.Datacenters)
 }
 
 func TestJobGetter_HCL2_Variables_StrictFalse(t *testing.T) {
-	ci.Parallel(t)
 
 	hcl := `
 variables {
@@ -392,8 +401,7 @@ job "example" {
 }
 `
 
-	os.Setenv("NOMAD_VAR_var4", "from-envvar")
-	defer os.Unsetenv("NOMAD_VAR_var4")
+	t.Setenv("NOMAD_VAR_var4", "from-envvar")
 
 	// Both the CLI and var file contain variables that are not used with the
 	// template and therefore would error, if hcl2-strict was true.
@@ -404,34 +412,39 @@ unsedVar2 = "from-varfile"
 `
 	expected := []string{"default-val", "from-cli", "from-varfile", "from-envvar"}
 
-	hclf, err := ioutil.TempFile("", "hcl")
-	require.NoError(t, err)
+	hclf, err := os.CreateTemp("", "hcl")
+	must.NoError(t, err)
 	defer os.Remove(hclf.Name())
 	defer hclf.Close()
 
 	_, err = hclf.WriteString(hcl)
-	require.NoError(t, err)
+	must.NoError(t, err)
 
-	vf, err := ioutil.TempFile("", "var.hcl")
-	require.NoError(t, err)
+	vf, err := os.CreateTemp("", "var.hcl")
+	must.NoError(t, err)
 	defer os.Remove(vf.Name())
 	defer vf.Close()
 
 	_, err = vf.WriteString(fileVars + "\n")
-	require.NoError(t, err)
+	must.NoError(t, err)
 
-	j, err := (&JobGetter{}).ApiJobWithArgs(hclf.Name(), cliArgs, []string{vf.Name()}, false)
-	require.NoError(t, err)
+	jg := &JobGetter{
+		Vars:     cliArgs,
+		VarFiles: []string{vf.Name()},
+		Strict:   false,
+	}
 
-	require.NotNil(t, j)
-	require.Equal(t, expected, j.Datacenters)
+	_, j, err := jg.Get(hclf.Name())
+	must.NoError(t, err)
+	must.NotNil(t, j)
+	must.Eq(t, expected, j.Datacenters)
 }
 
 // Test StructJob with jobfile from HTTP Server
 func TestJobGetter_HTTPServer(t *testing.T) {
 	ci.Parallel(t)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, job)
+		fmt.Fprintf(w, job1)
 	})
 	go http.ListenAndServe("127.0.0.1:12345", nil)
 
@@ -439,7 +452,7 @@ func TestJobGetter_HTTPServer(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	j := &JobGetter{}
-	aj, err := j.ApiJob("http://127.0.0.1:12345/")
+	_, aj, err := j.ApiJob("http://127.0.0.1:12345/")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -448,6 +461,84 @@ func TestJobGetter_HTTPServer(t *testing.T) {
 			t.Logf(d)
 		}
 		t.Fatalf("Unexpected file")
+	}
+}
+
+func TestJobGetter_Validate(t *testing.T) {
+	cases := []struct {
+		name        string
+		jg          JobGetter
+		errContains string
+	}{
+		{
+			"StrictAndHCL1",
+			JobGetter{
+				HCL1:   true,
+				Strict: true,
+			},
+			"HCLv1 and HCLv2 strict",
+		},
+		{
+			"JSONandHCL1",
+			JobGetter{
+				HCL1: true,
+				JSON: true,
+			},
+			"HCL and JSON",
+		},
+		{
+			"VarsAndHCL1",
+			JobGetter{
+				HCL1: true,
+				Vars: []string{"foo"},
+			},
+			"variables with HCLv1",
+		},
+		{
+			"VarFilesAndHCL1",
+			JobGetter{
+				HCL1:     true,
+				VarFiles: []string{"foo.var"},
+			},
+			"variables with HCLv1",
+		},
+		{
+			"VarsAndJSON",
+			JobGetter{
+				JSON: true,
+				Vars: []string{"foo"},
+			},
+			"variables with JSON",
+		},
+		{
+			"VarFilesAndJSON",
+			JobGetter{
+				JSON:     true,
+				VarFiles: []string{"foo.var"},
+			},
+			"variables with JSON files",
+		},
+		{
+			"JSON_OK",
+			JobGetter{
+				JSON: true,
+			},
+			"",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.jg.Validate()
+
+			switch tc.errContains {
+			case "":
+				must.NoError(t, err)
+			default:
+				must.ErrorContains(t, err, tc.errContains)
+			}
+
+		})
 	}
 }
 
@@ -517,25 +608,126 @@ func TestUiErrorWriter(t *testing.T) {
 	partialAcc := ""
 	for _, in := range inputs {
 		n, err := w.Write([]byte(in))
-		require.NoError(t, err)
-		require.Equal(t, len(in), n)
+		must.NoError(t, err)
+		must.Eq(t, len(in), n)
 
 		// assert that writer emits partial result until last new line
 		partialAcc += strings.ReplaceAll(in, "\r\n", "\n")
 		lastNL := strings.LastIndex(partialAcc, "\n")
-		require.Equal(t, partialAcc[:lastNL+1], errBuf.String())
+		must.Eq(t, partialAcc[:lastNL+1], errBuf.String())
 	}
 
-	require.Empty(t, outBuf.String())
+	must.Eq(t, "", outBuf.String())
 
 	// note that the \r\n got replaced by \n
 	expectedErr := "some line\nmultiple\nlines\nhere with  followup\nand more lines  without new line until here\n"
-	require.Equal(t, expectedErr, errBuf.String())
+	must.Eq(t, expectedErr, errBuf.String())
 
 	// close emits the final line
 	err := w.Close()
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	expectedErr += "and thensome more\n"
-	require.Equal(t, expectedErr, errBuf.String())
+	must.Eq(t, expectedErr, errBuf.String())
+}
+
+func Test_extractVarFiles(t *testing.T) {
+	ci.Parallel(t)
+
+	t.Run("none", func(t *testing.T) {
+		result, err := extractVarFiles(nil)
+		must.NoError(t, err)
+		must.Eq(t, "", result)
+	})
+
+	t.Run("files", func(t *testing.T) {
+		d := t.TempDir()
+		fileOne := filepath.Join(d, "one.hcl")
+		fileTwo := filepath.Join(d, "two.hcl")
+
+		must.NoError(t, os.WriteFile(fileOne, []byte(`foo = "bar"`), 0o644))
+		must.NoError(t, os.WriteFile(fileTwo, []byte(`baz = 42`), 0o644))
+
+		result, err := extractVarFiles([]string{fileOne, fileTwo})
+		must.NoError(t, err)
+		must.Eq(t, "foo = \"bar\"\nbaz = 42\n", result)
+	})
+
+	t.Run("unreadble", func(t *testing.T) {
+		testutil.RequireNonRoot(t)
+
+		d := t.TempDir()
+		fileOne := filepath.Join(d, "one.hcl")
+
+		must.NoError(t, os.WriteFile(fileOne, []byte(`foo = "bar"`), 0o200))
+
+		_, err := extractVarFiles([]string{fileOne})
+		must.ErrorContains(t, err, "permission denied")
+	})
+}
+
+func Test_extractVarFlags(t *testing.T) {
+	ci.Parallel(t)
+
+	t.Run("nil", func(t *testing.T) {
+		result := extractVarFlags(nil)
+		must.MapEmpty(t, result)
+	})
+
+	t.Run("complete", func(t *testing.T) {
+		result := extractVarFlags([]string{"one=1", "two=2", "three"})
+		must.Eq(t, map[string]string{
+			"one":   "1",
+			"two":   "2",
+			"three": "",
+		}, result)
+	})
+}
+
+func Test_extractJobSpecEnvVars(t *testing.T) {
+	ci.Parallel(t)
+
+	t.Run("nil", func(t *testing.T) {
+		must.MapEmpty(t, extractJobSpecEnvVars(nil))
+	})
+
+	t.Run("complete", func(t *testing.T) {
+		result := extractJobSpecEnvVars([]string{
+			"NOMAD_VAR_count=13",
+			"GOPATH=/Users/jrasell/go",
+			"NOMAD_VAR_image=redis:7",
+		})
+		must.Eq(t, map[string]string{
+			"count": "13",
+			"image": "redis:7",
+		}, result)
+	})
+
+	t.Run("whitespace", func(t *testing.T) {
+		result := extractJobSpecEnvVars([]string{
+			"NOMAD_VAR_count = 13",
+			"GOPATH = /Users/jrasell/go",
+		})
+		must.Eq(t, map[string]string{
+			"count ": " 13",
+		}, result)
+	})
+
+	t.Run("empty key", func(t *testing.T) {
+		result := extractJobSpecEnvVars([]string{
+			"NOMAD_VAR_=13",
+			"=/Users/jrasell/go",
+		})
+		must.Eq(t, map[string]string{}, result)
+	})
+
+	t.Run("empty value", func(t *testing.T) {
+		result := extractJobSpecEnvVars([]string{
+			"NOMAD_VAR_count=",
+			"GOPATH=",
+		})
+		must.Eq(t, map[string]string{
+			"count": "",
+		}, result)
+	})
 }

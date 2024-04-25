@@ -18,6 +18,12 @@ Use the PR number as the file name. Enterprise private changes should have an en
 
 The `.txt` files have a markdown-like syntax, with a tag signifying the entry type.
 
+Use the `tools/cl-entry` command to help generate a changelog entry file.
+
+```shell
+make cl
+```
+
 Below are some examples of how to generate a CHANGELOG entry with your pull request.
 
 ### Improvement
@@ -42,9 +48,11 @@ Significant major release features. Typically included in release blog announcem
 
 Improvements are incremental and quality of life enhancement that don't rise to the FEATURES level:
 
+~~~
 ```release-note:improvement
 cli: Added `-monitor` flag to `deployment status` command and automatically monitor deployments from `job run` command.
 ```
+~~~
 
 ### Bug
 

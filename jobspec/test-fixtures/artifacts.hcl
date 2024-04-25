@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
 job "binstore-storagelocker" {
   group "binsl" {
     task "binstore" {
@@ -19,6 +22,15 @@ job "binstore-storagelocker" {
       artifact {
         source      = "http://foo.com/bam"
         destination = "var/foo"
+      }
+
+      artifact {
+        source = "https://example.com/file.txt"
+
+        headers {
+          User-Agent    = "nomad"
+          X-Nomad-Alloc = "alloc"
+        }
       }
     }
   }

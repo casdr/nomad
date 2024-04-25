@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-disable ember/no-incorrect-calls-with-inline-anonymous-functions */
 import { alias } from '@ember/object/computed';
 import Controller from '@ember/controller';
@@ -41,13 +46,23 @@ export default class AllocationsController extends Controller.extend(
     {
       qpTaskGroup: 'taskGroup',
     },
+    {
+      qpVersion: 'version',
+    },
+    {
+      qpScheduling: 'scheduling',
+    },
+    'activeTask',
   ];
 
   qpStatus = '';
   qpClient = '';
   qpTaskGroup = '';
+  qpVersion = '';
+  qpScheduling = '';
   currentPage = 1;
   pageSize = 25;
+  activeTask = null;
 
   sortProperty = 'modifyIndex';
   sortDescending = true;
@@ -68,10 +83,18 @@ export default class AllocationsController extends Controller.extend(
     'allocations.[]',
     'selectionStatus',
     'selectionClient',
-    'selectionTaskGroup'
+    'selectionTaskGroup',
+    'selectionVersion',
+    'selectionScheduling'
   )
   get filteredAllocations() {
-    const { selectionStatus, selectionClient, selectionTaskGroup } = this;
+    const {
+      selectionStatus,
+      selectionClient,
+      selectionTaskGroup,
+      selectionVersion,
+      selectionScheduling,
+    } = this;
 
     return this.allocations.filter((alloc) => {
       if (
@@ -92,6 +115,41 @@ export default class AllocationsController extends Controller.extend(
       ) {
         return false;
       }
+      if (
+        selectionVersion.length &&
+        !selectionVersion.includes(alloc.jobVersion)
+      ) {
+        return false;
+      }
+
+      if (selectionScheduling.length) {
+        if (
+          selectionScheduling.includes('will-not-reschedule') &&
+          !alloc.willNotReschedule
+        ) {
+          return false;
+        }
+        if (
+          selectionScheduling.includes('will-not-restart') &&
+          !alloc.willNotRestart
+        ) {
+          return false;
+        }
+        if (
+          selectionScheduling.includes('has-been-rescheduled') &&
+          !alloc.hasBeenRescheduled
+        ) {
+          return false;
+        }
+        if (
+          selectionScheduling.includes('has-been-restarted') &&
+          !alloc.hasBeenRestarted
+        ) {
+          return false;
+        }
+        return true;
+      }
+
       return true;
     });
   }
@@ -103,10 +161,12 @@ export default class AllocationsController extends Controller.extend(
   @selection('qpStatus') selectionStatus;
   @selection('qpClient') selectionClient;
   @selection('qpTaskGroup') selectionTaskGroup;
+  @selection('qpVersion') selectionVersion;
+  @selection('qpScheduling') selectionScheduling;
 
   @action
   gotoAllocation(allocation) {
-    this.transitionToRoute('allocations.allocation', allocation);
+    this.transitionToRoute('allocations.allocation', allocation.id);
   }
 
   get optionsAllocationStatus() {
@@ -116,6 +176,7 @@ export default class AllocationsController extends Controller.extend(
       { key: 'complete', label: 'Complete' },
       { key: 'failed', label: 'Failed' },
       { key: 'lost', label: 'Lost' },
+      { key: 'unknown', label: 'Unknown' },
     ];
   }
 
@@ -155,7 +216,56 @@ export default class AllocationsController extends Controller.extend(
     return taskGroups.sort().map((tg) => ({ key: tg, label: tg }));
   }
 
+  @computed('model.allocations.[]', 'selectionVersion')
+  get optionsVersions() {
+    const versions = Array.from(
+      new Set(this.model.allocations.mapBy('jobVersion'))
+    ).compact();
+
+    // Update query param when the list of versions changes.
+    scheduleOnce('actions', () => {
+      // eslint-disable-next-line ember/no-side-effects
+      this.set(
+        'qpVersion',
+        serialize(intersection(versions, this.selectionVersion))
+      );
+    });
+
+    return versions.sort((a, b) => a - b).map((v) => ({ key: v, label: v }));
+  }
+
+  @computed('model.allocations.[]', 'selectionScheduling')
+  get optionsScheduling() {
+    return [
+      {
+        key: 'has-been-rescheduled',
+        label: 'Failed & Has Been Rescheduled',
+      },
+      {
+        key: 'will-not-reschedule',
+        label: "Failed & Won't Reschedule",
+      },
+      {
+        key: 'has-been-restarted',
+        label: 'Has Been Restarted',
+      },
+      {
+        key: 'will-not-restart',
+        label: "Won't Restart",
+      },
+    ];
+  }
+
   setFacetQueryParam(queryParam, selection) {
     this.set(queryParam, serialize(selection));
+  }
+
+  @action
+  setActiveTaskQueryParam(task) {
+    if (task) {
+      this.set('activeTask', `${task.allocation.id}-${task.name}`);
+    } else {
+      this.set('activeTask', null);
+    }
   }
 }

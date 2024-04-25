@@ -1,8 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package taskrunner
 
 import (
 	"context"
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,8 +16,8 @@ import (
 	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
 	ti "github.com/hashicorp/nomad/client/allocrunner/taskrunner/interfaces"
 	"github.com/hashicorp/nomad/client/consul"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -43,11 +47,12 @@ const (
 )
 
 type sidsHookConfig struct {
-	alloc      *structs.Allocation
-	task       *structs.Task
-	sidsClient consul.ServiceIdentityAPI
-	lifecycle  ti.TaskLifecycle
-	logger     hclog.Logger
+	alloc              *structs.Allocation
+	task               *structs.Task
+	sidsClient         consul.ServiceIdentityAPI
+	lifecycle          ti.TaskLifecycle
+	logger             hclog.Logger
+	allocHookResources *cstructs.AllocHookResources
 }
 
 // Service Identities hook for managing SI tokens of connect enabled tasks.
@@ -77,17 +82,22 @@ type sidsHook struct {
 	// firstRun keeps track of whether the hook is being called for the first
 	// time (for this task) during the lifespan of the Nomad Client process.
 	firstRun bool
+
+	// allocHookResources gives us access to Consul tokens that may have been
+	// set by the consul_hook
+	allocHookResources *cstructs.AllocHookResources
 }
 
 func newSIDSHook(c sidsHookConfig) *sidsHook {
 	return &sidsHook{
-		alloc:             c.alloc,
-		task:              c.task,
-		sidsClient:        c.sidsClient,
-		lifecycle:         c.lifecycle,
-		derivationTimeout: sidsDerivationTimeout,
-		logger:            c.logger.Named(sidsHookName),
-		firstRun:          true,
+		alloc:              c.alloc,
+		task:               c.task,
+		sidsClient:         c.sidsClient,
+		lifecycle:          c.lifecycle,
+		derivationTimeout:  sidsDerivationTimeout,
+		logger:             c.logger.Named(sidsHookName),
+		firstRun:           true,
+		allocHookResources: c.allocHookResources,
 	}
 }
 
@@ -113,6 +123,32 @@ func (h *sidsHook) Prestart(
 	token, err := h.recoverToken(req.TaskDir.SecretsDir)
 	if err != nil {
 		return err
+	}
+
+	// if we're using Workload Identities then this Connect task should already
+	// have a token stored under the cluster + service ID.
+	tokens := h.allocHookResources.GetConsulTokens()
+
+	// Find the group-level service that this task belongs to
+	tg := h.alloc.Job.LookupTaskGroup(h.alloc.TaskGroup)
+	serviceName := h.task.Kind.Value()
+	var serviceIdentityName string
+	var cluster string
+	for _, service := range tg.Services {
+		if service.Name == serviceName {
+			serviceIdentityName = service.MakeUniqueIdentityName()
+			cluster = service.GetConsulClusterName(tg)
+			break
+		}
+	}
+	if cluster != "" && serviceIdentityName != "" {
+		if token, ok := tokens[cluster][serviceIdentityName]; ok {
+			if err := h.writeToken(req.TaskDir.SecretsDir, token.SecretID); err != nil {
+				return err
+			}
+			resp.Done = true
+			return nil
+		}
 	}
 
 	// need to ask for a new SI token & persist it to disk
@@ -146,8 +182,8 @@ func (h *sidsHook) earlyExit() bool {
 // writeToken writes token into the secrets directory for the task.
 func (h *sidsHook) writeToken(dir string, token string) error {
 	tokenPath := filepath.Join(dir, sidsTokenFile)
-	if err := ioutil.WriteFile(tokenPath, []byte(token), sidsTokenFilePerms); err != nil {
-		return errors.Wrap(err, "failed to write SI token")
+	if err := os.WriteFile(tokenPath, []byte(token), sidsTokenFilePerms); err != nil {
+		return fmt.Errorf("failed to write SI token: %w", err)
 	}
 	return nil
 }
@@ -157,11 +193,11 @@ func (h *sidsHook) writeToken(dir string, token string) error {
 // is returned only for some other (e.g. disk IO) error.
 func (h *sidsHook) recoverToken(dir string) (string, error) {
 	tokenPath := filepath.Join(dir, sidsTokenFile)
-	token, err := ioutil.ReadFile(tokenPath)
+	token, err := os.ReadFile(tokenPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			h.logger.Error("failed to recover SI token", "error", err)
-			return "", errors.Wrap(err, "failed to recover SI token")
+			return "", fmt.Errorf("failed to recover SI token: %w", err)
 		}
 		h.logger.Trace("no pre-existing SI token to recover", "task", h.task.Name)
 		return "", nil // token file does not exist yet
@@ -195,7 +231,7 @@ func (h *sidsHook) deriveSIToken(ctx context.Context) (string, error) {
 		case result := <-resultCh:
 			if result.err != nil {
 				h.logger.Error("failed to derive SI token", "error", result.err)
-				h.kill(ctx, errors.Wrap(result.err, "failed to derive SI token"))
+				h.kill(ctx, fmt.Errorf("failed to derive SI token: %w", result.err))
 				return "", result.err
 			}
 			return result.token, nil

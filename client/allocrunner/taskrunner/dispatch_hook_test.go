@@ -1,8 +1,11 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package taskrunner
 
 import (
 	"context"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,10 +36,10 @@ func TestTaskRunner_DispatchHook_NoPayload(t *testing.T) {
 	alloc := mock.BatchAlloc()
 	task := alloc.Job.TaskGroups[0].Tasks[0]
 
-	allocDir := allocdir.NewAllocDir(logger, "nomadtest_nopayload", alloc.ID)
+	allocDir := allocdir.NewAllocDir(logger, "nomadtest_nopayload", "nomadtest_nopayload", alloc.ID)
 	defer allocDir.Destroy()
 	taskDir := allocDir.NewTaskDir(task.Name)
-	require.NoError(taskDir.Build(false, nil))
+	require.NoError(taskDir.Build(fsisolation.None, nil, task.User))
 
 	h := newDispatchHook(alloc, logger)
 
@@ -50,7 +54,7 @@ func TestTaskRunner_DispatchHook_NoPayload(t *testing.T) {
 	require.True(resp.Done)
 
 	// Assert payload directory is empty
-	files, err := ioutil.ReadDir(req.TaskDir.LocalDir)
+	files, err := os.ReadDir(req.TaskDir.LocalDir)
 	require.NoError(err)
 	require.Empty(files)
 }
@@ -78,10 +82,10 @@ func TestTaskRunner_DispatchHook_Ok(t *testing.T) {
 		File: "out",
 	}
 
-	allocDir := allocdir.NewAllocDir(logger, "nomadtest_dispatchok", alloc.ID)
+	allocDir := allocdir.NewAllocDir(logger, "nomadtest_dispatchok", "nomadtest_dispatchok", alloc.ID)
 	defer allocDir.Destroy()
 	taskDir := allocDir.NewTaskDir(task.Name)
-	require.NoError(taskDir.Build(false, nil))
+	require.NoError(taskDir.Build(fsisolation.None, nil, task.User))
 
 	h := newDispatchHook(alloc, logger)
 
@@ -94,7 +98,7 @@ func TestTaskRunner_DispatchHook_Ok(t *testing.T) {
 	require.True(resp.Done)
 
 	filename := filepath.Join(req.TaskDir.LocalDir, task.DispatchPayload.File)
-	result, err := ioutil.ReadFile(filename)
+	result, err := os.ReadFile(filename)
 	require.NoError(err)
 	require.Equal(expected, result)
 }
@@ -123,10 +127,10 @@ func TestTaskRunner_DispatchHook_Error(t *testing.T) {
 		File: "out",
 	}
 
-	allocDir := allocdir.NewAllocDir(logger, "nomadtest_dispatcherr", alloc.ID)
+	allocDir := allocdir.NewAllocDir(logger, "nomadtest_dispatcherr", "nomadtest_dispatcherr", alloc.ID)
 	defer allocDir.Destroy()
 	taskDir := allocDir.NewTaskDir(task.Name)
-	require.NoError(taskDir.Build(false, nil))
+	require.NoError(taskDir.Build(fsisolation.None, nil, task.User))
 
 	h := newDispatchHook(alloc, logger)
 
@@ -141,7 +145,7 @@ func TestTaskRunner_DispatchHook_Error(t *testing.T) {
 	require.False(resp.Done)
 
 	// Assert payload directory is empty
-	files, err := ioutil.ReadDir(req.TaskDir.LocalDir)
+	files, err := os.ReadDir(req.TaskDir.LocalDir)
 	require.NoError(err)
 	require.Empty(files)
 }

@@ -1,8 +1,10 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package loader
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,11 +47,7 @@ func newHarness(t *testing.T, plugins []string) *harness {
 	}
 
 	// Build a temp directory
-	path, err := ioutil.TempDir("", t.Name())
-	if err != nil {
-		t.Fatalf("failed to build tmp directory")
-	}
-	h.tmpDir = path
+	h.tmpDir = t.TempDir()
 
 	// Get our own executable path
 	selfExe, err := os.Executable()
@@ -100,13 +98,6 @@ func (h *harness) pluginDir() string {
 	return h.tmpDir
 }
 
-// cleanup removes the temp directory
-func (h *harness) cleanup() {
-	if err := os.RemoveAll(h.tmpDir); err != nil {
-		h.t.Fatalf("failed to remove tmp directory %q: %v", h.tmpDir, err)
-	}
-}
-
 func TestPluginLoader_External(t *testing.T) {
 	ci.Parallel(t)
 	require := require.New(t)
@@ -115,7 +106,6 @@ func TestPluginLoader_External(t *testing.T) {
 	plugins := []string{"mock-device", "mock-device-2"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -175,7 +165,6 @@ func TestPluginLoader_External_ApiVersions(t *testing.T) {
 	plugins := []string{"mock-device", "mock-device-2", "mock-device-3"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -279,7 +268,6 @@ func TestPluginLoader_External_NoApiVersion(t *testing.T) {
 	plugins := []string{"mock-device"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -309,7 +297,6 @@ func TestPluginLoader_External_Config(t *testing.T) {
 	plugins := []string{"mock-device", "mock-device-2"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -376,7 +363,6 @@ func TestPluginLoader_External_Config_Bad(t *testing.T) {
 	plugins := []string{"mock-device"}
 	pluginVersions := []string{"v0.0.1"}
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -411,7 +397,6 @@ func TestPluginLoader_External_VersionOverlap(t *testing.T) {
 	plugins := []string{"mock-device", "mock-device-2"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -461,7 +446,6 @@ func TestPluginLoader_Internal(t *testing.T) {
 
 	// Create the harness
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	plugins := []string{"mock-device", "mock-device-2"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
@@ -525,7 +509,6 @@ func TestPluginLoader_Internal_ApiVersions(t *testing.T) {
 	plugins := []string{"mock-device", "mock-device-2", "mock-device-3"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -607,7 +590,6 @@ func TestPluginLoader_Internal_NoApiVersion(t *testing.T) {
 	plugins := []string{"mock-device"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -636,7 +618,6 @@ func TestPluginLoader_Internal_Config(t *testing.T) {
 
 	// Create the harness
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	plugins := []string{"mock-device", "mock-device-2"}
 	pluginVersions := []string{"v0.0.1", "v0.0.2"}
@@ -707,7 +688,6 @@ func TestPluginLoader_Internal_ExternalConfig(t *testing.T) {
 
 	// Create the harness
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	plugin := "mock-device"
 	pluginVersion := "v0.0.1"
@@ -778,7 +758,6 @@ func TestPluginLoader_Internal_Config_Bad(t *testing.T) {
 
 	// Create the harness
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	plugins := []string{"mock-device"}
 	pluginVersions := []string{"v0.0.1"}
@@ -820,7 +799,6 @@ func TestPluginLoader_InternalOverrideExternal(t *testing.T) {
 	pluginApiVersions := []string{device.ApiVersion010}
 
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -877,7 +855,6 @@ func TestPluginLoader_ExternalOverrideInternal(t *testing.T) {
 	pluginApiVersions := []string{device.ApiVersion010}
 
 	h := newHarness(t, plugins)
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -932,7 +909,6 @@ func TestPluginLoader_Dispense_External(t *testing.T) {
 	plugin := "mock-device"
 	pluginVersion := "v0.0.1"
 	h := newHarness(t, []string{plugin})
-	defer h.cleanup()
 
 	expKey := "set_config_worked"
 
@@ -980,7 +956,6 @@ func TestPluginLoader_Dispense_Internal(t *testing.T) {
 	pluginVersion := "v0.0.1"
 	pluginApiVersions := []string{device.ApiVersion010}
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	expKey := "set_config_worked"
 	expNomadConfig := &base.AgentConfig{
@@ -1038,7 +1013,6 @@ func TestPluginLoader_Dispense_NoConfigSchema_External(t *testing.T) {
 	plugin := "mock-device"
 	pluginVersion := "v0.0.1"
 	h := newHarness(t, []string{plugin})
-	defer h.cleanup()
 
 	expKey := "set_config_worked"
 
@@ -1087,7 +1061,6 @@ func TestPluginLoader_Dispense_NoConfigSchema_Internal(t *testing.T) {
 	pluginVersion := "v0.0.1"
 	pluginApiVersions := []string{device.ApiVersion010}
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	expKey := "set_config_worked"
 
@@ -1137,7 +1110,6 @@ func TestPluginLoader_Reattach_External(t *testing.T) {
 	plugin := "mock-device"
 	pluginVersion := "v0.0.1"
 	h := newHarness(t, []string{plugin})
-	defer h.cleanup()
 
 	expKey := "set_config_worked"
 
@@ -1200,7 +1172,6 @@ func TestPluginLoader_Bad_Executable(t *testing.T) {
 	// Create a plugin
 	plugin := "mock-device"
 	h := newHarness(t, []string{plugin})
-	defer h.cleanup()
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)
@@ -1233,7 +1204,6 @@ func TestPluginLoader_External_SkipBadFiles(t *testing.T) {
 	plugins := []string{"mock-device"}
 	pluginVersions := []string{"v0.0.1"}
 	h := newHarness(t, nil)
-	defer h.cleanup()
 
 	// Create a folder inside our plugin dir
 	require.NoError(os.Mkdir(filepath.Join(h.pluginDir(), "folder"), 0666))
@@ -1246,7 +1216,7 @@ func TestPluginLoader_External_SkipBadFiles(t *testing.T) {
 	require.NoError(os.Symlink(selfExe, filepath.Join(h.pluginDir(), plugins[0])))
 
 	// Create a non-executable file
-	require.NoError(ioutil.WriteFile(filepath.Join(h.pluginDir(), "some.yaml"), []byte("hcl > yaml"), 0666))
+	require.NoError(os.WriteFile(filepath.Join(h.pluginDir(), "some.yaml"), []byte("hcl > yaml"), 0666))
 
 	logger := testlog.HCLogger(t)
 	logger.SetLevel(log.Trace)

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { computed } from '@ember/object';
 
 // An Ember.Computed property for taking the first segment
@@ -7,6 +12,6 @@ import { computed } from '@ember/object';
 //     short: shortUUIDProperty('id') // 123456
 export default function shortUUIDProperty(uuidKey) {
   return computed(uuidKey, function () {
-    return this.get(uuidKey).split('-')[0];
+    return this.get(uuidKey)?.split('-')[0];
   });
 }

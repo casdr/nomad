@@ -1,22 +1,35 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/hashicorp/go-memdb"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
+	"github.com/shoenig/test"
+	"github.com/shoenig/test/must"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client"
 	cconfig "github.com/hashicorp/nomad/client/config"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper/uuid"
+	"github.com/hashicorp/nomad/lib/lang"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/plugins/csi"
 	"github.com/hashicorp/nomad/testutil"
-	"github.com/stretchr/testify/require"
 )
 
 func TestCSIVolumeEndpoint_Get(t *testing.T) {
@@ -67,7 +80,7 @@ func TestCSIVolumeEndpoint_Get(t *testing.T) {
 
 func TestCSIVolumeEndpoint_Get_ACL(t *testing.T) {
 	ci.Parallel(t)
-	srv, shutdown := TestServer(t, func(c *Config) {
+	srv, _, shutdown := TestACLServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
 	defer shutdown()
@@ -76,8 +89,6 @@ func TestCSIVolumeEndpoint_Get_ACL(t *testing.T) {
 	ns := structs.DefaultNamespace
 
 	state := srv.fsm.State()
-	state.BootstrapACLTokens(structs.MsgTypeTestSetup, 1, 0, mock.ACLManagementToken())
-	srv.config.ACLEnabled = true
 	policy := mock.NamespacePolicy(ns, "", []string{acl.NamespaceCapabilityCSIReadVolume})
 	validToken := mock.CreatePolicyAndToken(t, state, 1001, "csi-access", policy)
 
@@ -116,6 +127,83 @@ func TestCSIVolumeEndpoint_Get_ACL(t *testing.T) {
 	require.Equal(t, vols[0].ID, resp.Volume.ID)
 }
 
+func TestCSIVolume_pluginValidateVolume(t *testing.T) {
+	// bare minimum server for this method
+	store := state.TestStateStore(t)
+	srv := &Server{
+		fsm: &nomadFSM{state: store},
+	}
+	// has our method under test
+	csiVolume := &CSIVolume{srv: srv}
+	// volume for which we will request a valid plugin
+	vol := &structs.CSIVolume{PluginID: "neat-plugin"}
+
+	// plugin not found
+	got, err := csiVolume.pluginValidateVolume(vol)
+	must.Nil(t, got, must.Sprint("nonexistent plugin should be nil"))
+	must.ErrorContains(t, err, "no CSI plugin named")
+
+	// we'll upsert this plugin after optionally modifying it
+	basePlug := &structs.CSIPlugin{
+		ID: vol.PluginID,
+		// these should be set on the volume after success
+		Provider: "neat-provider",
+		Version:  "v0",
+		// explicit zero values, because these modify behavior we care about
+		ControllerRequired: false,
+		ControllersHealthy: 0,
+	}
+
+	cases := []struct {
+		name         string
+		updatePlugin func(*structs.CSIPlugin)
+		expectErr    string
+	}{
+		{
+			name: "controller not required",
+		},
+		{
+			name: "controller unhealthy",
+			updatePlugin: func(p *structs.CSIPlugin) {
+				p.ControllerRequired = true
+			},
+			expectErr: "no healthy controllers",
+		},
+		{
+			name: "controller healthy",
+			updatePlugin: func(p *structs.CSIPlugin) {
+				p.ControllerRequired = true
+				p.ControllersHealthy = 1
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vol := vol.Copy()
+			plug := basePlug.Copy()
+
+			if tc.updatePlugin != nil {
+				tc.updatePlugin(plug)
+			}
+			must.NoError(t, store.UpsertCSIPlugin(1000, plug))
+
+			got, err := csiVolume.pluginValidateVolume(vol)
+
+			if tc.expectErr == "" {
+				must.NoError(t, err)
+				must.NotNil(t, got, must.Sprint("plugin should not be nil"))
+				must.Eq(t, vol.Provider, plug.Provider)
+				must.Eq(t, vol.ProviderVersion, plug.Version)
+			} else {
+				must.Error(t, err, must.Sprint("expect error:", tc.expectErr))
+				must.ErrorContains(t, err, tc.expectErr)
+				must.Nil(t, got, must.Sprint("plugin should be nil"))
+			}
+		})
+	}
+}
+
 func TestCSIVolumeEndpoint_Register(t *testing.T) {
 	ci.Parallel(t)
 	srv, shutdown := TestServer(t, func(c *Config) {
@@ -124,12 +212,14 @@ func TestCSIVolumeEndpoint_Register(t *testing.T) {
 	defer shutdown()
 	testutil.WaitForLeader(t, srv.RPC)
 
-	ns := structs.DefaultNamespace
-
-	state := srv.fsm.State()
+	store := srv.fsm.State()
 	codec := rpcClient(t, srv)
 
 	id0 := uuid.Generate()
+
+	// Create the register request
+	ns := mock.Namespace()
+	store.UpsertNamespaces(900, []*structs.Namespace{ns})
 
 	// Create the node and plugin
 	node := mock.Node()
@@ -141,11 +231,12 @@ func TestCSIVolumeEndpoint_Register(t *testing.T) {
 			NodeInfo: &structs.CSINodeInfo{},
 		},
 	}
-	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, 1000, node))
+	require.NoError(t, store.UpsertNode(structs.MsgTypeTestSetup, 1000, node))
 
 	// Create the volume
 	vols := []*structs.CSIVolume{{
 		ID:             id0,
+		Namespace:      ns.Name,
 		PluginID:       "minnie",
 		AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader, // legacy field ignored
 		AttachmentMode: structs.CSIVolumeAttachmentModeBlockDevice,  // legacy field ignored
@@ -165,7 +256,7 @@ func TestCSIVolumeEndpoint_Register(t *testing.T) {
 		Volumes: vols,
 		WriteRequest: structs.WriteRequest{
 			Region:    "global",
-			Namespace: ns,
+			Namespace: "",
 		},
 	}
 	resp1 := &structs.CSIVolumeRegisterResponse{}
@@ -177,7 +268,8 @@ func TestCSIVolumeEndpoint_Register(t *testing.T) {
 	req2 := &structs.CSIVolumeGetRequest{
 		ID: id0,
 		QueryOptions: structs.QueryOptions{
-			Region: "global",
+			Region:    "global",
+			Namespace: ns.Name,
 		},
 	}
 	resp2 := &structs.CSIVolumeGetResponse{}
@@ -200,7 +292,7 @@ func TestCSIVolumeEndpoint_Register(t *testing.T) {
 		VolumeIDs: []string{id0},
 		WriteRequest: structs.WriteRequest{
 			Region:    "global",
-			Namespace: ns,
+			Namespace: ns.Name,
 		},
 	}
 	resp3 := &structs.CSIVolumeDeregisterResponse{}
@@ -255,7 +347,7 @@ func TestCSIVolumeEndpoint_Claim(t *testing.T) {
 	}
 	claimResp := &structs.CSIVolumeClaimResponse{}
 	err := msgpackrpc.CallWithCodec(codec, "CSIVolume.Claim", claimReq, claimResp)
-	require.EqualError(t, err, fmt.Sprintf("controller publish: volume not found: %s", id0),
+	require.EqualError(t, err, fmt.Sprintf("volume not found: %s", id0),
 		"expected 'volume not found' error because volume hasn't yet been created")
 
 	// Create a plugin and volume
@@ -374,8 +466,7 @@ func TestCSIVolumeEndpoint_Claim(t *testing.T) {
 // when a controller is required.
 func TestCSIVolumeEndpoint_ClaimWithController(t *testing.T) {
 	ci.Parallel(t)
-	srv, shutdown := TestServer(t, func(c *Config) {
-		c.ACLEnabled = true
+	srv, _, shutdown := TestACLServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
 	defer shutdown()
@@ -383,7 +474,6 @@ func TestCSIVolumeEndpoint_ClaimWithController(t *testing.T) {
 
 	ns := structs.DefaultNamespace
 	state := srv.fsm.State()
-	state.BootstrapACLTokens(structs.MsgTypeTestSetup, 1, 0, mock.ACLManagementToken())
 
 	policy := mock.NamespacePolicy(ns, "", []string{acl.NamespaceCapabilityCSIMountVolume}) +
 		mock.PluginPolicy("read")
@@ -448,19 +538,19 @@ func TestCSIVolumeEndpoint_ClaimWithController(t *testing.T) {
 	claimResp := &structs.CSIVolumeClaimResponse{}
 	err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Claim", claimReq, claimResp)
 	// Because the node is not registered
-	require.EqualError(t, err, "controller publish: attach volume: controller attach volume: No path to node")
+	require.EqualError(t, err, "controller publish: controller attach volume: No path to node")
 
 	// The node SecretID is authorized for all policies
 	claimReq.AuthToken = node.SecretID
 	claimReq.Namespace = ""
 	claimResp = &structs.CSIVolumeClaimResponse{}
 	err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Claim", claimReq, claimResp)
-	require.EqualError(t, err, "controller publish: attach volume: controller attach volume: No path to node")
+	require.EqualError(t, err, "controller publish: controller attach volume: No path to node")
 }
 
 func TestCSIVolumeEndpoint_Unpublish(t *testing.T) {
 	ci.Parallel(t)
-	srv, shutdown := TestServer(t, func(c *Config) { c.NumSchedulers = 0 })
+	srv, _, shutdown := TestACLServer(t, func(c *Config) { c.NumSchedulers = 0 })
 	defer shutdown()
 	testutil.WaitForLeader(t, srv.RPC)
 
@@ -468,7 +558,6 @@ func TestCSIVolumeEndpoint_Unpublish(t *testing.T) {
 	index := uint64(1000)
 	ns := structs.DefaultNamespace
 	state := srv.fsm.State()
-	state.BootstrapACLTokens(structs.MsgTypeTestSetup, 1, 0, mock.ACLManagementToken())
 
 	policy := mock.NamespacePolicy(ns, "", []string{acl.NamespaceCapabilityCSIMountVolume}) +
 		mock.PluginPolicy("read")
@@ -494,27 +583,52 @@ func TestCSIVolumeEndpoint_Unpublish(t *testing.T) {
 		},
 	}
 	index++
-	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
+	must.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
 
 	type tc struct {
 		name           string
 		startingState  structs.CSIVolumeClaimState
+		endState       structs.CSIVolumeClaimState
+		nodeID         string
+		otherNodeID    string
 		expectedErrMsg string
 	}
 	testCases := []tc{
 		{
 			name:          "success",
 			startingState: structs.CSIVolumeClaimStateControllerDetached,
+			nodeID:        node.ID,
+			otherNodeID:   uuid.Generate(),
+		},
+		{
+			name:          "non-terminal allocation on same node",
+			startingState: structs.CSIVolumeClaimStateNodeDetached,
+			nodeID:        node.ID,
+			otherNodeID:   node.ID,
 		},
 		{
 			name:           "unpublish previously detached node",
 			startingState:  structs.CSIVolumeClaimStateNodeDetached,
+			endState:       structs.CSIVolumeClaimStateNodeDetached,
 			expectedErrMsg: "could not detach from controller: controller detach volume: No path to node",
+			nodeID:         node.ID,
+			otherNodeID:    uuid.Generate(),
+		},
+		{
+			name:           "unpublish claim on garbage collected node",
+			startingState:  structs.CSIVolumeClaimStateTaken,
+			endState:       structs.CSIVolumeClaimStateNodeDetached,
+			expectedErrMsg: "could not detach from controller: controller detach volume: No path to node",
+			nodeID:         uuid.Generate(),
+			otherNodeID:    uuid.Generate(),
 		},
 		{
 			name:           "first unpublish",
 			startingState:  structs.CSIVolumeClaimStateTaken,
-			expectedErrMsg: "could not detach from node: No path to node",
+			endState:       structs.CSIVolumeClaimStateNodeDetached,
+			expectedErrMsg: "could not detach from controller: controller detach volume: No path to node",
+			nodeID:         node.ID,
+			otherNodeID:    uuid.Generate(),
 		},
 	}
 
@@ -536,20 +650,25 @@ func TestCSIVolumeEndpoint_Unpublish(t *testing.T) {
 
 			index++
 			err = state.UpsertCSIVolume(index, []*structs.CSIVolume{vol})
-			require.NoError(t, err)
+			must.NoError(t, err)
 
 			// setup: create an alloc that will claim our volume
 			alloc := mock.BatchAlloc()
-			alloc.NodeID = node.ID
-			alloc.ClientStatus = structs.AllocClientStatusFailed
+			alloc.NodeID = tc.nodeID
+			alloc.ClientStatus = structs.AllocClientStatusRunning
+
+			otherAlloc := mock.BatchAlloc()
+			otherAlloc.NodeID = tc.otherNodeID
+			otherAlloc.ClientStatus = structs.AllocClientStatusRunning
 
 			index++
-			require.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, index, []*structs.Allocation{alloc}))
+			must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, index,
+				[]*structs.Allocation{alloc, otherAlloc}))
 
-			// setup: claim the volume for our alloc
+			// setup: claim the volume for our to-be-failed alloc
 			claim := &structs.CSIVolumeClaim{
 				AllocationID:   alloc.ID,
-				NodeID:         node.ID,
+				NodeID:         tc.nodeID,
 				ExternalNodeID: "i-example",
 				Mode:           structs.CSIVolumeClaimRead,
 			}
@@ -557,7 +676,20 @@ func TestCSIVolumeEndpoint_Unpublish(t *testing.T) {
 			index++
 			claim.State = structs.CSIVolumeClaimStateTaken
 			err = state.CSIVolumeClaim(index, ns, volID, claim)
-			require.NoError(t, err)
+			must.NoError(t, err)
+
+			// setup: claim the volume for our other alloc
+			otherClaim := &structs.CSIVolumeClaim{
+				AllocationID:   otherAlloc.ID,
+				NodeID:         tc.otherNodeID,
+				ExternalNodeID: "i-example",
+				Mode:           structs.CSIVolumeClaimRead,
+			}
+
+			index++
+			otherClaim.State = structs.CSIVolumeClaimStateTaken
+			err = state.CSIVolumeClaim(index, ns, volID, otherClaim)
+			must.NoError(t, err)
 
 			// test: unpublish and check the results
 			claim.State = tc.startingState
@@ -571,20 +703,35 @@ func TestCSIVolumeEndpoint_Unpublish(t *testing.T) {
 				},
 			}
 
+			alloc = alloc.Copy()
+			alloc.ClientStatus = structs.AllocClientStatusFailed
+			index++
+			must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, index,
+				[]*structs.Allocation{alloc}))
+
 			err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Unpublish", req,
 				&structs.CSIVolumeUnpublishResponse{})
 
+			snap, snapErr := state.Snapshot()
+			must.NoError(t, snapErr)
+
+			vol, volErr := snap.CSIVolumeByID(nil, ns, volID)
+			must.NoError(t, volErr)
+			must.NotNil(t, vol)
+
 			if tc.expectedErrMsg == "" {
-				require.NoError(t, err)
-				vol, err = state.CSIVolumeByID(nil, ns, volID)
-				require.NoError(t, err)
-				require.NotNil(t, vol)
-				require.Len(t, vol.ReadAllocs, 0)
+				must.NoError(t, err)
+				assert.Len(t, vol.ReadAllocs, 1)
 			} else {
-				require.Error(t, err)
-				require.True(t, strings.Contains(err.Error(), tc.expectedErrMsg),
-					"error message %q did not contain %q", err.Error(), tc.expectedErrMsg)
+				must.Error(t, err)
+				assert.Len(t, vol.ReadAllocs, 2)
+				test.True(t, strings.Contains(err.Error(), tc.expectedErrMsg),
+					test.Sprintf("error %v did not contain %q", err, tc.expectedErrMsg))
+				claim = vol.PastClaims[alloc.ID]
+				must.NotNil(t, claim)
+				test.Eq(t, tc.endState, claim.State)
 			}
+
 		})
 	}
 
@@ -592,15 +739,13 @@ func TestCSIVolumeEndpoint_Unpublish(t *testing.T) {
 
 func TestCSIVolumeEndpoint_List(t *testing.T) {
 	ci.Parallel(t)
-	srv, shutdown := TestServer(t, func(c *Config) {
+	srv, _, shutdown := TestACLServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
 	defer shutdown()
 	testutil.WaitForLeader(t, srv.RPC)
 
 	state := srv.fsm.State()
-	state.BootstrapACLTokens(structs.MsgTypeTestSetup, 1, 0, mock.ACLManagementToken())
-	srv.config.ACLEnabled = true
 	codec := rpcClient(t, srv)
 
 	nsPolicy := mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityCSIReadVolume}) +
@@ -978,8 +1123,10 @@ func TestCSIVolumeEndpoint_Create(t *testing.T) {
 	)
 	defer cleanup()
 
-	node := client.Node()
-	node.Attributes["nomad.version"] = "0.11.0" // client RPCs not supported on early versions
+	node := client.UpdateConfig(func(c *cconfig.Config) {
+		// client RPCs not supported on early versions
+		c.Node.Attributes["nomad.version"] = "0.11.0"
+	}).Node
 
 	req0 := &structs.NodeRegisterRequest{
 		Node:         node,
@@ -1002,24 +1149,26 @@ func TestCSIVolumeEndpoint_Create(t *testing.T) {
 	codec := rpcClient(t, srv)
 	index := uint64(1000)
 
-	node.CSIControllerPlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			ControllerInfo: &structs.CSIControllerInfo{
-				SupportsAttachDetach: true,
-				SupportsCreateDelete: true,
+	node = client.UpdateConfig(func(c *cconfig.Config) {
+		c.Node.CSIControllerPlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				ControllerInfo: &structs.CSIControllerInfo{
+					SupportsAttachDetach: true,
+					SupportsCreateDelete: true,
+				},
+				RequiresControllerPlugin: true,
 			},
-			RequiresControllerPlugin: true,
-		},
-	}
-	node.CSINodePlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			NodeInfo: &structs.CSINodeInfo{},
-		},
-	}
+		}
+		c.Node.CSINodePlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				NodeInfo: &structs.CSINodeInfo{},
+			},
+		}
+	}).Node
 	index++
 	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
 
@@ -1028,7 +1177,7 @@ func TestCSIVolumeEndpoint_Create(t *testing.T) {
 	vols := []*structs.CSIVolume{{
 		ID:             volID,
 		Name:           "vol",
-		Namespace:      "notTheNamespace", // overriden by WriteRequest
+		Namespace:      "", // overriden by WriteRequest
 		PluginID:       "minnie",
 		AccessMode:     structs.CSIVolumeAccessModeSingleNodeReader, // legacy field ignored
 		AttachmentMode: structs.CSIVolumeAttachmentModeBlockDevice,  // legacy field ignored
@@ -1114,8 +1263,10 @@ func TestCSIVolumeEndpoint_Delete(t *testing.T) {
 	)
 	defer cleanup()
 
-	node := client.Node()
-	node.Attributes["nomad.version"] = "0.11.0" // client RPCs not supported on early versions
+	node := client.UpdateConfig(func(c *cconfig.Config) {
+		// client RPCs not supported on early versions
+		c.Node.Attributes["nomad.version"] = "0.11.0"
+	}).Node
 
 	req0 := &structs.NodeRegisterRequest{
 		Node:         node,
@@ -1123,7 +1274,7 @@ func TestCSIVolumeEndpoint_Delete(t *testing.T) {
 	}
 	var resp0 structs.NodeUpdateResponse
 	err = client.RPC("Node.Register", req0, &resp0)
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	testutil.WaitForResult(func() (bool, error) {
 		nodes := srv.connectedNodes()
@@ -1138,36 +1289,47 @@ func TestCSIVolumeEndpoint_Delete(t *testing.T) {
 	codec := rpcClient(t, srv)
 	index := uint64(1000)
 
-	node.CSIControllerPlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			ControllerInfo: &structs.CSIControllerInfo{
-				SupportsAttachDetach: true,
+	node = client.UpdateConfig(func(c *cconfig.Config) {
+		c.Node.CSIControllerPlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				ControllerInfo: &structs.CSIControllerInfo{
+					SupportsAttachDetach: true,
+				},
+				RequiresControllerPlugin: true,
 			},
-			RequiresControllerPlugin: true,
-		},
-	}
-	node.CSINodePlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			NodeInfo: &structs.CSINodeInfo{},
-		},
-	}
+		}
+		c.Node.CSINodePlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				NodeInfo: &structs.CSINodeInfo{},
+			},
+		}
+	}).Node
 	index++
-	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
+	must.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
 
 	volID := uuid.Generate()
-	vols := []*structs.CSIVolume{{
-		ID:        volID,
-		Namespace: structs.DefaultNamespace,
-		PluginID:  "minnie",
-		Secrets:   structs.CSISecrets{"mysecret": "secretvalue"},
-	}}
+	noPluginVolID := uuid.Generate()
+	vols := []*structs.CSIVolume{
+		{
+			ID:        volID,
+			Namespace: structs.DefaultNamespace,
+			PluginID:  "minnie",
+			Secrets:   structs.CSISecrets{"mysecret": "secretvalue"},
+		},
+		{
+			ID:        noPluginVolID,
+			Namespace: structs.DefaultNamespace,
+			PluginID:  "doesnt-exist",
+			Secrets:   structs.CSISecrets{"mysecret": "secretvalue"},
+		},
+	}
 	index++
 	err = state.UpsertCSIVolume(index, vols)
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	// Delete volumes
 
@@ -1178,10 +1340,13 @@ func TestCSIVolumeEndpoint_Delete(t *testing.T) {
 			Region:    "global",
 			Namespace: ns,
 		},
+		Secrets: structs.CSISecrets{
+			"secret-key-1": "secret-val-1",
+		},
 	}
 	resp1 := &structs.CSIVolumeCreateResponse{}
 	err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Delete", req1, resp1)
-	require.EqualError(t, err, "volume not found: bad")
+	must.EqError(t, err, "volume not found: bad")
 
 	// Make sure the valid volume wasn't deleted
 	req2 := &structs.CSIVolumeGetRequest{
@@ -1192,19 +1357,34 @@ func TestCSIVolumeEndpoint_Delete(t *testing.T) {
 	}
 	resp2 := &structs.CSIVolumeGetResponse{}
 	err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Get", req2, resp2)
-	require.NoError(t, err)
-	require.NotNil(t, resp2.Volume)
+	must.NoError(t, err)
+	must.NotNil(t, resp2.Volume)
 
 	// Fix the delete request
 	fake.NextDeleteError = nil
 	req1.VolumeIDs = []string{volID}
 	err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Delete", req1, resp1)
-	require.NoError(t, err)
+	must.NoError(t, err)
 
 	// Make sure it was deregistered
 	err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Get", req2, resp2)
-	require.NoError(t, err)
-	require.Nil(t, resp2.Volume)
+	must.NoError(t, err)
+	must.Nil(t, resp2.Volume)
+
+	// Create a delete request for a volume without plugin.
+	req3 := &structs.CSIVolumeDeleteRequest{
+		VolumeIDs: []string{noPluginVolID},
+		WriteRequest: structs.WriteRequest{
+			Region:    "global",
+			Namespace: ns,
+		},
+		Secrets: structs.CSISecrets{
+			"secret-key-1": "secret-val-1",
+		},
+	}
+	resp3 := &structs.CSIVolumeCreateResponse{}
+	err = msgpackrpc.CallWithCodec(codec, "CSIVolume.Delete", req3, resp3)
+	must.EqError(t, err, fmt.Sprintf(`plugin "doesnt-exist" for volume "%s" not found`, noPluginVolID))
 }
 
 func TestCSIVolumeEndpoint_ListExternal(t *testing.T) {
@@ -1248,8 +1428,10 @@ func TestCSIVolumeEndpoint_ListExternal(t *testing.T) {
 	)
 	defer cleanup()
 
-	node := client.Node()
-	node.Attributes["nomad.version"] = "0.11.0" // client RPCs not supported on early versions
+	node := client.UpdateConfig(func(c *cconfig.Config) {
+		// client RPCs not supported on early versions
+		c.Node.Attributes["nomad.version"] = "0.11.0"
+	}).Node
 
 	req0 := &structs.NodeRegisterRequest{
 		Node:         node,
@@ -1270,24 +1452,26 @@ func TestCSIVolumeEndpoint_ListExternal(t *testing.T) {
 	codec := rpcClient(t, srv)
 	index := uint64(1000)
 
-	node.CSIControllerPlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			ControllerInfo: &structs.CSIControllerInfo{
-				SupportsAttachDetach: true,
-				SupportsListVolumes:  true,
+	node = client.UpdateConfig(func(c *cconfig.Config) {
+		c.Node.CSIControllerPlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				ControllerInfo: &structs.CSIControllerInfo{
+					SupportsAttachDetach: true,
+					SupportsListVolumes:  true,
+				},
+				RequiresControllerPlugin: true,
 			},
-			RequiresControllerPlugin: true,
-		},
-	}
-	node.CSINodePlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			NodeInfo: &structs.CSINodeInfo{},
-		},
-	}
+		}
+		c.Node.CSINodePlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				NodeInfo: &structs.CSINodeInfo{},
+			},
+		}
+	}).Node
 	index++
 	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
 
@@ -1322,12 +1506,14 @@ func TestCSIVolumeEndpoint_CreateSnapshot(t *testing.T) {
 
 	testutil.WaitForLeader(t, srv.RPC)
 
+	now := time.Now().Unix()
 	fake := newMockClientCSI()
 	fake.NextCreateSnapshotError = nil
 	fake.NextCreateSnapshotResponse = &cstructs.ClientCSIControllerCreateSnapshotResponse{
 		ID:                     "snap-12345",
 		ExternalSourceVolumeID: "vol-12345",
 		SizeBytes:              42,
+		CreateTime:             now,
 		IsReady:                true,
 	}
 
@@ -1339,10 +1525,8 @@ func TestCSIVolumeEndpoint_CreateSnapshot(t *testing.T) {
 	)
 	defer cleanup()
 
-	node := client.Node()
-
 	req0 := &structs.NodeRegisterRequest{
-		Node:         node,
+		Node:         client.Node(),
 		WriteRequest: structs.WriteRequest{Region: "global"},
 	}
 	var resp0 structs.NodeUpdateResponse
@@ -1362,16 +1546,18 @@ func TestCSIVolumeEndpoint_CreateSnapshot(t *testing.T) {
 	codec := rpcClient(t, srv)
 	index := uint64(1000)
 
-	node.CSIControllerPlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			ControllerInfo: &structs.CSIControllerInfo{
-				SupportsCreateDeleteSnapshot: true,
+	node := client.UpdateConfig(func(c *cconfig.Config) {
+		c.Node.CSIControllerPlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				ControllerInfo: &structs.CSIControllerInfo{
+					SupportsCreateDeleteSnapshot: true,
+				},
+				RequiresControllerPlugin: true,
 			},
-			RequiresControllerPlugin: true,
-		},
-	}
+		}
+	}).Node
 	index++
 	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
 
@@ -1432,10 +1618,8 @@ func TestCSIVolumeEndpoint_DeleteSnapshot(t *testing.T) {
 	)
 	defer cleanup()
 
-	node := client.Node()
-
 	req0 := &structs.NodeRegisterRequest{
-		Node:         node,
+		Node:         client.Node(),
 		WriteRequest: structs.WriteRequest{Region: "global"},
 	}
 	var resp0 structs.NodeUpdateResponse
@@ -1455,16 +1639,18 @@ func TestCSIVolumeEndpoint_DeleteSnapshot(t *testing.T) {
 	codec := rpcClient(t, srv)
 	index := uint64(1000)
 
-	node.CSIControllerPlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			ControllerInfo: &structs.CSIControllerInfo{
-				SupportsCreateDeleteSnapshot: true,
+	node := client.UpdateConfig(func(c *cconfig.Config) {
+		c.Node.CSIControllerPlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				ControllerInfo: &structs.CSIControllerInfo{
+					SupportsCreateDeleteSnapshot: true,
+				},
+				RequiresControllerPlugin: true,
 			},
-			RequiresControllerPlugin: true,
-		},
-	}
+		}
+	}).Node
 	index++
 	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
 
@@ -1531,9 +1717,8 @@ func TestCSIVolumeEndpoint_ListSnapshots(t *testing.T) {
 	)
 	defer cleanup()
 
-	node := client.Node()
 	req0 := &structs.NodeRegisterRequest{
-		Node:         node,
+		Node:         client.Node(),
 		WriteRequest: structs.WriteRequest{Region: "global"},
 	}
 	var resp0 structs.NodeUpdateResponse
@@ -1551,16 +1736,18 @@ func TestCSIVolumeEndpoint_ListSnapshots(t *testing.T) {
 	codec := rpcClient(t, srv)
 	index := uint64(1000)
 
-	node.CSIControllerPlugins = map[string]*structs.CSIInfo{
-		"minnie": {
-			PluginID: "minnie",
-			Healthy:  true,
-			ControllerInfo: &structs.CSIControllerInfo{
-				SupportsListSnapshots: true,
+	node := client.UpdateConfig(func(c *cconfig.Config) {
+		c.Node.CSIControllerPlugins = map[string]*structs.CSIInfo{
+			"minnie": {
+				PluginID: "minnie",
+				Healthy:  true,
+				ControllerInfo: &structs.CSIControllerInfo{
+					SupportsListSnapshots: true,
+				},
+				RequiresControllerPlugin: true,
 			},
-			RequiresControllerPlugin: true,
-		},
-	}
+		}
+	}).Node
 	index++
 	require.NoError(t, state.UpsertNode(structs.MsgTypeTestSetup, index, node))
 
@@ -1587,9 +1774,222 @@ func TestCSIVolumeEndpoint_ListSnapshots(t *testing.T) {
 	require.Equal(t, "page2", resp.NextToken)
 }
 
+func TestCSIVolume_expandVolume(t *testing.T) {
+	ci.Parallel(t)
+
+	srv, cleanupSrv := TestServer(t, nil)
+	t.Cleanup(cleanupSrv)
+	testutil.WaitForLeader(t, srv.RPC)
+	t.Log("server started 👍")
+
+	_, fake, _, fakeVolID := testClientWithCSI(t, srv)
+
+	endpoint := NewCSIVolumeEndpoint(srv, nil)
+	plug, vol, err := endpoint.volAndPluginLookup(structs.DefaultNamespace, fakeVolID)
+	must.NoError(t, err)
+
+	// ensure nil checks
+	expectErr := "unexpected nil value"
+	err = endpoint.expandVolume(nil, plug, &csi.CapacityRange{})
+	must.EqError(t, err, expectErr)
+	err = endpoint.expandVolume(vol, nil, &csi.CapacityRange{})
+	must.EqError(t, err, expectErr)
+	err = endpoint.expandVolume(vol, plug, nil)
+	must.EqError(t, err, expectErr)
+
+	// these tests must be run in order, as they mutate vol along the way
+	cases := []struct {
+		Name string
+
+		NewMin int64
+		NewMax int64
+
+		ExpectMin      int64
+		ExpectMax      int64
+		ControllerResp int64 // new capacity for the mock controller response
+		ExpectCapacity int64 // expected resulting capacity on the volume
+		ExpectErr      string
+	}{
+		{
+			// successful expansion from initial vol with no capacity values.
+			Name:   "success",
+			NewMin: 1000,
+			NewMax: 2000,
+
+			ExpectMin:      1000,
+			ExpectMax:      2000,
+			ControllerResp: 1000,
+			ExpectCapacity: 1000,
+		},
+		{
+			// with min/max both zero, no action should be taken,
+			// so expect no change to desired or actual capacity on the volume.
+			Name:   "zero",
+			NewMin: 0,
+			NewMax: 0,
+
+			ExpectMin:      1000,
+			ExpectMax:      2000,
+			ControllerResp: 999999, // this should not come into play
+			ExpectCapacity: 1000,
+		},
+		{
+			// increasing min is what actually triggers an expand to occur.
+			Name:   "increase min",
+			NewMin: 1500,
+			NewMax: 2000,
+
+			ExpectMin:      1500,
+			ExpectMax:      2000,
+			ControllerResp: 1500,
+			ExpectCapacity: 1500,
+		},
+		{
+			// min going down is okay, but no expand should occur.
+			Name:   "reduce min",
+			NewMin: 500,
+			NewMax: 2000,
+
+			ExpectMin:      500,
+			ExpectMax:      2000,
+			ControllerResp: 999999,
+			ExpectCapacity: 1500,
+		},
+		{
+			// max going up is okay, but no expand should occur.
+			Name:   "increase max",
+			NewMin: 500,
+			NewMax: 5000,
+
+			ExpectMin:      500,
+			ExpectMax:      5000,
+			ControllerResp: 999999,
+			ExpectCapacity: 1500,
+		},
+		{
+			// max lower than min is logically impossible.
+			Name:      "max below min",
+			NewMin:    3,
+			NewMax:    2,
+			ExpectErr: "max requested capacity (2 B) less than or equal to min (3 B)",
+		},
+		{
+			// volume size cannot be reduced.
+			Name:      "max below current",
+			NewMax:    2,
+			ExpectErr: "max requested capacity (2 B) less than or equal to current (1.5 kB)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			fake.NextControllerExpandVolumeResponse = &cstructs.ClientCSIControllerExpandVolumeResponse{
+				CapacityBytes: tc.ControllerResp,
+				// this also exercises some node expand code, incidentally
+				NodeExpansionRequired: true,
+			}
+
+			err = endpoint.expandVolume(vol, plug, &csi.CapacityRange{
+				RequiredBytes: tc.NewMin,
+				LimitBytes:    tc.NewMax,
+			})
+
+			if tc.ExpectErr != "" {
+				must.EqError(t, err, tc.ExpectErr)
+				return
+			}
+
+			must.NoError(t, err)
+
+			test.Eq(t, tc.ExpectCapacity, vol.Capacity,
+				test.Sprint("unexpected capacity"))
+			test.Eq(t, tc.ExpectMin, vol.RequestedCapacityMin,
+				test.Sprint("unexpected min"))
+			test.Eq(t, tc.ExpectMax, vol.RequestedCapacityMax,
+				test.Sprint("unexpected max"))
+		})
+	}
+
+	// a nodeExpandVolume error should fail expandVolume too
+	t.Run("node error", func(t *testing.T) {
+		expect := "sad node expand"
+		fake.NextNodeExpandError = errors.New(expect)
+		fake.NextControllerExpandVolumeResponse = &cstructs.ClientCSIControllerExpandVolumeResponse{
+			CapacityBytes:         2000,
+			NodeExpansionRequired: true,
+		}
+		err = endpoint.expandVolume(vol, plug, &csi.CapacityRange{
+			RequiredBytes: 2000,
+		})
+		test.ErrorContains(t, err, expect)
+	})
+
+}
+
+func TestCSIVolume_nodeExpandVolume(t *testing.T) {
+	ci.Parallel(t)
+
+	srv, cleanupSrv := TestServer(t, nil)
+	t.Cleanup(cleanupSrv)
+	testutil.WaitForLeader(t, srv.RPC)
+	t.Log("server started 👍")
+
+	c, fake, _, fakeVolID := testClientWithCSI(t, srv)
+	fakeClaim := fakeCSIClaim(c.NodeID())
+
+	endpoint := NewCSIVolumeEndpoint(srv, nil)
+	plug, vol, err := endpoint.volAndPluginLookup(structs.DefaultNamespace, fakeVolID)
+	must.NoError(t, err)
+
+	// there's not a lot of logic here -- validation has been done prior,
+	// in (controller) expandVolume and what preceeds it.
+	cases := []struct {
+		Name  string
+		Error error
+	}{
+		{
+			Name: "ok",
+		},
+		{
+			Name:  "not ok",
+			Error: errors.New("test node expand fail"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+
+			fake.NextNodeExpandError = tc.Error
+			capacity := &csi.CapacityRange{
+				RequiredBytes: 10,
+				LimitBytes:    10,
+			}
+
+			err = endpoint.nodeExpandVolume(vol, plug, capacity)
+
+			if tc.Error == nil {
+				test.NoError(t, err)
+			} else {
+				must.Error(t, err)
+				must.ErrorContains(t, err,
+					fmt.Sprintf("CSI.NodeExpandVolume error: %s", tc.Error))
+			}
+
+			req := fake.LastNodeExpandRequest
+			must.NotNil(t, req, must.Sprint("request should have happened"))
+			test.Eq(t, fakeVolID, req.VolumeID)
+			test.Eq(t, capacity, req.Capacity)
+			test.Eq(t, "fake-csi-plugin", req.PluginID)
+			test.Eq(t, "fake-csi-external-id", req.ExternalID)
+			test.Eq(t, fakeClaim, req.Claim)
+
+		})
+	}
+}
+
 func TestCSIPluginEndpoint_RegisterViaFingerprint(t *testing.T) {
 	ci.Parallel(t)
-	srv, shutdown := TestServer(t, func(c *Config) {
+	srv, _, shutdown := TestACLServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
 	defer shutdown()
@@ -1599,8 +1999,6 @@ func TestCSIPluginEndpoint_RegisterViaFingerprint(t *testing.T) {
 	defer deleteNodes()
 
 	state := srv.fsm.State()
-	state.BootstrapACLTokens(structs.MsgTypeTestSetup, 1, 0, mock.ACLManagementToken())
-	srv.config.ACLEnabled = true
 	codec := rpcClient(t, srv)
 
 	// Get the plugin back out
@@ -1738,7 +2136,7 @@ func TestCSIPluginEndpoint_RegisterViaJob(t *testing.T) {
 
 func TestCSIPluginEndpoint_DeleteViaGC(t *testing.T) {
 	ci.Parallel(t)
-	srv, shutdown := TestServer(t, func(c *Config) {
+	srv, _, shutdown := TestACLServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
 	})
 	defer shutdown()
@@ -1748,8 +2146,6 @@ func TestCSIPluginEndpoint_DeleteViaGC(t *testing.T) {
 	defer deleteNodes()
 
 	state := srv.fsm.State()
-	state.BootstrapACLTokens(structs.MsgTypeTestSetup, 1, 0, mock.ACLManagementToken())
-	srv.config.ACLEnabled = true
 	codec := rpcClient(t, srv)
 
 	// Get the plugin back out
@@ -1865,7 +2261,7 @@ func TestCSI_RPCVolumeAndPluginLookup(t *testing.T) {
 	require.NoError(t, err)
 
 	// has controller
-	c := srv.staticEndpoints.CSIVolume
+	c := NewCSIVolumeEndpoint(srv, nil)
 	plugin, vol, err := c.volAndPluginLookup(structs.DefaultNamespace, id0)
 	require.NotNil(t, plugin)
 	require.NotNil(t, vol)
@@ -1882,4 +2278,210 @@ func TestCSI_RPCVolumeAndPluginLookup(t *testing.T) {
 	require.Nil(t, plugin)
 	require.Nil(t, vol)
 	require.EqualError(t, err, fmt.Sprintf("volume not found: %s", id2))
+}
+
+func TestCSI_SerializedControllerRPC(t *testing.T) {
+	ci.Parallel(t)
+
+	srv, shutdown := TestServer(t, func(c *Config) { c.NumSchedulers = 0 })
+	defer shutdown()
+	testutil.WaitForLeader(t, srv.RPC)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	timeCh := make(chan lang.Pair[string, time.Duration])
+
+	testFn := func(pluginID string, dur time.Duration) {
+		defer wg.Done()
+		c := NewCSIVolumeEndpoint(srv, nil)
+		now := time.Now()
+		err := c.serializedControllerRPC(pluginID, func() error {
+			time.Sleep(dur)
+			return nil
+		})
+		elapsed := time.Since(now)
+		timeCh <- lang.Pair[string, time.Duration]{pluginID, elapsed}
+		must.NoError(t, err)
+	}
+
+	go testFn("plugin1", 50*time.Millisecond)
+	go testFn("plugin2", 50*time.Millisecond)
+	go testFn("plugin1", 50*time.Millisecond)
+
+	totals := map[string]time.Duration{}
+	for i := 0; i < 3; i++ {
+		pair := <-timeCh
+		totals[pair.First] += pair.Second
+	}
+
+	wg.Wait()
+
+	// plugin1 RPCs should block each other
+	must.GreaterEq(t, 150*time.Millisecond, totals["plugin1"])
+	must.Less(t, 200*time.Millisecond, totals["plugin1"])
+
+	// plugin1 RPCs should not block plugin2 RPCs
+	must.GreaterEq(t, 50*time.Millisecond, totals["plugin2"])
+	must.Less(t, 100*time.Millisecond, totals["plugin2"])
+}
+
+// testClientWithCSI sets up a client with a fake CSI plugin.
+// Much of the plugin/volume configuration is only to pass validation;
+// callers should modify MockClientCSI's Next* fields.
+func testClientWithCSI(t *testing.T, srv *Server) (c *client.Client, m *MockClientCSI, plugID, volID string) {
+	t.Helper()
+
+	m = newMockClientCSI()
+	plugID = "fake-csi-plugin"
+	volID = "fake-csi-volume"
+
+	c, cleanup := client.TestClientWithRPCs(t,
+		func(c *cconfig.Config) {
+			c.Servers = []string{srv.config.RPCAddr.String()}
+			c.Node.CSIControllerPlugins = map[string]*structs.CSIInfo{
+				plugID: {
+					PluginID: plugID,
+					Healthy:  true,
+					ControllerInfo: &structs.CSIControllerInfo{
+						// Supports.* everything, but Next* values must be set on the mock.
+						SupportsAttachDetach:             true,
+						SupportsClone:                    true,
+						SupportsCondition:                true,
+						SupportsCreateDelete:             true,
+						SupportsCreateDeleteSnapshot:     true,
+						SupportsExpand:                   true,
+						SupportsGet:                      true,
+						SupportsGetCapacity:              true,
+						SupportsListSnapshots:            true,
+						SupportsListVolumes:              true,
+						SupportsListVolumesAttachedNodes: true,
+						SupportsReadOnlyAttach:           true,
+					},
+					RequiresControllerPlugin: true,
+				},
+			}
+			c.Node.CSINodePlugins = map[string]*structs.CSIInfo{
+				plugID: {
+					PluginID: plugID,
+					Healthy:  true,
+					NodeInfo: &structs.CSINodeInfo{
+						ID:                c.Node.GetID(),
+						SupportsCondition: true,
+						SupportsExpand:    true,
+						SupportsStats:     true,
+					},
+				},
+			}
+		},
+		map[string]interface{}{"CSI": m}, // MockClientCSI
+	)
+	t.Cleanup(func() { test.NoError(t, cleanup()) })
+	testutil.WaitForClient(t, srv.RPC, c.NodeID(), c.Region())
+	t.Log("client started with fake CSI plugin 👍")
+
+	// Register a minimum-viable fake volume
+	req := &structs.CSIVolumeRegisterRequest{
+		Volumes: []*structs.CSIVolume{{
+			PluginID:   plugID,
+			ID:         volID,
+			ExternalID: "fake-csi-external-id",
+			Namespace:  structs.DefaultNamespace,
+			RequestedCapabilities: []*structs.CSIVolumeCapability{
+				{
+					AccessMode:     structs.CSIVolumeAccessModeMultiNodeSingleWriter,
+					AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+				},
+			},
+			WriteClaims: map[string]*structs.CSIVolumeClaim{
+				"fake-csi-claim": fakeCSIClaim(c.NodeID()),
+			},
+		}},
+		WriteRequest: structs.WriteRequest{Region: srv.Region()},
+	}
+	must.NoError(t, srv.RPC("CSIVolume.Register", req, &structs.CSIVolumeRegisterResponse{}))
+	t.Logf("CSI volume %s registered 👍", volID)
+
+	return c, m, plugID, volID
+}
+
+func fakeCSIClaim(nodeID string) *structs.CSIVolumeClaim {
+	return &structs.CSIVolumeClaim{
+		NodeID:         nodeID,
+		AllocationID:   "fake-csi-alloc",
+		ExternalNodeID: "fake-csi-external-node",
+		Mode:           structs.CSIVolumeClaimWrite,
+		AccessMode:     structs.CSIVolumeAccessModeMultiNodeSingleWriter,
+		AttachmentMode: structs.CSIVolumeAttachmentModeFilesystem,
+		State:          structs.CSIVolumeClaimStateTaken,
+	}
+}
+
+// TestCSIPluginEndpoint_ACLNamespaceFilterAlloc checks that plugin allocations
+// are filtered by namespace when getting plugins, and enforcing that the client
+// has job-read ACL access to the namespace of the plugin allocations
+func TestCSIPluginEndpoint_ACLNamespaceFilterAlloc(t *testing.T) {
+	ci.Parallel(t)
+	srv, _, shutdown := TestACLServer(t, func(c *Config) {
+		c.NumSchedulers = 0 // Prevent automatic dequeue
+	})
+	defer shutdown()
+	testutil.WaitForLeader(t, srv.RPC)
+	s := srv.fsm.State()
+
+	ns1 := mock.Namespace()
+	must.NoError(t, s.UpsertNamespaces(1000, []*structs.Namespace{ns1}))
+
+	// Setup ACLs
+	codec := rpcClient(t, srv)
+	listJob := mock.NamespacePolicy(structs.DefaultNamespace, "", []string{acl.NamespaceCapabilityReadJob})
+	policy := mock.PluginPolicy("read") + listJob
+	getToken := mock.CreatePolicyAndToken(t, s, 1001, "plugin-read", policy)
+
+	// Create the plugin and then some allocations to pretend to be the allocs that are
+	// running the plugin tasks
+	deleteNodes := state.CreateTestCSIPlugin(srv.fsm.State(), "foo")
+	defer deleteNodes()
+
+	plug, _ := s.CSIPluginByID(memdb.NewWatchSet(), "foo")
+	var allocs []*structs.Allocation
+	for _, info := range plug.Controllers {
+		a := mock.Alloc()
+		a.ID = info.AllocID
+		allocs = append(allocs, a)
+	}
+	for _, info := range plug.Nodes {
+		a := mock.Alloc()
+		a.ID = info.AllocID
+		allocs = append(allocs, a)
+	}
+
+	must.Eq(t, 3, len(allocs))
+	allocs[0].Namespace = ns1.Name
+
+	err := s.UpsertAllocs(structs.MsgTypeTestSetup, 1003, allocs)
+	must.NoError(t, err)
+
+	req := &structs.CSIPluginGetRequest{
+		ID: "foo",
+		QueryOptions: structs.QueryOptions{
+			Region:    "global",
+			AuthToken: getToken.SecretID,
+		},
+	}
+	resp := &structs.CSIPluginGetResponse{}
+	err = msgpackrpc.CallWithCodec(codec, "CSIPlugin.Get", req, resp)
+	must.NoError(t, err)
+	must.Eq(t, 2, len(resp.Plugin.Allocations))
+
+	for _, a := range resp.Plugin.Allocations {
+		must.Eq(t, structs.DefaultNamespace, a.Namespace)
+	}
+
+	p2 := mock.PluginPolicy("read")
+	t2 := mock.CreatePolicyAndToken(t, s, 1004, "plugin-read2", p2)
+	req.AuthToken = t2.SecretID
+	err = msgpackrpc.CallWithCodec(codec, "CSIPlugin.Get", req, resp)
+	must.NoError(t, err)
+	must.Eq(t, 0, len(resp.Plugin.Allocations))
 }

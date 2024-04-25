@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state_test
 
 import (
@@ -5,7 +8,6 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,11 +16,14 @@ import (
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/allocrunner"
 	"github.com/hashicorp/nomad/client/allocwatcher"
+	"github.com/hashicorp/nomad/client/config"
 	clientconfig "github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/client/consul"
 	"github.com/hashicorp/nomad/client/devicemanager"
 	dmstate "github.com/hashicorp/nomad/client/devicemanager/state"
+	"github.com/hashicorp/nomad/client/lib/cgroupslib"
+	"github.com/hashicorp/nomad/client/lib/proclib"
 	"github.com/hashicorp/nomad/client/pluginmanager/drivermanager"
+	regMock "github.com/hashicorp/nomad/client/serviceregistration/mock"
 	. "github.com/hashicorp/nomad/client/state"
 	"github.com/hashicorp/nomad/client/vaultclient"
 	"github.com/hashicorp/nomad/helper/boltdd"
@@ -72,9 +77,7 @@ func TestBoltStateDB_UpgradeOld_Ok(t *testing.T) {
 	for _, fn := range pre09files {
 		t.Run(fn, func(t *testing.T) {
 
-			dir, err := ioutil.TempDir("", "nomadtest")
-			require.NoError(t, err)
-			defer os.RemoveAll(dir)
+			dir := t.TempDir()
 
 			db := dbFromTestFile(t, dir, fn)
 			defer db.Close()
@@ -133,9 +136,7 @@ func TestBoltStateDB_UpgradeOld_Ok(t *testing.T) {
 
 	t.Run("testdata/state-1.2.6.db.gz", func(t *testing.T) {
 		fn := "testdata/state-1.2.6.db.gz"
-		dir, err := ioutil.TempDir("", "nomadtest")
-		require.NoError(t, err)
-		defer os.RemoveAll(dir)
+		dir := t.TempDir()
 
 		db := dbFromTestFile(t, dir, fn)
 		defer db.Close()
@@ -202,18 +203,20 @@ func checkUpgradedAlloc(t *testing.T, path string, db StateDB, alloc *structs.Al
 
 	clientConf.StateDir = path
 
-	conf := &allocrunner.Config{
+	conf := &config.AllocRunnerConfig{
 		Alloc:             alloc,
 		Logger:            clientConf.Logger,
 		ClientConfig:      clientConf,
 		StateDB:           db,
-		Consul:            consul.NewMockConsulServiceClient(t, clientConf.Logger),
-		Vault:             vaultclient.NewMockVaultClient(),
+		ConsulServices:    regMock.NewServiceRegistrationHandler(clientConf.Logger),
+		VaultFunc:         vaultclient.NewMockVaultClient,
 		StateUpdater:      &allocrunner.MockStateUpdater{},
 		PrevAllocWatcher:  allocwatcher.NoopPrevAlloc{},
 		PrevAllocMigrator: allocwatcher.NoopPrevAlloc{},
 		DeviceManager:     devicemanager.NoopMockManager(),
 		DriverManager:     drivermanager.TestDriverManager(t),
+		Wranglers:         proclib.MockWranglers(t),
+		Partitions:        cgroupslib.NoopPartition(),
 	}
 	ar, err := allocrunner.NewAllocRunner(conf)
 	require.NoError(t, err)

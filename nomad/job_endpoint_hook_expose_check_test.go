@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
@@ -317,7 +320,7 @@ func TestJobExposeCheckHook_exposePathForCheck(t *testing.T) {
 			Name:     "group1",
 			Services: []*structs.Service{s},
 			Networks: structs.Networks{{
-				Mode: "bridge",
+				Mode:         "bridge",
 				DynamicPorts: []structs.Port{
 					// service declares "sPort", but does not exist
 				},

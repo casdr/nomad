@@ -1,16 +1,23 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-set/v2"
 	"github.com/hashicorp/nomad/client/taskenv"
-	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/envoy"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -30,6 +37,10 @@ func connectSidecarResources() *structs.Resources {
 
 // connectSidecarDriverConfig is the driver configuration used by the injected
 // connect proxy sidecar task.
+//
+// Note: must be compatible with both docker and podman. One could imagine passing
+// in the driver name in the future and switching on that if we need specific
+// configs.
 func connectSidecarDriverConfig() map[string]interface{} {
 	return map[string]interface{}{
 		"image": envoy.SidecarConfigVar,
@@ -68,30 +79,57 @@ func connectGatewayDriverConfig(hostNetwork bool) map[string]interface{} {
 // connectSidecarVersionConstraint is used when building the sidecar task to ensure
 // the proper Consul version is used that supports the necessary Connect
 // features. This includes bootstrapping envoy with a unix socket for Consul's
-// gRPC xDS API.
-func connectSidecarVersionConstraint() *structs.Constraint {
-	return &structs.Constraint{
-		LTarget: "${attr.consul.version}",
-		RTarget: ">= 1.6.0-beta1",
-		Operand: structs.ConstraintSemver,
+// gRPC xDS API, and support for generating local service identity tokens.
+func connectSidecarVersionConstraint(cluster string) *structs.Constraint {
+	if cluster != structs.ConsulDefaultCluster && cluster != "" {
+		return &structs.Constraint{
+			LTarget: fmt.Sprintf("${attr.consul.%s.version}", cluster),
+			RTarget: ">= 1.8.0",
+			Operand: structs.ConstraintSemver,
+		}
 	}
+	return consulServiceDiscoveryConstraint
 }
 
 // connectGatewayVersionConstraint is used when building a connect gateway
 // task to ensure proper Consul version is used that supports Connect Gateway
 // features. This includes making use of Consul Configuration Entries of type
 // {ingress,terminating,mesh}-gateway.
-func connectGatewayVersionConstraint() *structs.Constraint {
+func connectGatewayVersionConstraint(cluster string) *structs.Constraint {
+	if cluster != structs.ConsulDefaultCluster && cluster != "" {
+		return &structs.Constraint{
+			LTarget: fmt.Sprintf("${attr.consul.%s.version}", cluster),
+			RTarget: ">= 1.8.0",
+			Operand: structs.ConstraintSemver,
+		}
+	}
+	return consulServiceDiscoveryConstraint
+}
+
+// connectGatewayTLSVersionConstraint is used when building a connect gateway
+// task to ensure proper Consul version is used that supports customized TLS version.
+// https://github.com/hashicorp/consul/pull/11576
+func connectGatewayTLSVersionConstraint(cluster string) *structs.Constraint {
+	attr := "${attr.consul.version}"
+	if cluster != structs.ConsulDefaultCluster {
+		attr = fmt.Sprintf("${attr.consul.%s.version}", cluster)
+	}
+
 	return &structs.Constraint{
-		LTarget: "${attr.consul.version}",
-		RTarget: ">= 1.8.0",
+		LTarget: attr,
+		RTarget: ">= 1.11.2",
 		Operand: structs.ConstraintSemver,
 	}
 }
 
-func connectListenerConstraint() *structs.Constraint {
+func connectListenerConstraint(cluster string) *structs.Constraint {
+	attr := "${attr.consul.grpc}"
+	if cluster != structs.ConsulDefaultCluster {
+		attr = fmt.Sprintf("${attr.consul.%s.grpc}", cluster)
+	}
+
 	return &structs.Constraint{
-		LTarget: "${attr.consul.grpc}",
+		LTarget: attr,
 		RTarget: "0",
 		Operand: ">",
 	}
@@ -184,7 +222,7 @@ func getNamedTaskForNativeService(tg *structs.TaskGroup, serviceName, taskName s
 		if len(tg.Tasks) == 1 {
 			return tg.Tasks[0], nil
 		}
-		return nil, errors.Errorf("task for Consul Connect Native service %s->%s is ambiguous and must be set", tg.Name, serviceName)
+		return nil, fmt.Errorf("task for Consul Connect Native service %s->%s is ambiguous and must be set", tg.Name, serviceName)
 	}
 
 	for _, t := range tg.Tasks {
@@ -192,7 +230,7 @@ func getNamedTaskForNativeService(tg *structs.TaskGroup, serviceName, taskName s
 			return t, nil
 		}
 	}
-	return nil, errors.Errorf("task %s named by Consul Connect Native service %s->%s does not exist", taskName, tg.Name, serviceName)
+	return nil, fmt.Errorf("task %s named by Consul Connect Native service %s->%s does not exist", taskName, tg.Name, serviceName)
 }
 
 func injectPort(group *structs.TaskGroup, label string) {
@@ -211,6 +249,23 @@ func injectPort(group *structs.TaskGroup, label string) {
 		// the same port in the netns.
 		To: -1,
 	})
+}
+
+// groupConnectGuessTaskDriver will scan the tasks in g and try to decide which
+// task driver to use for the default sidecar proxy task definition.
+//
+// If there is at least one podman task and zero docker tasks, use podman.
+// Otherwise default to docker.
+//
+// If the sidecar_task block is set, that takes precedence and this does not apply.
+func groupConnectGuessTaskDriver(g *structs.TaskGroup) string {
+	drivers := set.FromFunc(g.Tasks, func(t *structs.Task) string {
+		return t.Driver
+	})
+	if drivers.Contains("podman") && !drivers.Contains("docker") {
+		return "podman"
+	}
+	return "docker"
 }
 
 func groupConnectHook(job *structs.Job, g *structs.TaskGroup) error {
@@ -237,7 +292,9 @@ func groupConnectHook(job *structs.Job, g *structs.TaskGroup) error {
 
 			// If the task doesn't already exist, create a new one and add it to the job
 			if task == nil {
-				task = newConnectSidecarTask(service.Name)
+				driver := groupConnectGuessTaskDriver(g)
+				cluster := service.GetConsulClusterName(g)
+				task = newConnectSidecarTask(service.Name, driver, cluster)
 
 				// If there happens to be a task defined with the same name
 				// append an UUID fragment to the task name
@@ -315,10 +372,13 @@ func groupConnectHook(job *structs.Job, g *structs.TaskGroup) error {
 				// detect whether the group is in host networking mode, which will
 				// require tweaking the default gateway task config
 				netHost := netMode == "host"
-				task := newConnectGatewayTask(prefix, service.Name, netHost)
+				customizedTLS := service.Connect.IsCustomizedTLS()
+
+				task := newConnectGatewayTask(prefix, service.Name,
+					service.GetConsulClusterName(g), netHost, customizedTLS)
 				g.Tasks = append(g.Tasks, task)
 
-				// the connect.sidecar_task stanza can also be used to configure
+				// the connect.sidecar_task block can also be used to configure
 				// a custom task to use as a gateway proxy
 				if service.Connect.SidecarTask != nil {
 					service.Connect.SidecarTask.MergeIntoTask(task)
@@ -378,7 +438,7 @@ func gatewayProxy(gateway *structs.ConsulGateway, mode string) *structs.ConsulGa
 
 	// set default connect timeout if not set
 	if proxy.ConnectTimeout == nil {
-		proxy.ConnectTimeout = helper.TimeToPtr(defaultConnectTimeout)
+		proxy.ConnectTimeout = pointer.Of(defaultConnectTimeout)
 	}
 
 	if mode == "bridge" {
@@ -434,7 +494,14 @@ func gatewayBindAddressesIngressForBridge(ingress *structs.ConsulIngressConfigEn
 	return addresses
 }
 
-func newConnectGatewayTask(prefix, service string, netHost bool) *structs.Task {
+func newConnectGatewayTask(prefix, service, cluster string, netHost, customizedTls bool) *structs.Task {
+	constraints := structs.Constraints{
+		connectGatewayVersionConstraint(cluster),
+		connectListenerConstraint(cluster),
+	}
+	if customizedTls {
+		constraints = append(constraints, connectGatewayTLSVersionConstraint(cluster))
+	}
 	return &structs.Task{
 		// Name is used in container name so must start with '[A-Za-z0-9]'
 		Name:          fmt.Sprintf("%s-%s", prefix, service),
@@ -446,20 +513,21 @@ func newConnectGatewayTask(prefix, service string, netHost bool) *structs.Task {
 			MaxFiles:      2,
 			MaxFileSizeMB: 2,
 		},
-		Resources: connectSidecarResources(),
-		Constraints: structs.Constraints{
-			connectGatewayVersionConstraint(),
-			connectListenerConstraint(),
-		},
+		Resources:   connectSidecarResources(),
+		Constraints: constraints,
 	}
 }
 
-func newConnectSidecarTask(service string) *structs.Task {
+func newConnectSidecarTask(service, driver, cluster string) *structs.Task {
+
+	versionConstraint := connectSidecarVersionConstraint(cluster)
+	listenerConstraint := connectListenerConstraint(cluster)
+
 	return &structs.Task{
 		// Name is used in container name so must start with '[A-Za-z0-9]'
 		Name:          fmt.Sprintf("%s-%s", structs.ConnectProxyPrefix, service),
 		Kind:          structs.NewTaskKind(structs.ConnectProxyPrefix, service),
-		Driver:        "docker",
+		Driver:        driver,
 		Config:        connectSidecarDriverConfig(),
 		ShutdownDelay: 5 * time.Second,
 		LogConfig: &structs.LogConfig{
@@ -471,10 +539,7 @@ func newConnectSidecarTask(service string) *structs.Task {
 			Hook:    structs.TaskLifecycleHookPrestart,
 			Sidecar: true,
 		},
-		Constraints: structs.Constraints{
-			connectSidecarVersionConstraint(),
-			connectListenerConstraint(),
-		},
+		Constraints: structs.Constraints{versionConstraint, listenerConstraint},
 	}
 }
 
@@ -496,31 +561,72 @@ func groupConnectValidate(g *structs.TaskGroup) error {
 		}
 	}
 
-	if err := groupConnectUpstreamsValidate(g.Name, g.Services); err != nil {
+	if err := groupConnectUpstreamsValidate(g, g.Services); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func groupConnectUpstreamsValidate(group string, services []*structs.Service) error {
+func groupConnectUpstreamsValidate(g *structs.TaskGroup, services []*structs.Service) error {
 	listeners := make(map[string]string) // address -> service
 
+	var connectBlockCount int
+	var hasTproxy bool
+
 	for _, service := range services {
+		if service.Connect != nil {
+			connectBlockCount++
+		}
 		if service.Connect.HasSidecar() && service.Connect.SidecarService.Proxy != nil {
 			for _, up := range service.Connect.SidecarService.Proxy.Upstreams {
-				listener := fmt.Sprintf("%s:%d", up.LocalBindAddress, up.LocalBindPort)
+				listener := net.JoinHostPort(up.LocalBindAddress, strconv.Itoa(up.LocalBindPort))
 				if s, exists := listeners[listener]; exists {
 					return fmt.Errorf(
 						"Consul Connect services %q and %q in group %q using same address for upstreams (%s)",
-						service.Name, s, group, listener,
+						service.Name, s, g.Name, listener,
 					)
 				}
 				listeners[listener] = service.Name
 			}
+
+			if tp := service.Connect.SidecarService.Proxy.TransparentProxy; tp != nil {
+				hasTproxy = true
+				for _, net := range g.Networks {
+					if !net.DNS.IsZero() && !tp.NoDNS {
+						return fmt.Errorf(
+							"Consul Connect transparent proxy cannot be used with network.dns unless no_dns=true")
+					}
+				}
+				for _, portLabel := range tp.ExcludeInboundPorts {
+					if !transparentProxyPortLabelValidate(g, portLabel) {
+						return fmt.Errorf(
+							"Consul Connect transparent proxy port %q must be numeric or one of network.port labels", portLabel)
+					}
+				}
+			}
+
 		}
 	}
+	if hasTproxy && connectBlockCount > 1 {
+		return fmt.Errorf("Consul Connect transparent proxy requires there is only one connect block")
+	}
 	return nil
+}
+
+func transparentProxyPortLabelValidate(g *structs.TaskGroup, portLabel string) bool {
+	if _, err := strconv.ParseUint(portLabel, 10, 16); err == nil {
+		return true
+	}
+
+	for _, network := range g.Networks {
+		for _, reservedPort := range network.ReservedPorts {
+			if reservedPort.Label == portLabel {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func groupConnectSidecarValidate(g *structs.TaskGroup, s *structs.Service) error {
@@ -565,7 +671,7 @@ func groupConnectGatewayValidate(g *structs.TaskGroup) error {
 	}
 
 	modes := []string{"bridge", "host"}
-	if !helper.SliceStringContains(modes, g.Networks[0].Mode) {
+	if !slices.Contains(modes, g.Networks[0].Mode) {
 		return fmt.Errorf(`Consul Connect Gateway service requires Task Group with network mode of type "bridge" or "host"`)
 	}
 

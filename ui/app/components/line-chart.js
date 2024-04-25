@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import Component from '@glimmer/component';
 import { tracked } from '@glimmer/tracking';
 import { action } from '@ember/object';
@@ -348,6 +353,20 @@ export default class LineChart extends Component {
         this.updateActiveDatum(this.latestMouseX);
       }
     });
+  }
+
+  @action
+  recomputeXAxis(el) {
+    if (!this.isDestroyed && !this.isDestroying) {
+      d3.select(el.querySelector('.x-axis')).call(this.xAxis);
+    }
+  }
+
+  @action
+  recomputeYAxis(el) {
+    if (!this.isDestroyed && !this.isDestroying) {
+      d3.select(el.querySelector('.y-axis')).call(this.yAxis);
+    }
   }
 
   mountD3Elements() {

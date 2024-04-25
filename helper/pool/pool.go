@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package pool
 
 import (
@@ -11,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/consul/lib"
 	hclog "github.com/hashicorp/go-hclog"
-	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/yamux"
@@ -47,7 +50,7 @@ type Conn struct {
 
 	addr     net.Addr
 	session  *yamux.Session
-	lastUsed time.Time
+	lastUsed atomic.Pointer[time.Time]
 
 	pool *ConnPool
 
@@ -58,7 +61,8 @@ type Conn struct {
 // markForUse does all the bookkeeping required to ready a connection for use,
 // and ensure that active connections don't get reaped.
 func (c *Conn) markForUse() {
-	c.lastUsed = time.Now()
+	now := time.Now()
+	c.lastUsed.Store(&now)
 	atomic.AddInt32(&c.refCount, 1)
 }
 
@@ -402,9 +406,12 @@ func (p *ConnPool) getNewConn(region string, addr net.Addr) (*Conn, error) {
 		addr:     addr,
 		session:  session,
 		clients:  list.New(),
-		lastUsed: time.Now(),
+		lastUsed: atomic.Pointer[time.Time]{},
 		pool:     p,
 	}
+
+	now := time.Now()
+	c.lastUsed.Store(&now)
 	return c, nil
 }
 
@@ -491,7 +498,7 @@ func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interfa
 		// If we read EOF, the session is toast. Clear it and open a
 		// new session next time
 		// See https://github.com/hashicorp/consul/blob/v1.6.3/agent/pool/pool.go#L471-L477
-		if lib.IsErrEOF(err) {
+		if helper.IsErrEOF(err) {
 			p.clearConn(conn)
 		}
 
@@ -526,7 +533,7 @@ func (p *ConnPool) reap() {
 		now := time.Now()
 		for host, conn := range p.pool {
 			// Skip recently used connections
-			if now.Sub(conn.lastUsed) < p.maxTime {
+			if now.Sub(*conn.lastUsed.Load()) < p.maxTime {
 				continue
 			}
 

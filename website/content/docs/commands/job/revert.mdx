@@ -35,7 +35,10 @@ The `job revert` command requires two inputs, the job ID and the version of that
 job to revert to.
 
 When ACLs are enabled, this command requires a token with the `submit-job`
-and `list-jobs` capabilities for the job's namespace.
+capability for the job's namespace. The `list-jobs` capability is required to
+run the command with a job prefix instead of the exact job ID. The `read-job`
+capability is required to monitor the resulting evaluation when `-detach` is
+not used.
 
 ## General Options
 
@@ -71,7 +74,7 @@ Diff        =
 +/- Task Group: "cache"
   +/- Task: "redis"
     +/- Config {
-      +/- image:           "redis:3.2" => "redis:4.0"
+      +/- image:           "redis:7" => "redis:4.0"
           port_map[0][db]: "6379"
         }
 
@@ -96,7 +99,7 @@ Diff        =
 +/- Task Group: "cache"
   +/- Task: "redis"
     +/- Config {
-      +/- image:           "redis:4.0" => "redis:3.2"
+      +/- image:           "redis:4.0" => "redis:7"
           port_map[0][db]: "6379"
         }
 
@@ -108,7 +111,7 @@ Diff        =
 +/- Task Group: "cache"
   +/- Task: "redis"
     +/- Config {
-      +/- image:           "redis:3.2" => "redis:4.0"
+      +/- image:           "redis:7" => "redis:4.0"
           port_map[0][db]: "6379"
         }
 
@@ -117,8 +120,8 @@ Stable      = false
 Submit Date = 07/25/17 21:27:18 UTC
 ```
 
-[`job history`]: /docs/commands/job/history
-[eval status]: /docs/commands/eval-status
-[consul service identity]: /docs/configuration/consul#allow_unauthenticated
-[vault policy]: /docs/configuration/vault#allow_unauthenticated
-[run]: /docs/commands/job/run
+[`job history`]: /nomad/docs/commands/job/history
+[eval status]: /nomad/docs/commands/eval/status
+[consul service identity]: /nomad/docs/configuration/consul#allow_unauthenticated
+[vault policy]: /nomad/docs/configuration/vault#allow_unauthenticated
+[run]: /nomad/docs/commands/job/run

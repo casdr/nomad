@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { inject as service } from '@ember/service';
 import { alias } from '@ember/object/computed';
 import Component from '@ember/component';
@@ -41,9 +46,29 @@ export default class ServerAgentRow extends Component {
     return currentURL.replace(/%40/g, '@') === targetURL.replace(/%40/g, '@');
   }
 
-  click() {
+  goToAgent() {
     const transition = () =>
       this.router.transitionTo('servers.server', this.agent);
     lazyClick([transition, event]);
+  }
+
+  click() {
+    this.goToAgent();
+  }
+
+  @computed('agent.status')
+  get agentStatusColor() {
+    let agentStatus = this.get('agent.status');
+    if (agentStatus === 'alive') {
+      return 'success';
+    } else if (agentStatus === 'failed') {
+      return 'critical';
+    } else if (agentStatus === 'leaving') {
+      return 'neutral';
+    } else if (agentStatus === 'left') {
+      return 'neutral';
+    } else {
+      return '';
+    }
   }
 }

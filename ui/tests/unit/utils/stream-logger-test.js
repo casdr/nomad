@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { module, test } from 'qunit';
 import { Promise } from 'rsvp';
 import sinon from 'sinon';
@@ -42,6 +47,11 @@ module('Unit | Util | StreamLogger', function () {
 
     assert.notOk(logger.poll.isRunning);
     assert.equal(fetchMock.reader.readSpy.callCount, 1);
+  });
+
+  test('disable streaming if not supported', async function (assert) {
+    window.ReadableStream = null;
+    assert.false(StreamLogger.isSupported);
   });
 });
 

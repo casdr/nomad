@@ -1,12 +1,17 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package volumewatcher
 
 import (
 	"context"
 	"sync"
+	"time"
 
 	log "github.com/hashicorp/go-hclog"
 	memdb "github.com/hashicorp/go-memdb"
 	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -30,6 +35,11 @@ type volumeWatcher struct {
 	shutdownCtx context.Context // parent context
 	ctx         context.Context // own context
 	exitFn      context.CancelFunc
+	deleteFn    func()
+
+	// quiescentTimeout is the time we wait until the volume has "settled"
+	// before stopping the child watcher goroutines
+	quiescentTimeout time.Duration
 
 	// updateCh is triggered when there is an updated volume
 	updateCh chan *structs.CSIVolume
@@ -43,13 +53,15 @@ type volumeWatcher struct {
 func newVolumeWatcher(parent *Watcher, vol *structs.CSIVolume) *volumeWatcher {
 
 	w := &volumeWatcher{
-		updateCh:    make(chan *structs.CSIVolume, 1),
-		v:           vol,
-		state:       parent.state,
-		rpc:         parent.rpc,
-		leaderAcl:   parent.leaderAcl,
-		logger:      parent.logger.With("volume_id", vol.ID, "namespace", vol.Namespace),
-		shutdownCtx: parent.ctx,
+		updateCh:         make(chan *structs.CSIVolume, 1),
+		v:                vol,
+		state:            parent.state,
+		rpc:              parent.rpc,
+		leaderAcl:        parent.leaderAcl,
+		logger:           parent.logger.With("volume_id", vol.ID, "namespace", vol.Namespace),
+		shutdownCtx:      parent.ctx,
+		deleteFn:         func() { parent.remove(vol.ID + vol.Namespace) },
+		quiescentTimeout: parent.quiescentTimeout,
 	}
 
 	// Start the long lived watcher that scans for allocation updates
@@ -65,7 +77,6 @@ func (vw *volumeWatcher) Notify(v *structs.CSIVolume) {
 	select {
 	case vw.updateCh <- v:
 	case <-vw.shutdownCtx.Done(): // prevent deadlock if we stopped
-	case <-vw.ctx.Done(): // prevent deadlock if we stopped
 	}
 }
 
@@ -74,17 +85,14 @@ func (vw *volumeWatcher) Start() {
 	vw.wLock.Lock()
 	defer vw.wLock.Unlock()
 	vw.running = true
-	ctx, exitFn := context.WithCancel(vw.shutdownCtx)
-	vw.ctx = ctx
-	vw.exitFn = exitFn
 	go vw.watch()
 }
 
-// Stop stops watching the volume. This should be called whenever a
-// volume's claims are fully reaped or the watcher is no longer needed.
 func (vw *volumeWatcher) Stop() {
 	vw.logger.Trace("no more claims")
-	vw.exitFn()
+	vw.wLock.Lock()
+	defer vw.wLock.Unlock()
+	vw.running = false
 }
 
 func (vw *volumeWatcher) isRunning() bool {
@@ -92,8 +100,6 @@ func (vw *volumeWatcher) isRunning() bool {
 	defer vw.wLock.RUnlock()
 	select {
 	case <-vw.shutdownCtx.Done():
-		return false
-	case <-vw.ctx.Done():
 		return false
 	default:
 		return vw.running
@@ -104,12 +110,11 @@ func (vw *volumeWatcher) isRunning() bool {
 // Each pass steps the volume's claims through the various states of reaping
 // until the volume has no more claims eligible to be reaped.
 func (vw *volumeWatcher) watch() {
-	// always denormalize the volume and call reap when we first start
-	// the watcher so that we ensure we don't drop events that
-	// happened during leadership transitions and didn't get completed
-	// by the prior leader
-	vol := vw.getVolume(vw.v)
-	vw.volumeReap(vol)
+	defer vw.deleteFn()
+	defer vw.Stop()
+
+	timer, stop := helper.NewSafeTimer(vw.quiescentTimeout)
+	defer stop()
 
 	for {
 		select {
@@ -117,20 +122,17 @@ func (vw *volumeWatcher) watch() {
 		// context, so we can't stop the long-runner RPCs gracefully
 		case <-vw.shutdownCtx.Done():
 			return
-		case <-vw.ctx.Done():
-			return
 		case vol := <-vw.updateCh:
-			// while we won't make raft writes if we get a stale update,
-			// we can still fire extra CSI RPC calls if we don't check this
-			if vol.ModifyIndex >= vw.v.ModifyIndex {
-				vol = vw.getVolume(vol)
-				if vol == nil {
-					return
-				}
-				vw.volumeReap(vol)
+			vol = vw.getVolume(vol)
+			if vol == nil {
+				return
 			}
-		default:
-			vw.Stop() // no pending work
+			vw.volumeReap(vol)
+			timer.Reset(vw.quiescentTimeout)
+		case <-timer.C:
+			// Wait until the volume has "settled" before stopping this
+			// goroutine so that we can handle the burst of updates around
+			// freeing claims without having to spin it back up
 			return
 		}
 	}
@@ -145,9 +147,12 @@ func (vw *volumeWatcher) getVolume(vol *structs.CSIVolume) *structs.CSIVolume {
 	var err error
 	ws := memdb.NewWatchSet()
 
-	vol, err = vw.state.CSIVolumeDenormalizePlugins(ws, vol.Copy())
+	vol, err = vw.state.CSIVolumeByID(ws, vol.Namespace, vol.ID)
 	if err != nil {
-		vw.logger.Error("could not query plugins for volume", "error", err)
+		vw.logger.Error("could not query for volume", "error", err)
+		return nil
+	}
+	if vol == nil {
 		return nil
 	}
 
@@ -167,9 +172,6 @@ func (vw *volumeWatcher) volumeReap(vol *structs.CSIVolume) {
 	err := vw.volumeReapImpl(vol)
 	if err != nil {
 		vw.logger.Error("error releasing volume claims", "error", err)
-	}
-	if vw.isUnclaimed(vol) {
-		vw.Stop()
 	}
 }
 
@@ -230,6 +232,7 @@ func (vw *volumeWatcher) collectPastClaims(vol *structs.CSIVolume) *structs.CSIV
 }
 
 func (vw *volumeWatcher) unpublish(vol *structs.CSIVolume, claim *structs.CSIVolumeClaim) error {
+	vw.logger.Trace("unpublishing volume", "alloc", claim.AllocationID)
 	req := &structs.CSIVolumeUnpublishRequest{
 		VolumeID: vol.ID,
 		Claim:    claim,

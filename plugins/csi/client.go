@@ -1,8 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package csi
 
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -11,14 +15,14 @@ import (
 	csipbv1 "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/hashicorp/go-hclog"
 	multierror "github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/nomad/helper"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/hashicorp/nomad/helper/grpc-middleware/logging"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // PluginTypeCSI implements the CSI plugin interface
@@ -35,29 +39,29 @@ type NodeGetInfoResponse struct {
 // "zone", "rack", etc.
 //
 // According to CSI, there are a few requirements for the keys within this map:
-// - Valid keys have two segments: an OPTIONAL prefix and name, separated
-//   by a slash (/), for example: "com.company.example/zone".
-// - The key name segment is REQUIRED. The prefix is OPTIONAL.
-// - The key name MUST be 63 characters or less, begin and end with an
-//   alphanumeric character ([a-z0-9A-Z]), and contain only dashes (-),
-//   underscores (_), dots (.), or alphanumerics in between, for example
-//   "zone".
-// - The key prefix MUST be 63 characters or less, begin and end with a
-//   lower-case alphanumeric character ([a-z0-9]), contain only
-//   dashes (-), dots (.), or lower-case alphanumerics in between, and
-//   follow domain name notation format
-//   (https://tools.ietf.org/html/rfc1035#section-2.3.1).
-// - The key prefix SHOULD include the plugin's host company name and/or
-//   the plugin name, to minimize the possibility of collisions with keys
-//   from other plugins.
-// - If a key prefix is specified, it MUST be identical across all
-//   topology keys returned by the SP (across all RPCs).
-// - Keys MUST be case-insensitive. Meaning the keys "Zone" and "zone"
-//   MUST not both exist.
-// - Each value (topological segment) MUST contain 1 or more strings.
-// - Each string MUST be 63 characters or less and begin and end with an
-//   alphanumeric character with '-', '_', '.', or alphanumerics in
-//   between.
+//   - Valid keys have two segments: an OPTIONAL prefix and name, separated
+//     by a slash (/), for example: "com.company.example/zone".
+//   - The key name segment is REQUIRED. The prefix is OPTIONAL.
+//   - The key name MUST be 63 characters or less, begin and end with an
+//     alphanumeric character ([a-z0-9A-Z]), and contain only dashes (-),
+//     underscores (_), dots (.), or alphanumerics in between, for example
+//     "zone".
+//   - The key prefix MUST be 63 characters or less, begin and end with a
+//     lower-case alphanumeric character ([a-z0-9]), contain only
+//     dashes (-), dots (.), or lower-case alphanumerics in between, and
+//     follow domain name notation format
+//     (https://tools.ietf.org/html/rfc1035#section-2.3.1).
+//   - The key prefix SHOULD include the plugin's host company name and/or
+//     the plugin name, to minimize the possibility of collisions with keys
+//     from other plugins.
+//   - If a key prefix is specified, it MUST be identical across all
+//     topology keys returned by the SP (across all RPCs).
+//   - Keys MUST be case-insensitive. Meaning the keys "Zone" and "zone"
+//     MUST not both exist.
+//   - Each value (topological segment) MUST contain 1 or more strings.
+//   - Each string MUST be 63 characters or less and begin and end with an
+//     alphanumeric character with '-', '_', '.', or alphanumerics in
+//     between.
 type Topology struct {
 	Segments map[string]string
 }
@@ -72,6 +76,7 @@ type CSIControllerClient interface {
 	CreateVolume(ctx context.Context, in *csipbv1.CreateVolumeRequest, opts ...grpc.CallOption) (*csipbv1.CreateVolumeResponse, error)
 	ListVolumes(ctx context.Context, in *csipbv1.ListVolumesRequest, opts ...grpc.CallOption) (*csipbv1.ListVolumesResponse, error)
 	DeleteVolume(ctx context.Context, in *csipbv1.DeleteVolumeRequest, opts ...grpc.CallOption) (*csipbv1.DeleteVolumeResponse, error)
+	ControllerExpandVolume(ctx context.Context, in *csipbv1.ControllerExpandVolumeRequest, opts ...grpc.CallOption) (*csipbv1.ControllerExpandVolumeResponse, error)
 	CreateSnapshot(ctx context.Context, in *csipbv1.CreateSnapshotRequest, opts ...grpc.CallOption) (*csipbv1.CreateSnapshotResponse, error)
 	DeleteSnapshot(ctx context.Context, in *csipbv1.DeleteSnapshotRequest, opts ...grpc.CallOption) (*csipbv1.DeleteSnapshotResponse, error)
 	ListSnapshots(ctx context.Context, in *csipbv1.ListSnapshotsRequest, opts ...grpc.CallOption) (*csipbv1.ListSnapshotsResponse, error)
@@ -86,6 +91,7 @@ type CSINodeClient interface {
 	NodeUnstageVolume(ctx context.Context, in *csipbv1.NodeUnstageVolumeRequest, opts ...grpc.CallOption) (*csipbv1.NodeUnstageVolumeResponse, error)
 	NodePublishVolume(ctx context.Context, in *csipbv1.NodePublishVolumeRequest, opts ...grpc.CallOption) (*csipbv1.NodePublishVolumeResponse, error)
 	NodeUnpublishVolume(ctx context.Context, in *csipbv1.NodeUnpublishVolumeRequest, opts ...grpc.CallOption) (*csipbv1.NodeUnpublishVolumeResponse, error)
+	NodeExpandVolume(ctx context.Context, in *csipbv1.NodeExpandVolumeRequest, opts ...grpc.CallOption) (*csipbv1.NodeExpandVolumeResponse, error)
 }
 
 type client struct {
@@ -162,6 +168,7 @@ func newGrpcConn(addr string, logger hclog.Logger) (*grpc.ClientConn, error) {
 		grpc.WithInsecure(),
 		grpc.WithUnaryInterceptor(logging.UnaryClientInterceptor(logger)),
 		grpc.WithStreamInterceptor(logging.StreamClientInterceptor(logger)),
+		grpc.WithAuthority("localhost"),
 		grpc.WithDialer(func(target string, timeout time.Duration) (net.Conn, error) {
 			return net.DialTimeout("unix", target, timeout)
 		}),
@@ -326,7 +333,7 @@ func (c *client) ControllerPublishVolume(ctx context.Context, req *ControllerPub
 	}
 
 	return &ControllerPublishVolumeResponse{
-		PublishContext: helper.CopyMapStringString(resp.PublishContext),
+		PublishContext: maps.Clone(resp.PublishContext),
 	}, nil
 }
 
@@ -504,6 +511,44 @@ func (c *client) ControllerDeleteVolume(ctx context.Context, req *ControllerDele
 		}
 	}
 	return err
+}
+
+func (c *client) ControllerExpandVolume(ctx context.Context, req *ControllerExpandVolumeRequest, opts ...grpc.CallOption) (*ControllerExpandVolumeResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+
+	exReq := req.ToCSIRepresentation()
+	resp, err := c.controllerClient.ControllerExpandVolume(ctx, exReq, opts...)
+	if err != nil {
+		code := status.Code(err)
+		switch code {
+		case codes.InvalidArgument:
+			return nil, fmt.Errorf(
+				"requested capabilities not compatible with volume %q: %v",
+				req.ExternalVolumeID, err)
+		case codes.NotFound:
+			err = fmt.Errorf("volume %q could not be found: %v", req.ExternalVolumeID, err)
+		case codes.FailedPrecondition:
+			err = fmt.Errorf("volume %q cannot be expanded online: %v", req.ExternalVolumeID, err)
+		case codes.OutOfRange:
+			return nil, fmt.Errorf(
+				"unsupported capacity_range for volume %q: %v", req.ExternalVolumeID, err)
+		case codes.Internal:
+			err = fmt.Errorf("controller plugin returned an internal error, check the plugin allocation logs for more information: %v", err)
+		default:
+			err = fmt.Errorf("controller plugin returned an error: %v", err)
+		}
+		return nil, err
+	}
+
+	return &ControllerExpandVolumeResponse{
+		CapacityBytes:         resp.GetCapacityBytes(),
+		NodeExpansionRequired: resp.GetNodeExpansionRequired(),
+	}, nil
 }
 
 // compareCapabilities returns an error if the 'got' capabilities aren't found
@@ -878,4 +923,40 @@ func (c *client) NodeUnpublishVolume(ctx context.Context, volumeID, targetPath s
 	}
 
 	return err
+}
+
+func (c *client) NodeExpandVolume(ctx context.Context, req *NodeExpandVolumeRequest, opts ...grpc.CallOption) (*NodeExpandVolumeResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	if err := c.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+
+	exReq := req.ToCSIRepresentation()
+	resp, err := c.nodeClient.NodeExpandVolume(ctx, exReq, opts...)
+	if err != nil {
+		code := status.Code(err)
+		switch code {
+		case codes.InvalidArgument:
+			return nil, fmt.Errorf(
+				"requested capabilities not compatible with volume %q: %v",
+				req.ExternalVolumeID, err)
+		case codes.NotFound:
+			return nil, fmt.Errorf("%w: volume %q could not be found: %v",
+				structs.ErrCSIClientRPCIgnorable, req.ExternalVolumeID, err)
+		case codes.FailedPrecondition:
+			return nil, fmt.Errorf("volume %q cannot be expanded while in use: %v", req.ExternalVolumeID, err)
+		case codes.OutOfRange:
+			return nil, fmt.Errorf(
+				"unsupported capacity_range for volume %q: %v", req.ExternalVolumeID, err)
+		case codes.Internal:
+			return nil, fmt.Errorf(
+				"node plugin returned an internal error, check the plugin allocation logs for more information: %v", err)
+		default:
+			return nil, fmt.Errorf("node plugin returned an error: %v", err)
+		}
+	}
+
+	return &NodeExpandVolumeResponse{resp.GetCapacityBytes()}, nil
 }

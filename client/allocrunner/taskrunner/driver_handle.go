@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package taskrunner
 
 import (
@@ -11,13 +14,18 @@ import (
 )
 
 // NewDriverHandle returns a handle for task operations on a specific task
-func NewDriverHandle(driver drivers.DriverPlugin, taskID string, task *structs.Task, net *drivers.DriverNetwork) *DriverHandle {
+func NewDriverHandle(
+	driver drivers.DriverPlugin,
+	taskID string,
+	task *structs.Task,
+	maxKillTimeout time.Duration,
+	net *drivers.DriverNetwork) *DriverHandle {
 	return &DriverHandle{
 		driver:      driver,
 		net:         net,
 		taskID:      taskID,
 		killSignal:  task.KillSignal,
-		killTimeout: task.KillTimeout,
+		killTimeout: min(task.KillTimeout, maxKillTimeout),
 	}
 }
 

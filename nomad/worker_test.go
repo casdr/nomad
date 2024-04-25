@@ -1,7 +1,11 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -11,6 +15,8 @@ import (
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/helper"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 
 	"github.com/hashicorp/nomad/helper/testlog"
@@ -49,19 +55,6 @@ func init() {
 		}
 		return n
 	}
-}
-
-// NewTestWorker returns the worker without calling it's run method.
-func NewTestWorker(shutdownCtx context.Context, srv *Server) *Worker {
-	w := &Worker{
-		srv:   srv,
-		start: time.Now(),
-		id:    uuid.Generate(),
-	}
-	w.logger = srv.logger.ResetNamed("worker").With("worker_id", w.id)
-	w.pauseCond = sync.NewCond(&w.pauseLock)
-	w.ctx, w.cancelFn = context.WithCancel(shutdownCtx)
-	return w
 }
 
 func TestWorker_dequeueEvaluation(t *testing.T) {
@@ -118,9 +111,10 @@ func TestWorker_dequeueEvaluation_SerialJobs(t *testing.T) {
 	eval2.JobID = eval1.JobID
 
 	// Insert the evals into the state store
-	if err := s1.fsm.State().UpsertEvals(structs.MsgTypeTestSetup, 1000, []*structs.Evaluation{eval1, eval2}); err != nil {
-		t.Fatal(err)
-	}
+	must.NoError(t, s1.fsm.State().UpsertEvals(
+		structs.MsgTypeTestSetup, 1000, []*structs.Evaluation{eval1}))
+	must.NoError(t, s1.fsm.State().UpsertEvals(
+		structs.MsgTypeTestSetup, 2000, []*structs.Evaluation{eval2}))
 
 	s1.evalBroker.Enqueue(eval1)
 	s1.evalBroker.Enqueue(eval2)
@@ -131,45 +125,29 @@ func TestWorker_dequeueEvaluation_SerialJobs(t *testing.T) {
 
 	// Attempt dequeue
 	eval, token, waitIndex, shutdown := w.dequeueEvaluation(10 * time.Millisecond)
-	if shutdown {
-		t.Fatalf("should not shutdown")
-	}
-	if token == "" {
-		t.Fatalf("should get token")
-	}
-	if waitIndex != eval1.ModifyIndex {
-		t.Fatalf("bad wait index; got %d; want %d", waitIndex, eval1.ModifyIndex)
-	}
-
-	// Ensure we get a sane eval
-	if !reflect.DeepEqual(eval, eval1) {
-		t.Fatalf("bad: %#v %#v", eval, eval1)
-	}
+	must.False(t, shutdown, must.Sprint("should not be shutdown"))
+	must.NotEq(t, token, "", must.Sprint("should get a token"))
+	must.NotEq(t, eval1.ModifyIndex, waitIndex, must.Sprintf("bad wait index"))
+	must.Eq(t, eval, eval1)
 
 	// Update the modify index of the first eval
-	if err := s1.fsm.State().UpsertEvals(structs.MsgTypeTestSetup, 2000, []*structs.Evaluation{eval1}); err != nil {
-		t.Fatal(err)
-	}
+	must.NoError(t, s1.fsm.State().UpsertEvals(
+		structs.MsgTypeTestSetup, 1500, []*structs.Evaluation{eval1}))
 
 	// Send the Ack
 	w.sendAck(eval1, token)
 
-	// Attempt second dequeue
+	// Attempt second dequeue; it should succeed because the 2nd eval has a
+	// lower modify index than the snapshot used to schedule the 1st
+	// eval. Normally this can only happen if the worker is on a follower that's
+	// trailing behind in raft logs
 	eval, token, waitIndex, shutdown = w.dequeueEvaluation(10 * time.Millisecond)
-	if shutdown {
-		t.Fatalf("should not shutdown")
-	}
-	if token == "" {
-		t.Fatalf("should get token")
-	}
-	if waitIndex != 2000 {
-		t.Fatalf("bad wait index; got %d; want 2000", eval2.ModifyIndex)
-	}
 
-	// Ensure we get a sane eval
-	if !reflect.DeepEqual(eval, eval2) {
-		t.Fatalf("bad: %#v %#v", eval, eval2)
-	}
+	must.False(t, shutdown, must.Sprint("should not be shutdown"))
+	must.NotEq(t, token, "", must.Sprint("should get a token"))
+	must.Eq(t, waitIndex, 2000, must.Sprintf("bad wait index"))
+	must.Eq(t, eval, eval2)
+
 }
 
 func TestWorker_dequeueEvaluation_paused(t *testing.T) {
@@ -352,6 +330,55 @@ func TestWorker_sendAck(t *testing.T) {
 	}
 }
 
+func TestWorker_runBackoff(t *testing.T) {
+	ci.Parallel(t)
+
+	srv, cleanupSrv := TestServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+		c.EnabledSchedulers = []string{structs.JobTypeService}
+	})
+	defer cleanupSrv()
+	testutil.WaitForLeader(t, srv.RPC)
+
+	eval1 := mock.Eval()
+	eval1.ModifyIndex = 1000
+	srv.evalBroker.Enqueue(eval1)
+	must.Eq(t, 1, srv.evalBroker.Stats().TotalReady)
+
+	// make a new context here so we can still check the broker's state after
+	// we've shut down the worker
+	workerCtx, workerCancel := context.WithCancel(srv.shutdownCtx)
+	defer workerCancel()
+
+	poolArgs := getSchedulerWorkerPoolArgsFromConfigLocked(srv.config).Copy()
+	w := newWorker(workerCtx, srv, poolArgs)
+	doneCh := make(chan struct{})
+
+	go func() {
+		w.run(time.Millisecond)
+		doneCh <- struct{}{}
+	}()
+
+	// We expect to be paused for 10ms + 1ms but otherwise can't be all that
+	// precise here because of concurrency. But checking coverage for this test
+	// shows we've covered the logic
+	t1, cancelT1 := helper.NewSafeTimer(100 * time.Millisecond)
+	defer cancelT1()
+	select {
+	case <-doneCh:
+		t.Fatal("returned early")
+	case <-t1.C:
+	}
+
+	workerCancel()
+	<-doneCh
+
+	must.Eq(t, 1, srv.evalBroker.Stats().TotalWaiting)
+	must.Eq(t, 0, srv.evalBroker.Stats().TotalReady)
+	must.Eq(t, 0, srv.evalBroker.Stats().TotalPending)
+	must.Eq(t, 0, srv.evalBroker.Stats().TotalUnacked)
+}
+
 func TestWorker_waitForIndex(t *testing.T) {
 	ci.Parallel(t)
 
@@ -390,6 +417,7 @@ func TestWorker_waitForIndex(t *testing.T) {
 	require.Nil(t, snap)
 	require.EqualError(t, err,
 		fmt.Sprintf("timed out after %s waiting for index=%d", timeout, waitIndex))
+	require.True(t, errors.Is(err, context.DeadlineExceeded), "expect error to wrap DeadlineExceeded")
 }
 
 func TestWorker_invokeScheduler(t *testing.T) {
@@ -430,7 +458,7 @@ func TestWorker_SubmitPlan(t *testing.T) {
 	job := mock.Job()
 	eval1 := mock.Eval()
 	eval1.JobID = job.ID
-	s1.fsm.State().UpsertJob(structs.MsgTypeTestSetup, 1000, job)
+	s1.fsm.State().UpsertJob(structs.MsgTypeTestSetup, 1000, nil, job)
 	s1.fsm.State().UpsertEvals(structs.MsgTypeTestSetup, 1000, []*structs.Evaluation{eval1})
 
 	// Create the register request
@@ -488,7 +516,7 @@ func TestWorker_SubmitPlanNormalizedAllocations(t *testing.T) {
 	s1, cleanupS1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
-		c.Build = "0.9.2"
+		c.Build = "1.4.0"
 	})
 	defer cleanupS1()
 	testutil.WaitForLeader(t, s1.RPC)
@@ -500,7 +528,7 @@ func TestWorker_SubmitPlanNormalizedAllocations(t *testing.T) {
 	job := mock.Job()
 	eval1 := mock.Eval()
 	eval1.JobID = job.ID
-	s1.fsm.State().UpsertJob(structs.MsgTypeTestSetup, 0, job)
+	s1.fsm.State().UpsertJob(structs.MsgTypeTestSetup, 0, nil, job)
 	s1.fsm.State().UpsertEvals(structs.MsgTypeTestSetup, 0, []*structs.Evaluation{eval1})
 
 	stoppedAlloc := mock.Alloc()
@@ -551,7 +579,7 @@ func TestWorker_SubmitPlan_MissingNodeRefresh(t *testing.T) {
 
 	// Create the job
 	job := mock.Job()
-	s1.fsm.State().UpsertJob(structs.MsgTypeTestSetup, 1000, job)
+	s1.fsm.State().UpsertJob(structs.MsgTypeTestSetup, 1000, nil, job)
 
 	// Create the register request
 	eval1 := mock.Eval()

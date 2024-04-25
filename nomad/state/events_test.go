@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package state
 
 import (
@@ -6,10 +9,11 @@ import (
 
 	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/nomad/ci"
-	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -110,7 +114,7 @@ func TestEventsFromChanges_DeploymentUpdate(t *testing.T) {
 	d := mock.Deployment()
 	d.JobID = j.ID
 
-	require.NoError(t, s.upsertJobImpl(10, j, false, setupTx))
+	require.NoError(t, s.upsertJobImpl(10, nil, j, false, setupTx))
 	require.NoError(t, s.upsertDeploymentImpl(10, d, setupTx))
 
 	setupTx.Txn.Commit()
@@ -154,7 +158,7 @@ func TestEventsFromChanges_DeploymentPromotion(t *testing.T) {
 	tg2 := tg1.Copy()
 	tg2.Name = "foo"
 	j.TaskGroups = append(j.TaskGroups, tg2)
-	require.NoError(t, s.upsertJobImpl(10, j, false, setupTx))
+	require.NoError(t, s.upsertJobImpl(10, nil, j, false, setupTx))
 
 	d := mock.Deployment()
 	d.StatusDescription = structs.DeploymentStatusDescriptionRunningNeedsPromotion
@@ -177,7 +181,7 @@ func TestEventsFromChanges_DeploymentPromotion(t *testing.T) {
 	c1.DeploymentID = d.ID
 	d.TaskGroups[c1.TaskGroup].PlacedCanaries = append(d.TaskGroups[c1.TaskGroup].PlacedCanaries, c1.ID)
 	c1.DeploymentStatus = &structs.AllocDeploymentStatus{
-		Healthy: helper.BoolToPtr(true),
+		Healthy: pointer.Of(true),
 	}
 	c2 := mock.Alloc()
 	c2.JobID = j.ID
@@ -185,7 +189,7 @@ func TestEventsFromChanges_DeploymentPromotion(t *testing.T) {
 	d.TaskGroups[c2.TaskGroup].PlacedCanaries = append(d.TaskGroups[c2.TaskGroup].PlacedCanaries, c2.ID)
 	c2.TaskGroup = tg2.Name
 	c2.DeploymentStatus = &structs.AllocDeploymentStatus{
-		Healthy: helper.BoolToPtr(true),
+		Healthy: pointer.Of(true),
 	}
 
 	require.NoError(t, s.upsertAllocsImpl(10, []*structs.Allocation{c1, c2}, setupTx))
@@ -231,7 +235,7 @@ func TestEventsFromChanges_DeploymentAllocHealthRequestType(t *testing.T) {
 	tg2 := tg1.Copy()
 	tg2.Name = "foo"
 	j.TaskGroups = append(j.TaskGroups, tg2)
-	require.NoError(t, s.upsertJobImpl(10, j, false, setupTx))
+	require.NoError(t, s.upsertJobImpl(10, nil, j, false, setupTx))
 
 	d := mock.Deployment()
 	d.StatusDescription = structs.DeploymentStatusDescriptionRunningNeedsPromotion
@@ -254,7 +258,7 @@ func TestEventsFromChanges_DeploymentAllocHealthRequestType(t *testing.T) {
 	c1.DeploymentID = d.ID
 	d.TaskGroups[c1.TaskGroup].PlacedCanaries = append(d.TaskGroups[c1.TaskGroup].PlacedCanaries, c1.ID)
 	c1.DeploymentStatus = &structs.AllocDeploymentStatus{
-		Healthy: helper.BoolToPtr(true),
+		Healthy: pointer.Of(true),
 	}
 	c2 := mock.Alloc()
 	c2.JobID = j.ID
@@ -262,7 +266,7 @@ func TestEventsFromChanges_DeploymentAllocHealthRequestType(t *testing.T) {
 	d.TaskGroups[c2.TaskGroup].PlacedCanaries = append(d.TaskGroups[c2.TaskGroup].PlacedCanaries, c2.ID)
 	c2.TaskGroup = tg2.Name
 	c2.DeploymentStatus = &structs.AllocDeploymentStatus{
-		Healthy: helper.BoolToPtr(true),
+		Healthy: pointer.Of(true),
 	}
 
 	require.NoError(t, s.upsertAllocsImpl(10, []*structs.Allocation{c1, c2}, setupTx))
@@ -386,6 +390,62 @@ func TestEventsFromChanges_NodeUpdateStatusRequest(t *testing.T) {
 	require.Equal(t, structs.NodeStatusDown, event.Node.Status)
 }
 
+func TestEventsFromChanges_NodePoolUpsertRequestType(t *testing.T) {
+	ci.Parallel(t)
+	s := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer s.StopEventBroker()
+
+	// Create test node pool.
+	pool := mock.NodePool()
+	err := s.UpsertNodePools(structs.MsgTypeTestSetup, 1000, []*structs.NodePool{pool})
+	must.NoError(t, err)
+
+	// Update test node pool.
+	updated := pool.Copy()
+	updated.Meta["updated"] = "true"
+	err = s.UpsertNodePools(structs.NodePoolUpsertRequestType, 1001, []*structs.NodePool{updated})
+	must.NoError(t, err)
+
+	// Wait and verify update event.
+	events := WaitForEvents(t, s, 1001, 1, 1*time.Second)
+	must.Len(t, 1, events)
+
+	e := events[0]
+	must.Eq(t, structs.TopicNodePool, e.Topic)
+	must.Eq(t, structs.TypeNodePoolUpserted, e.Type)
+	must.Eq(t, pool.Name, e.Key)
+
+	payload := e.Payload.(*structs.NodePoolEvent)
+	must.Eq(t, updated, payload.NodePool)
+}
+
+func TestEventsFromChanges_NodePoolDeleteRequestType(t *testing.T) {
+	ci.Parallel(t)
+	s := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer s.StopEventBroker()
+
+	// Create test node pool.
+	pool := mock.NodePool()
+	err := s.UpsertNodePools(structs.MsgTypeTestSetup, 1000, []*structs.NodePool{pool})
+	must.NoError(t, err)
+
+	// Delete test node pool.
+	err = s.DeleteNodePools(structs.NodePoolDeleteRequestType, 1001, []string{pool.Name})
+	must.NoError(t, err)
+
+	// Wait and verify delete event.
+	events := WaitForEvents(t, s, 1001, 1, 1*time.Second)
+	must.Len(t, 1, events)
+
+	e := events[0]
+	must.Eq(t, structs.TopicNodePool, e.Topic)
+	must.Eq(t, structs.TypeNodePoolDeleted, e.Type)
+	must.Eq(t, pool.Name, e.Key)
+
+	payload := e.Payload.(*structs.NodePoolEvent)
+	must.Eq(t, pool, payload.NodePool)
+}
+
 func TestEventsFromChanges_EvalUpdateRequestType(t *testing.T) {
 	ci.Parallel(t)
 	s := TestStateStoreCfg(t, TestStateStorePublisher(t))
@@ -436,7 +496,7 @@ func TestEventsFromChanges_ApplyPlanResultsRequestType(t *testing.T) {
 	alloc.DeploymentID = d.ID
 	alloc2.DeploymentID = d.ID
 
-	require.NoError(t, s.UpsertJob(structs.MsgTypeTestSetup, 9, job))
+	require.NoError(t, s.UpsertJob(structs.MsgTypeTestSetup, 9, nil, job))
 
 	eval := mock.Eval()
 	eval.JobID = job.ID
@@ -583,7 +643,7 @@ func TestEventsFromChanges_AllocUpdateDesiredTransitionRequestType(t *testing.T)
 
 	alloc := mock.Alloc()
 
-	require.Nil(t, s.UpsertJob(structs.MsgTypeTestSetup, 10, alloc.Job))
+	require.Nil(t, s.UpsertJob(structs.MsgTypeTestSetup, 10, nil, alloc.Job))
 	require.Nil(t, s.UpsertAllocs(structs.MsgTypeTestSetup, 11, []*structs.Allocation{alloc}))
 
 	msgType := structs.AllocUpdateDesiredTransitionRequestType
@@ -602,7 +662,7 @@ func TestEventsFromChanges_AllocUpdateDesiredTransitionRequestType(t *testing.T)
 
 	req := &structs.AllocUpdateDesiredTransitionRequest{
 		Allocs: map[string]*structs.DesiredTransition{
-			alloc.ID: {Migrate: helper.BoolToPtr(true)},
+			alloc.ID: {Migrate: pointer.Of(true)},
 		},
 		Evals: evals,
 	}
@@ -639,10 +699,6 @@ func TestEventsFromChanges_AllocClientUpdateRequestType(t *testing.T) {
 	t.SkipNow()
 }
 
-func TestEventsFromChanges_AllocUpdateRequestType(t *testing.T) {
-	t.SkipNow()
-}
-
 func TestEventsFromChanges_JobDeregisterRequestType(t *testing.T) {
 	t.SkipNow()
 }
@@ -670,7 +726,7 @@ func TestEventsFromChanges_WithDeletion(t *testing.T) {
 	event := eventsFromChanges(nil, changes)
 	require.NotNil(t, event)
 
-	require.Len(t, event.Events, 1)
+	require.Len(t, event.Events, 2)
 }
 
 func TestEventsFromChanges_WithNodeDeregistration(t *testing.T) {
@@ -953,6 +1009,210 @@ func TestNodeDrainEventFromChanges(t *testing.T) {
 
 	require.Equal(t, structs.NodeSchedulingIneligible, nodeEvent.Node.SchedulingEligibility)
 	require.Equal(t, strat, nodeEvent.Node.DrainStrategy)
+}
+
+func Test_eventsFromChanges_ServiceRegistration(t *testing.T) {
+	ci.Parallel(t)
+	testState := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer testState.StopEventBroker()
+
+	// Generate test service registration.
+	service := mock.ServiceRegistrations()[0]
+
+	// Upsert a service registration.
+	writeTxn := testState.db.WriteTxn(10)
+	updated, err := testState.upsertServiceRegistrationTxn(10, writeTxn, service)
+	require.True(t, updated)
+	require.NoError(t, err)
+	writeTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	registerChange := Changes{Changes: writeTxn.Changes(), Index: 10, MsgType: structs.ServiceRegistrationUpsertRequestType}
+	receivedChange := eventsFromChanges(writeTxn, registerChange)
+
+	// Check the event, and it's payload are what we are expecting.
+	require.Len(t, receivedChange.Events, 1)
+	require.Equal(t, structs.TopicService, receivedChange.Events[0].Topic)
+	require.Equal(t, structs.TypeServiceRegistration, receivedChange.Events[0].Type)
+	require.Equal(t, uint64(10), receivedChange.Events[0].Index)
+
+	eventPayload := receivedChange.Events[0].Payload.(*structs.ServiceRegistrationStreamEvent)
+	require.Equal(t, service, eventPayload.Service)
+
+	// Delete the previously upserted service registration.
+	deleteTxn := testState.db.WriteTxn(20)
+	require.NoError(t, testState.deleteServiceRegistrationByIDTxn(uint64(20), deleteTxn, service.Namespace, service.ID))
+	writeTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	deregisterChange := Changes{Changes: deleteTxn.Changes(), Index: 20, MsgType: structs.ServiceRegistrationDeleteByIDRequestType}
+	receivedDeleteChange := eventsFromChanges(deleteTxn, deregisterChange)
+
+	// Check the event, and it's payload are what we are expecting.
+	require.Len(t, receivedDeleteChange.Events, 1)
+	require.Equal(t, structs.TopicService, receivedDeleteChange.Events[0].Topic)
+	require.Equal(t, structs.TypeServiceDeregistration, receivedDeleteChange.Events[0].Type)
+	require.Equal(t, uint64(20), receivedDeleteChange.Events[0].Index)
+
+	eventPayload = receivedChange.Events[0].Payload.(*structs.ServiceRegistrationStreamEvent)
+	require.Equal(t, service, eventPayload.Service)
+}
+
+func Test_eventsFromChanges_ACLRole(t *testing.T) {
+	ci.Parallel(t)
+	testState := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer testState.StopEventBroker()
+
+	// Generate a test ACL role.
+	aclRole := mock.ACLRole()
+
+	// Upsert the role into state, skipping the checks perform to ensure the
+	// linked policies exist.
+	writeTxn := testState.db.WriteTxn(10)
+	updated, err := testState.upsertACLRoleTxn(10, writeTxn, aclRole, true)
+	require.True(t, updated)
+	require.NoError(t, err)
+	writeTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	upsertChange := Changes{Changes: writeTxn.Changes(), Index: 10, MsgType: structs.ACLRolesUpsertRequestType}
+	receivedChange := eventsFromChanges(writeTxn, upsertChange)
+
+	// Check the event, and it's payload are what we are expecting.
+	require.Len(t, receivedChange.Events, 1)
+	require.Equal(t, structs.TopicACLRole, receivedChange.Events[0].Topic)
+	require.Equal(t, aclRole.ID, receivedChange.Events[0].Key)
+	require.Equal(t, aclRole.Name, receivedChange.Events[0].FilterKeys[0])
+	require.Equal(t, structs.TypeACLRoleUpserted, receivedChange.Events[0].Type)
+	require.Equal(t, uint64(10), receivedChange.Events[0].Index)
+
+	eventPayload := receivedChange.Events[0].Payload.(*structs.ACLRoleStreamEvent)
+	require.Equal(t, aclRole, eventPayload.ACLRole)
+
+	// Delete the previously upserted ACL role.
+	deleteTxn := testState.db.WriteTxn(20)
+	require.NoError(t, testState.deleteACLRoleByIDTxn(deleteTxn, aclRole.ID))
+	require.NoError(t, deleteTxn.Insert(tableIndex, &IndexEntry{TableACLRoles, 20}))
+	deleteTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	deleteChange := Changes{Changes: deleteTxn.Changes(), Index: 20, MsgType: structs.ACLRolesDeleteByIDRequestType}
+	receivedDeleteChange := eventsFromChanges(deleteTxn, deleteChange)
+
+	// Check the event, and it's payload are what we are expecting.
+	require.Len(t, receivedDeleteChange.Events, 1)
+	require.Equal(t, structs.TopicACLRole, receivedDeleteChange.Events[0].Topic)
+	require.Equal(t, aclRole.ID, receivedDeleteChange.Events[0].Key)
+	require.Equal(t, aclRole.Name, receivedDeleteChange.Events[0].FilterKeys[0])
+	require.Equal(t, structs.TypeACLRoleDeleted, receivedDeleteChange.Events[0].Type)
+	require.Equal(t, uint64(20), receivedDeleteChange.Events[0].Index)
+
+	eventPayload = receivedChange.Events[0].Payload.(*structs.ACLRoleStreamEvent)
+	require.Equal(t, aclRole, eventPayload.ACLRole)
+}
+
+func Test_eventsFromChanges_ACLAuthMethod(t *testing.T) {
+	ci.Parallel(t)
+	testState := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer testState.StopEventBroker()
+
+	// Generate a test ACL auth method
+	authMethod := mock.ACLOIDCAuthMethod()
+
+	// Upsert the auth method straight into state
+	writeTxn := testState.db.WriteTxn(10)
+	updated, err := testState.upsertACLAuthMethodTxn(10, writeTxn, authMethod)
+	must.True(t, updated)
+	must.NoError(t, err)
+	writeTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	upsertChange := Changes{Changes: writeTxn.Changes(), Index: 10, MsgType: structs.ACLAuthMethodsUpsertRequestType}
+	receivedChange := eventsFromChanges(writeTxn, upsertChange)
+	must.NotNil(t, receivedChange)
+
+	// Check the event, and its payload are what we are expecting.
+	must.Len(t, 1, receivedChange.Events)
+	must.Eq(t, structs.TopicACLAuthMethod, receivedChange.Events[0].Topic)
+	must.Eq(t, authMethod.Name, receivedChange.Events[0].Key)
+	must.Eq(t, structs.TypeACLAuthMethodUpserted, receivedChange.Events[0].Type)
+	must.Eq(t, uint64(10), receivedChange.Events[0].Index)
+
+	eventPayload := receivedChange.Events[0].Payload.(*structs.ACLAuthMethodEvent)
+	must.Eq(t, authMethod, eventPayload.AuthMethod)
+
+	// Delete the previously upserted auth method
+	deleteTxn := testState.db.WriteTxn(20)
+	must.NoError(t, testState.deleteACLAuthMethodTxn(deleteTxn, authMethod.Name))
+	must.NoError(t, deleteTxn.Insert(tableIndex, &IndexEntry{TableACLAuthMethods, 20}))
+	deleteTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	deleteChange := Changes{Changes: deleteTxn.Changes(), Index: 20, MsgType: structs.ACLAuthMethodsDeleteRequestType}
+	receivedDeleteChange := eventsFromChanges(deleteTxn, deleteChange)
+	must.NotNil(t, receivedDeleteChange)
+
+	// Check the event, and its payload are what we are expecting.
+	must.Len(t, 1, receivedDeleteChange.Events)
+	must.Eq(t, structs.TopicACLAuthMethod, receivedDeleteChange.Events[0].Topic)
+	must.Eq(t, authMethod.Name, receivedDeleteChange.Events[0].Key)
+	must.Eq(t, structs.TypeACLAuthMethodDeleted, receivedDeleteChange.Events[0].Type)
+	must.Eq(t, uint64(20), receivedDeleteChange.Events[0].Index)
+
+	eventPayload = receivedChange.Events[0].Payload.(*structs.ACLAuthMethodEvent)
+	must.Eq(t, authMethod, eventPayload.AuthMethod)
+}
+
+func Test_eventsFromChanges_ACLBindingRule(t *testing.T) {
+	ci.Parallel(t)
+	testState := TestStateStoreCfg(t, TestStateStorePublisher(t))
+	defer testState.StopEventBroker()
+
+	// Generate a test ACL binding rule.
+	bindingRule := mock.ACLBindingRule()
+
+	// Upsert the binding rule straight into state.
+	writeTxn := testState.db.WriteTxn(10)
+	updated, err := testState.upsertACLBindingRuleTxn(10, writeTxn, bindingRule, true)
+	must.True(t, updated)
+	must.NoError(t, err)
+	writeTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	upsertChange := Changes{Changes: writeTxn.Changes(), Index: 10, MsgType: structs.ACLBindingRulesUpsertRequestType}
+	receivedChange := eventsFromChanges(writeTxn, upsertChange)
+	must.NotNil(t, receivedChange)
+
+	// Check the event, and its payload are what we are expecting.
+	must.Len(t, 1, receivedChange.Events)
+	must.Eq(t, structs.TopicACLBindingRule, receivedChange.Events[0].Topic)
+	must.Eq(t, bindingRule.ID, receivedChange.Events[0].Key)
+	must.SliceContainsAll(t, []string{bindingRule.AuthMethod}, receivedChange.Events[0].FilterKeys)
+	must.Eq(t, structs.TypeACLBindingRuleUpserted, receivedChange.Events[0].Type)
+	must.Eq(t, 10, receivedChange.Events[0].Index)
+
+	must.Eq(t, bindingRule, receivedChange.Events[0].Payload.(*structs.ACLBindingRuleEvent).ACLBindingRule)
+
+	// Delete the previously upserted binding rule.
+	deleteTxn := testState.db.WriteTxn(20)
+	must.NoError(t, testState.deleteACLBindingRuleTxn(deleteTxn, bindingRule.ID))
+	must.NoError(t, deleteTxn.Insert(tableIndex, &IndexEntry{TableACLBindingRules, 20}))
+	deleteTxn.Txn.Commit()
+
+	// Pull the events from the stream.
+	deleteChange := Changes{Changes: deleteTxn.Changes(), Index: 20, MsgType: structs.ACLBindingRulesDeleteRequestType}
+	receivedDeleteChange := eventsFromChanges(deleteTxn, deleteChange)
+	must.NotNil(t, receivedDeleteChange)
+
+	// Check the event, and its payload are what we are expecting.
+	must.Len(t, 1, receivedDeleteChange.Events)
+	must.Eq(t, structs.TopicACLBindingRule, receivedDeleteChange.Events[0].Topic)
+	must.Eq(t, bindingRule.ID, receivedDeleteChange.Events[0].Key)
+	must.SliceContainsAll(t, []string{bindingRule.AuthMethod}, receivedDeleteChange.Events[0].FilterKeys)
+	must.Eq(t, structs.TypeACLBindingRuleDeleted, receivedDeleteChange.Events[0].Type)
+	must.Eq(t, uint64(20), receivedDeleteChange.Events[0].Index)
+
+	must.Eq(t, bindingRule, receivedDeleteChange.Events[0].Payload.(*structs.ACLBindingRuleEvent).ACLBindingRule)
 }
 
 func requireNodeRegistrationEventEqual(t *testing.T, want, got structs.Event) {

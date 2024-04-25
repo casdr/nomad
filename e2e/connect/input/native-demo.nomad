@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: BUSL-1.1
+
 job "cn-demo" {
   datacenters = ["dc1"]
 
@@ -25,7 +28,7 @@ job "cn-demo" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/uuid-api:v5"
+        image        = "hashicorpdev/uuid-api:v5"
         network_mode = "host"
       }
 
@@ -57,7 +60,7 @@ job "cn-demo" {
       driver = "docker"
 
       config {
-        image        = "hashicorpnomad/uuid-fe:v5"
+        image        = "hashicorpdev/uuid-fe:v5"
         network_mode = "host"
       }
 

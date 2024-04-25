@@ -1,9 +1,20 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 /* eslint-env node */
 
 let USE_MIRAGE = true;
 
 if (process.env.USE_MIRAGE) {
   USE_MIRAGE = process.env.USE_MIRAGE == 'true';
+}
+
+let USE_PERCY = true;
+
+if (process.env.USE_PERCY) {
+  USE_PERCY = process.env.USE_PERCY == 'true';
 }
 
 module.exports = function (environment) {
@@ -30,6 +41,10 @@ module.exports = function (environment) {
       mirageWithTokens: true,
       mirageWithRegions: true,
       showStorybookLink: process.env.STORYBOOK_LINK === 'true',
+    },
+
+    percy: {
+      enabled: USE_PERCY,
     },
   };
 

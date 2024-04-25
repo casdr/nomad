@@ -1,6 +1,10 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package raftutil
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -20,6 +24,7 @@ type nomadFSM interface {
 	raft.FSM
 	State() *state.StateStore
 	Restore(io.ReadCloser) error
+	RestoreWithFilter(io.ReadCloser, *nomad.FSMFilter) error
 }
 
 type FSMHelper struct {
@@ -75,7 +80,7 @@ func dummyFSM(logger hclog.Logger) (nomadFSM, error) {
 	// use dummy non-enabled FSM dependencies
 	periodicDispatch := nomad.NewPeriodicDispatch(logger, nil)
 	blockedEvals := nomad.NewBlockedEvals(nil, logger)
-	evalBroker, err := nomad.NewEvalBroker(1, 1, 1, 1)
+	evalBroker, err := nomad.NewEvalBroker(context.Background(), 1, 1, 1, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +91,10 @@ func dummyFSM(logger hclog.Logger) (nomadFSM, error) {
 		Blocked:    blockedEvals,
 		Logger:     logger,
 		Region:     "default",
+		// This is the copied default value, and while this is configurable on
+		// running agents, it does not impact the creation of the FSM for this
+		// dummy implementation.
+		JobTrackedVersions: 6,
 	}
 
 	return nomad.NewFSM(fsmConfig)
@@ -197,7 +206,7 @@ func StateAsMap(store *state.StateStore) map[string][]interface{} {
 		"Indexes":          toArray(store.Indexes()),
 		"JobSummaries":     toArray(store.JobSummaries(nil)),
 		"JobVersions":      toArray(store.JobVersions(nil)),
-		"Jobs":             toArray(store.Jobs(nil)),
+		"Jobs":             toArray(store.Jobs(nil, state.SortDefault)),
 		"Nodes":            toArray(store.Nodes(nil)),
 		"PeriodicLaunches": toArray(store.PeriodicLaunches(nil)),
 		"SITokenAccessors": toArray(store.SITokenAccessors(nil)),

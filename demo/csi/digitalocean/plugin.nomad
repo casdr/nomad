@@ -1,3 +1,6 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
 job "digitalocean" {
 
   datacenters = ["dc1"]
@@ -10,7 +13,7 @@ job "digitalocean" {
       config {
         image = "digitalocean/do-csi-plugin:v2.1.1"
         args = [
-          "--endpoint=unix://csi/csi.sock",
+          "--endpoint=${CSI_ENDPOINT}",
           "--token=${token}",
           "--url=https://api.digitalocean.com/",
         ]

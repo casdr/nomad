@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package hclutil
 
 import (
@@ -14,17 +17,21 @@ import (
 // More concretely, it changes the following:
 //
 // ```
-// config {
-//   meta { ... }
-// }
+//
+//	config {
+//	  meta { ... }
+//	}
+//
 // ```
 //
 // to
 //
 // ```
-// config {
-//   meta = { ... } # <- attribute now
-// }
+//
+//	config {
+//	  meta = { ... } # <- attribute now
+//	}
+//
 // ```
 func BlocksAsAttrs(body hcl.Body) hcl.Body {
 	if hclb, ok := body.(*hcls.Body); ok {

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package allocwatcher
 
 import (
@@ -5,7 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +29,7 @@ import (
 // fakeAllocRunner implements AllocRunnerMeta
 type fakeAllocRunner struct {
 	alloc       *structs.Allocation
-	AllocDir    *allocdir.AllocDir
+	AllocDir    allocdir.Interface
 	Broadcaster *cstructs.AllocBroadcaster
 }
 
@@ -41,12 +44,12 @@ func newFakeAllocRunner(t *testing.T, logger hclog.Logger) *fakeAllocRunner {
 
 	return &fakeAllocRunner{
 		alloc:       alloc,
-		AllocDir:    allocdir.NewAllocDir(logger, path, alloc.ID),
+		AllocDir:    allocdir.NewAllocDir(logger, path, path, alloc.ID),
 		Broadcaster: cstructs.NewAllocBroadcaster(logger),
 	}
 }
 
-func (f *fakeAllocRunner) GetAllocDir() *allocdir.AllocDir {
+func (f *fakeAllocRunner) GetAllocDir() allocdir.Interface {
 	return f.AllocDir
 }
 
@@ -208,11 +211,7 @@ func TestPrevAlloc_LocalPrevAlloc_Terminated(t *testing.T) {
 func TestPrevAlloc_StreamAllocDir_Error(t *testing.T) {
 	ci.Parallel(t)
 
-	dest, err := ioutil.TempDir("", "nomadtest-")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer os.RemoveAll(dest)
+	dest := t.TempDir()
 
 	// This test only unit tests streamAllocDir so we only need a partially
 	// complete remotePrevAlloc
@@ -232,7 +231,7 @@ func TestPrevAlloc_StreamAllocDir_Error(t *testing.T) {
 		ModTime:  time.Now(),
 		Typeflag: tar.TypeReg,
 	}
-	err = tw.WriteHeader(&fooHdr)
+	err := tw.WriteHeader(&fooHdr)
 	if err != nil {
 		t.Fatalf("error writing file header: %v", err)
 	}
@@ -259,7 +258,7 @@ func TestPrevAlloc_StreamAllocDir_Error(t *testing.T) {
 	}
 
 	// Assert streamAllocDir fails
-	err = prevAlloc.streamAllocDir(context.Background(), ioutil.NopCloser(tarBuf), dest)
+	err = prevAlloc.streamAllocDir(context.Background(), io.NopCloser(tarBuf), dest)
 	if err == nil {
 		t.Fatalf("expected an error from streamAllocDir")
 	}

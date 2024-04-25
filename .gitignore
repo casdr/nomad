@@ -7,6 +7,7 @@
 .DS_Store
 Thumbs.db
 .idea
+.fleet
 
 # Folders
 _obj
@@ -55,11 +56,15 @@ ui/dist/
 website/.bundle
 website/vendor
 
+# Go work files
+go.work
+go.work.sum
+
 # init outputs
 example.nomad
+example.nomad.hcl
 spec.hcl
 volume.hcl
-
 nomad_linux_amd64
 nomad_darwin_amd64
 TODO.md
@@ -74,8 +79,10 @@ GNUMakefile.local
 
 rkt-*
 
+# Common editor config
 ./idea
 *.iml
+.vscode
 
 # UI rules
 
@@ -125,3 +132,6 @@ e2e/remotetasks/input/ecs.vars
 
 # local terraform overrides
 *.auto.tfvars
+
+# Tools files
+tools/missing/missing

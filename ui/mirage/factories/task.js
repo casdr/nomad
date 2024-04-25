@@ -1,11 +1,24 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+// @ts-check
 import { Factory } from 'ember-cli-mirage';
 import faker from 'nomad-ui/mirage/faker';
 import { generateResources } from '../common';
+import { dasherize } from '@ember/string';
+import { pickOne } from '../utils';
 
 const DRIVERS = ['docker', 'java', 'rkt', 'qemu', 'exec', 'raw_exec'];
 
 export default Factory.extend({
   createRecommendations: false,
+
+  withServices: false,
+
+  withActions: false,
+  actions: [],
 
   // Hidden property used to compute the Summary hash
   groupNames: [],
@@ -15,11 +28,11 @@ export default Factory.extend({
 
   JobID: '',
 
-  name: id => `task-${faker.hacker.noun().dasherize()}-${id}`,
+  name: (id) => `task-${dasherize(faker.hacker.noun())}-${id}`,
   driver: () => faker.helpers.randomize(DRIVERS),
 
   originalResources: generateResources,
-  resources: function() {
+  resources: function () {
     // Generate resources the usual way, but transform to the old
     // shape because that's what the job spec uses.
     const resources = this.originalResources;
@@ -31,7 +44,7 @@ export default Factory.extend({
     };
   },
 
-  Lifecycle: i => {
+  Lifecycle: (i) => {
     const cycle = i % 6;
 
     if (cycle === 0) {
@@ -54,14 +67,53 @@ export default Factory.extend({
       const recommendations = [];
 
       if (faker.random.number(10) >= 1) {
-        recommendations.push(server.create('recommendation', { task, resource: 'CPU' }));
+        recommendations.push(
+          server.create('recommendation', { task, resource: 'CPU' })
+        );
       }
 
       if (faker.random.number(10) >= 1) {
-        recommendations.push(server.create('recommendation', { task, resource: 'MemoryMB' }));
+        recommendations.push(
+          server.create('recommendation', { task, resource: 'MemoryMB' })
+        );
       }
 
       task.save({ recommendationIds: recommendations.mapBy('id') });
+    }
+
+    if (task.withServices) {
+      const services = server.createList('service-fragment', 1, {
+        provider: 'nomad',
+        taskName: task.name,
+      });
+
+      services.push(
+        server.create('service-fragment', {
+          provider: 'consul',
+          taskName: task.name,
+        })
+      );
+      services.forEach((fragment) => {
+        server.createList('service', 5, {
+          serviceName: fragment.name,
+        });
+      });
+      task.update({ services });
+    }
+
+    if (task.withActions) {
+      let actionsData = [
+        {
+          taskName: task.name,
+          Name: faker.hacker.verb(),
+          Command: '/bin/sh',
+          Args: [
+            '-c',
+            'counter=0; while true; do echo "Running for ${counter} seconds"; counter=$((counter + 1)); sleep 1; done',
+          ],
+        },
+      ];
+      task.update({ actions: actionsData });
     }
   },
 });

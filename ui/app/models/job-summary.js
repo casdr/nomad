@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { collect, sum } from '@ember/object/computed';
 import Model from '@ember-data/model';
 import { attr, belongsTo } from '@ember-data/model';
@@ -17,6 +22,7 @@ export default class JobSummary extends Model {
   @sumAggregation('taskGroupSummaries', 'runningAllocs') runningAllocs;
   @sumAggregation('taskGroupSummaries', 'completeAllocs') completeAllocs;
   @sumAggregation('taskGroupSummaries', 'failedAllocs') failedAllocs;
+  @sumAggregation('taskGroupSummaries', 'unknownAllocs') unknownAllocs;
   @sumAggregation('taskGroupSummaries', 'lostAllocs') lostAllocs;
 
   @collect(
@@ -25,7 +31,8 @@ export default class JobSummary extends Model {
     'runningAllocs',
     'completeAllocs',
     'failedAllocs',
-    'lostAllocs'
+    'lostAllocs',
+    'unknownAllocs'
   )
   allocsList;
 

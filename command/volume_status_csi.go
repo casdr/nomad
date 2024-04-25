@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -7,8 +10,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/dustin/go-humanize"
 	"github.com/hashicorp/nomad/api"
-	"github.com/hashicorp/nomad/nomad/structs"
 )
 
 func (c *VolumeStatusCommand) csiBanner() {
@@ -33,8 +36,27 @@ func (c *VolumeStatusCommand) csiStatus(client *api.Client, id string) int {
 		c.Ui.Error(fmt.Sprintf("No volumes(s) with prefix or ID %q found", id))
 		return 1
 	}
+
+	var ns string
+
+	if len(vols) == 1 {
+		// need to set id from the actual ID because it might be a prefix
+		id = vols[0].ID
+		ns = vols[0].Namespace
+	}
+
+	// List sorts by CreateIndex, not by ID, so we need to search for
+	// exact matches but account for multiple exact ID matches across
+	// namespaces
 	if len(vols) > 1 {
-		if (id != vols[0].ID) || (c.allNamespaces() && vols[0].ID == vols[1].ID) {
+		exactMatchesCount := 0
+		for _, vol := range vols {
+			if vol.ID == id {
+				exactMatchesCount++
+				ns = vol.Namespace
+			}
+		}
+		if exactMatchesCount != 1 {
 			out, err := c.csiFormatVolumes(vols)
 			if err != nil {
 				c.Ui.Error(fmt.Sprintf("Error formatting: %s", err))
@@ -44,9 +66,9 @@ func (c *VolumeStatusCommand) csiStatus(client *api.Client, id string) int {
 			return 1
 		}
 	}
-	id = vols[0].ID
 
 	// Try querying the volume
+	client.SetNamespace(ns)
 	vol, _, err := client.CSIVolumes().Info(id, nil)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error querying volume: %s", err))
@@ -166,11 +188,12 @@ func (c *VolumeStatusCommand) csiFormatVolumes(vols []*api.CSIVolumeListStub) (s
 // Format the volumes, assumes that we're already sorted by volume ID
 func csiFormatSortedVolumes(vols []*api.CSIVolumeListStub) (string, error) {
 	rows := make([]string, len(vols)+1)
-	rows[0] = "ID|Name|Plugin ID|Schedulable|Access Mode"
+	rows[0] = "ID|Name|Namespace|Plugin ID|Schedulable|Access Mode"
 	for i, v := range vols {
-		rows[i+1] = fmt.Sprintf("%s|%s|%s|%t|%s",
+		rows[i+1] = fmt.Sprintf("%s|%s|%s|%s|%t|%s",
 			v.ID,
 			v.Name,
+			v.Namespace,
 			v.PluginID,
 			v.Schedulable,
 			v.AccessMode,
@@ -191,10 +214,12 @@ func (c *VolumeStatusCommand) formatBasic(vol *api.CSIVolume) (string, error) {
 	output := []string{
 		fmt.Sprintf("ID|%s", vol.ID),
 		fmt.Sprintf("Name|%s", vol.Name),
+		fmt.Sprintf("Namespace|%s", vol.Namespace),
 		fmt.Sprintf("External ID|%s", vol.ExternalID),
 		fmt.Sprintf("Plugin ID|%s", vol.PluginID),
 		fmt.Sprintf("Provider|%s", vol.Provider),
 		fmt.Sprintf("Version|%s", vol.ProviderVersion),
+		fmt.Sprintf("Capacity|%s", humanize.IBytes(uint64(vol.Capacity))),
 		fmt.Sprintf("Schedulable|%t", vol.Schedulable),
 		fmt.Sprintf("Controllers Healthy|%d", vol.ControllersHealthy),
 		fmt.Sprintf("Controllers Expected|%d", vol.ControllersExpected),
@@ -233,6 +258,9 @@ func (c *VolumeStatusCommand) formatBasic(vol *api.CSIVolume) (string, error) {
 func (c *VolumeStatusCommand) formatTopology(vol *api.CSIVolume) string {
 	rows := []string{"Topology|Segments"}
 	for i, t := range vol.Topologies {
+		if t == nil {
+			continue
+		}
 		segmentPairs := make([]string, 0, len(t.Segments))
 		for k, v := range t.Segments {
 			segmentPairs = append(segmentPairs, fmt.Sprintf("%s=%s", k, v))
@@ -251,10 +279,10 @@ func (c *VolumeStatusCommand) formatTopology(vol *api.CSIVolume) string {
 }
 
 func csiVolMountOption(volume, request *api.CSIMountOptions) string {
-	var req, opts *structs.CSIMountOptions
+	var req, opts *api.CSIMountOptions
 
 	if request != nil {
-		req = &structs.CSIMountOptions{
+		req = &api.CSIMountOptions{
 			FSType:     request.FSType,
 			MountFlags: request.MountFlags,
 		}
@@ -263,7 +291,7 @@ func csiVolMountOption(volume, request *api.CSIMountOptions) string {
 	if volume == nil {
 		opts = req
 	} else {
-		opts = &structs.CSIMountOptions{
+		opts = &api.CSIMountOptions{
 			FSType:     volume.FSType,
 			MountFlags: volume.MountFlags,
 		}

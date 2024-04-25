@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 //go:build !windows
 // +build !windows
 
@@ -8,37 +11,29 @@ package taskrunner
 
 import (
 	"context"
-	"io/ioutil"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	consulapi "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
-	consulapi "github.com/hashicorp/nomad/client/consul"
+	consulclient "github.com/hashicorp/nomad/client/consul"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/hashicorp/nomad/testutil"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
 var _ interfaces.TaskPrestartHook = (*sidsHook)(nil)
-
-func tmpDir(t *testing.T) string {
-	dir, err := ioutil.TempDir("", "sids-")
-	require.NoError(t, err)
-	return dir
-}
-
-func cleanupDir(t *testing.T, dir string) {
-	err := os.RemoveAll(dir)
-	require.NoError(t, err)
-}
 
 func sidecar(task string) (string, structs.TaskKind) {
 	name := structs.ConnectProxyPrefix + "-" + task
@@ -50,8 +45,7 @@ func TestSIDSHook_recoverToken(t *testing.T) {
 	ci.Parallel(t)
 	r := require.New(t)
 
-	secrets := tmpDir(t)
-	defer cleanupDir(t, secrets)
+	secrets := t.TempDir()
 
 	taskName, taskKind := sidecar("foo")
 	h := newSIDSHook(sidsHookConfig{
@@ -75,8 +69,7 @@ func TestSIDSHook_recoverToken_empty(t *testing.T) {
 	ci.Parallel(t)
 	r := require.New(t)
 
-	secrets := tmpDir(t)
-	defer cleanupDir(t, secrets)
+	secrets := t.TempDir()
 
 	taskName, taskKind := sidecar("foo")
 	h := newSIDSHook(sidsHookConfig{
@@ -103,8 +96,7 @@ func TestSIDSHook_recoverToken_unReadable(t *testing.T) {
 
 	r := require.New(t)
 
-	secrets := tmpDir(t)
-	defer cleanupDir(t, secrets)
+	secrets := t.TempDir()
 
 	err := os.Chmod(secrets, 0000)
 	r.NoError(err)
@@ -126,15 +118,14 @@ func TestSIDSHook_writeToken(t *testing.T) {
 	ci.Parallel(t)
 	r := require.New(t)
 
-	secrets := tmpDir(t)
-	defer cleanupDir(t, secrets)
+	secrets := t.TempDir()
 
 	id := uuid.Generate()
 	h := new(sidsHook)
 	err := h.writeToken(secrets, id)
 	r.NoError(err)
 
-	content, err := ioutil.ReadFile(filepath.Join(secrets, sidsTokenFile))
+	content, err := os.ReadFile(filepath.Join(secrets, sidsTokenFile))
 	r.NoError(err)
 	r.Equal(id, string(content))
 }
@@ -150,8 +141,7 @@ func TestSIDSHook_writeToken_unWritable(t *testing.T) {
 
 	r := require.New(t)
 
-	secrets := tmpDir(t)
-	defer cleanupDir(t, secrets)
+	secrets := t.TempDir()
 
 	err := os.Chmod(secrets, 0000)
 	r.NoError(err)
@@ -166,8 +156,7 @@ func Test_SIDSHook_writeToken_nonExistent(t *testing.T) {
 	ci.Parallel(t)
 	r := require.New(t)
 
-	base := tmpDir(t)
-	defer cleanupDir(t, base)
+	base := t.TempDir()
 	secrets := filepath.Join(base, "does/not/exist")
 
 	id := uuid.Generate()
@@ -188,7 +177,7 @@ func TestSIDSHook_deriveSIToken(t *testing.T) {
 			Kind: taskKind,
 		},
 		logger:     testlog.HCLogger(t),
-		sidsClient: consulapi.NewMockServiceIdentitiesClient(),
+		sidsClient: consulclient.NewMockServiceIdentitiesClient(),
 	})
 
 	ctx := context.Background()
@@ -201,7 +190,7 @@ func TestSIDSHook_deriveSIToken_timeout(t *testing.T) {
 	ci.Parallel(t)
 	r := require.New(t)
 
-	siClient := consulapi.NewMockServiceIdentitiesClient()
+	siClient := consulclient.NewMockServiceIdentitiesClient()
 	siClient.DeriveTokenFn = func(allocation *structs.Allocation, strings []string) (m map[string]string, err error) {
 		select {
 		// block forever, hopefully triggering a timeout in the caller
@@ -284,26 +273,25 @@ func TestTaskRunner_DeriveSIToken_UnWritableTokenFile(t *testing.T) {
 		"run_for": "0s",
 	}
 
-	trConfig, cleanup := testTaskRunnerConfig(t, alloc, task.Name)
+	trConfig, cleanup := testTaskRunnerConfig(t, alloc, task.Name, nil)
 	defer cleanup()
 
 	// make the si_token file un-writable, triggering a failure after a
 	// successful token derivation
-	secrets := tmpDir(t)
-	defer cleanupDir(t, secrets)
+	secrets := t.TempDir()
 	trConfig.TaskDir.SecretsDir = secrets
-	err := ioutil.WriteFile(filepath.Join(secrets, sidsTokenFile), nil, 0400)
+	err := os.WriteFile(filepath.Join(secrets, sidsTokenFile), nil, 0400)
 	r.NoError(err)
 
 	// set a consul token for the nomad client, which is what triggers the
 	// SIDS hook to be applied
-	trConfig.ClientConfig.ConsulConfig.Token = uuid.Generate()
+	trConfig.ClientConfig.GetDefaultConsul().Token = uuid.Generate()
 
 	// derive token works just fine
 	deriveFn := func(*structs.Allocation, []string) (map[string]string, error) {
 		return map[string]string{task.Name: uuid.Generate()}, nil
 	}
-	siClient := trConfig.ConsulSI.(*consulapi.MockServiceIdentitiesClient)
+	siClient := trConfig.ConsulSI.(*consulclient.MockServiceIdentitiesClient)
 	siClient.DeriveTokenFn = deriveFn
 
 	// start the task runner
@@ -315,11 +303,7 @@ func TestTaskRunner_DeriveSIToken_UnWritableTokenFile(t *testing.T) {
 	go tr.Run()
 
 	// wait for task runner to finish running
-	select {
-	case <-tr.WaitCh():
-	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
-		r.Fail("timed out waiting for task runner")
-	}
+	testWaitForTaskToDie(t, tr)
 
 	// assert task exited un-successfully
 	finalState := tr.TaskState()
@@ -329,7 +313,48 @@ func TestTaskRunner_DeriveSIToken_UnWritableTokenFile(t *testing.T) {
 
 	// assert the token is *not* on disk, as secrets dir was un-writable
 	tokenPath := filepath.Join(trConfig.TaskDir.SecretsDir, sidsTokenFile)
-	token, err := ioutil.ReadFile(tokenPath)
+	token, err := os.ReadFile(tokenPath)
 	r.NoError(err)
 	r.Empty(token)
+}
+
+// TestSIDSHook_WIBypass exercises the code path where we skip deriving SI
+// tokens if we already have Consul tokens in the alloc hook resources (from WI)
+func TestSIDSHook_WIBypass(t *testing.T) {
+	ci.Parallel(t)
+
+	resources := cstructs.NewAllocHookResources()
+	resources.SetConsulTokens(map[string]map[string]*consulapi.ACLToken{
+		"default": {
+			"consul_service_": &consulapi.ACLToken{
+				AccessorID: uuid.Generate(),
+				SecretID:   uuid.Generate(),
+			},
+		},
+	})
+
+	alloc := mock.ConnectAlloc()
+	taskName, taskKind := sidecar("web")
+	task := &structs.Task{Name: taskName, Kind: taskKind}
+
+	sidsClient := consulclient.NewMockServiceIdentitiesClient()
+	sidsClient.SetDeriveTokenError(alloc.ID, []string{"web"}, errors.New("should never call"))
+
+	h := newSIDSHook(sidsHookConfig{
+		alloc:              alloc,
+		task:               task,
+		sidsClient:         sidsClient,
+		lifecycle:          nil,
+		logger:             testlog.HCLogger(t),
+		allocHookResources: resources,
+	})
+
+	ctx := context.Background()
+	req := &interfaces.TaskPrestartRequest{
+		Task:    task,
+		TaskDir: &allocdir.TaskDir{SecretsDir: t.TempDir()},
+	}
+	resp := &interfaces.TaskPrestartResponse{}
+	must.NoError(t, h.Prestart(ctx, req, resp))
+	must.True(t, resp.Done)
 }

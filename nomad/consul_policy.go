@@ -1,11 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package nomad
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/hcl"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -44,7 +47,7 @@ type ConsulPolicy struct {
 func parseConsulPolicy(s string) (*ConsulPolicy, error) {
 	cp := new(ConsulPolicy)
 	if err := hcl.Decode(cp, s); err != nil {
-		return nil, errors.Wrap(err, "failed to parse ACL policy")
+		return nil, fmt.Errorf("failed to parse ACL policy: %w", err)
 	}
 	return cp, nil
 }
@@ -98,10 +101,10 @@ func namespaceCheck(namespace string, token *api.ACLToken) error {
 	case namespace == "" && token.Namespace != "default":
 		// ACLs enabled with non-default token, but namespace on job not set, so
 		// provide a more informative error message.
-		return errors.Errorf("consul ACL token requires using namespace %q", token.Namespace)
+		return fmt.Errorf("consul ACL token requires using namespace %q", token.Namespace)
 
 	default:
-		return errors.Errorf("consul ACL token cannot use namespace %q", namespace)
+		return fmt.Errorf("consul ACL token cannot use namespace %q", namespace)
 	}
 }
 
@@ -119,7 +122,7 @@ func (c *consulACLsAPI) canReadKeystore(namespace string, token *api.ACLToken) (
 
 	// check each policy directly attached to the token
 	for _, policyRef := range token.Policies {
-		if allowable, err := c.policyAllowsKeystoreRead(matches, namespace, policyRef.ID); err != nil {
+		if allowable, err := c.policyAllowsKeystoreRead(matches, namespace, policyRef.ID, token.Namespace); err != nil {
 			return false, err
 		} else if allowable {
 			return true, nil
@@ -130,13 +133,14 @@ func (c *consulACLsAPI) canReadKeystore(namespace string, token *api.ACLToken) (
 	for _, roleLink := range token.Roles {
 		role, _, err := c.aclClient.RoleRead(roleLink.ID, &api.QueryOptions{
 			AllowStale: false,
+			Namespace:  token.Namespace,
 		})
 		if err != nil {
 			return false, err
 		}
 
 		for _, policyLink := range role.Policies {
-			allowable, err := c.policyAllowsKeystoreRead(matches, namespace, policyLink.ID)
+			allowable, err := c.policyAllowsKeystoreRead(matches, namespace, policyLink.ID, token.Namespace)
 			if err != nil {
 				return false, err
 			} else if allowable {
@@ -160,9 +164,17 @@ func (c *consulACLsAPI) canWriteService(namespace, service string, token *api.AC
 	// treat that like an exact match to preserve backwards compatibility
 	matches := (namespace == token.Namespace) || (namespace == "" && token.Namespace == "default")
 
+	// check each service identity attached to the token -
+	// the virtual policy for service identities enables service:write
+	for _, si := range token.ServiceIdentities {
+		if si.ServiceName == service {
+			return true, nil
+		}
+	}
+
 	// check each policy directly attached to the token
 	for _, policyRef := range token.Policies {
-		if allowable, err := c.policyAllowsServiceWrite(matches, namespace, service, policyRef.ID); err != nil {
+		if allowable, err := c.policyAllowsServiceWrite(matches, namespace, service, policyRef.ID, token.Namespace); err != nil {
 			return false, err
 		} else if allowable {
 			return true, nil
@@ -179,7 +191,7 @@ func (c *consulACLsAPI) canWriteService(namespace, service string, token *api.AC
 		}
 
 		for _, policyLink := range role.Policies {
-			allowable, wErr := c.policyAllowsServiceWrite(matches, namespace, service, policyLink.ID)
+			allowable, wErr := c.policyAllowsServiceWrite(matches, namespace, service, policyLink.ID, token.Namespace)
 			if wErr != nil {
 				return false, wErr
 			} else if allowable {
@@ -191,9 +203,10 @@ func (c *consulACLsAPI) canWriteService(namespace, service string, token *api.AC
 	return false, nil
 }
 
-func (c *consulACLsAPI) policyAllowsServiceWrite(matches bool, namespace, service string, policyID string) (bool, error) {
+func (c *consulACLsAPI) policyAllowsServiceWrite(matches bool, namespace, service string, policyID string, tokenNamespace string) (bool, error) {
 	policy, _, err := c.aclClient.PolicyRead(policyID, &api.QueryOptions{
 		AllowStale: false,
+		Namespace:  tokenNamespace,
 	})
 	if err != nil {
 		return false, err
@@ -276,9 +289,10 @@ func (cp *ConsulPolicy) allowsServiceWrite(matches bool, namespace, task string)
 	return false
 }
 
-func (c *consulACLsAPI) policyAllowsKeystoreRead(matches bool, namespace, policyID string) (bool, error) {
+func (c *consulACLsAPI) policyAllowsKeystoreRead(matches bool, namespace, policyID string, tokenNamespace string) (bool, error) {
 	policy, _, err := c.aclClient.PolicyRead(policyID, &api.QueryOptions{
 		AllowStale: false,
+		Namespace:  tokenNamespace,
 	})
 	if err != nil {
 		return false, err
